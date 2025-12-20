@@ -95,15 +95,19 @@ class KANExpert(ExpertModel):
         if dist.is_available() and dist.is_initialized():
             sampler = distributed.DistributedSampler(dataset)
 
-        # GPU Optimization (num_workers=0 to avoid CUDA fork issues in multiprocessing)
+        # GPU Optimization with spawn context to avoid CUDA fork issues
         is_cuda = str(self.device).startswith("cuda")
+        num_workers = 4 if is_cuda else 0
         loader = DataLoader(
             dataset,
             batch_size=self.batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=is_cuda,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+            multiprocessing_context='spawn' if num_workers > 0 else None,
         )
 
         import time

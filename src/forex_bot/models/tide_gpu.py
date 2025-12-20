@@ -122,7 +122,7 @@ class TiDEExpert(ExpertModel):
         y_v = y_v.to(self.device)
 
         dataset = TensorDataset(X_t, y_t)
-        # GPU Optimization (num_workers=0 to avoid CUDA fork issues in multiprocessing)
+        # GPU Optimization with spawn context to avoid CUDA fork issues
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
         # Auto-tune batch size based on free GPU memory (safe fallback to provided batch_size)
@@ -135,13 +135,19 @@ class TiDEExpert(ExpertModel):
             except Exception:
                 pass
 
+        num_workers = max(1, min(os.cpu_count() or 4, 8)) if is_cuda else 0
+        if world_size > 1:
+            num_workers = max(1, num_workers // world_size)
         sampler = torch.utils.data.distributed.DistributedSampler(dataset) if world_size > 1 else None
         loader = DataLoader(
             dataset,
             batch_size=max(1, eff_batch // max(1, world_size)),  # Divide batch by GPU count
             shuffle=(world_size == 1),  # Only shuffle if not using DistributedSampler
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=is_cuda,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+            multiprocessing_context='spawn' if num_workers > 0 else None,
             sampler=sampler,
         )
         fused_ok = is_cuda and hasattr(optim, "AdamW") and "fused" in optim.AdamW.__init__.__code__.co_varnames

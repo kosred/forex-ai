@@ -4,17 +4,11 @@ Decides whether to use CPU or GPU based on runtime benchmarks.
 """
 
 import logging
-import os
 import time
 
 from ..models.device import get_device_info, select_device
 
 logger = logging.getLogger(__name__)
-
-
-def _is_worker_subprocess() -> bool:
-    """Check if we're running in a parallel training worker subprocess."""
-    return os.environ.get("FOREX_BOT_TRAIN_WORKER") == "1"
 
 
 class Autotuner:
@@ -36,11 +30,8 @@ class Autotuner:
         self.gpu_info = {}
         self._initialized = True
         self._detect_hardware()
-        # Measure once on startup (skip in worker subprocesses to avoid CUDA fork issues)
-        if _is_worker_subprocess():
-            self._optimal_batch_size = 256 if self.gpu_available else 64
-        else:
-            self._optimal_batch_size = self._measure_optimal_batch_size()
+        # Measure optimal batch size (works in workers too with spawn context)
+        self._optimal_batch_size = self._measure_optimal_batch_size()
 
     def _detect_hardware(self):
         """Detect available hardware and basic capabilities."""
@@ -163,11 +154,6 @@ class Autotuner:
         """
         if not self.gpu_available:
             return False
-
-        # Skip benchmarking in worker subprocesses to avoid CUDA fork issues
-        if _is_worker_subprocess():
-            # Heuristic: use GPU for large datasets (> 100k rows)
-            return df_length > 100_000
 
         # Check cache first
         decision_key = f"features_{df_length}"
