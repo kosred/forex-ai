@@ -712,6 +712,7 @@ class HyperparameterOptimizer:
     def _run_study(self, study_name: str, objective: Callable[[Trial], float], target_trials: int) -> optuna.Study:
         """
         Warm-start aware study runner. Resumes existing study and only runs remaining trials.
+        Runs trials in PARALLEL across all available GPUs for maximum speed.
         """
         study = self._get_study(study_name)
 
@@ -725,8 +726,10 @@ class HyperparameterOptimizer:
         completed = sum(1 for t in study.trials if t.state == TrialState.COMPLETE)
         remaining = max(0, target_trials - completed)
         if remaining > 0:
-            logger.info(f"Optuna study {study_name}: running {remaining} new trials (completed={completed}).")
-            study.optimize(objective, n_trials=remaining, callbacks=[_cb], catch=(KeyboardInterrupt, MemoryError))
+            # Parallel execution: use all GPUs simultaneously
+            n_parallel = len(self.device_pool) if self.device_pool else 1
+            logger.info(f"Optuna study {study_name}: running {remaining} new trials (completed={completed}) with {n_parallel} parallel jobs.")
+            study.optimize(objective, n_trials=remaining, n_jobs=n_parallel, callbacks=[_cb], catch=(KeyboardInterrupt, MemoryError))
         else:
             logger.info(f"Optuna study {study_name}: using existing {completed} trials; no new trials scheduled.")
         return study
