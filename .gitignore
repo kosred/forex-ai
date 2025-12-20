@@ -1,5 +1,4 @@
 .env
-keys.txt
 /data/
 /models/
 /cache/
