@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -284,7 +285,9 @@ class CombinatorialPurgedCV:
                 )
                 n_jobs = 1
 
-            with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            # Use spawn context to avoid CUDA fork issues
+            spawn_ctx = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(max_workers=n_jobs, mp_context=spawn_ctx) as executor:
                 futures = []
                 for train_idx, test_idx in splits:
                     future = executor.submit(

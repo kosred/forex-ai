@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import multiprocessing
 import os
 import pickle
 from datetime import timedelta
@@ -724,9 +725,10 @@ class TrainingService:
                 if analyzer is not None:
                     news_map[sym] = self._build_news_features(analyzer, sym, frames)
 
-            # Parallel Feature Engineering
+            # Parallel Feature Engineering (use spawn to avoid CUDA fork issues)
             logger.info(f"HPC (Rank 0): Launching feature engineering on {max_workers} workers...")
-            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            spawn_ctx = multiprocessing.get_context('spawn')
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
                 futures: dict[concurrent.futures.Future, str] = {}
                 for sym, frames in raw_frames_map.items():
                     fut = executor.submit(_hpc_feature_worker, self.settings.model_copy(), frames, sym, news_map.get(sym))
