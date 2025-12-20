@@ -1,0 +1,114 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forex-bot"
+version = "0.1.0"
+description = "Forex Trading Bot with Refactored Architecture"
+authors = [{name = "Konstantin", email = "konst@example.com"}]
+requires-python = ">=3.12"
+dependencies = [
+    # Core Scientific Computing (2025 versions)
+    "numpy>=2.0.0,<3.0.0",
+    "pandas>=2.2.3",
+    "pyarrow>=18.0.0",
+    "scipy>=1.14.0",
+    "scikit-learn>=1.7.0",
+    "joblib>=1.4.0",
+
+    # Networking & Data
+    "requests>=2.32.0",
+    "feedparser>=6.0.11",
+    "PyYAML>=6.0.2",
+
+    # Visualization
+    "matplotlib>=3.9.0",
+
+    # System & Performance
+    "psutil>=6.1.0",
+    "numba>=0.61.0",
+
+    # Trading Platform
+    "MetaTrader5>=5.0.5000; sys_platform == 'win32'",
+    "TA-Lib>=0.4.32",
+
+    # ML/AI - Tree-based Models (2025 versions)
+    "lightgbm>=4.6.0",
+    "xgboost>=2.1.0",
+    "catboost>=1.2.7",
+
+    # ML/AI - Hyperparameter Optimization
+    "optuna>=4.5.0",
+
+    # ML/AI - Reinforcement Learning
+    "tianshou>=0.5.0",
+    "gymnasium>=0.29.1",
+    "stable-baselines3>=2.7.0",
+    "shimmy>=2.0.0",
+    "tensorboard>=2.18.0",
+
+    # ML/AI - Evolution Strategies
+    "cma>=4.0.0",
+
+    # ML/AI - Deep Learning (PyTorch 2.9 ecosystem)
+    "torch>=2.9.0",
+    "torchvision>=0.24.0",
+    "torchaudio>=2.9.0",
+
+    # ML/AI - Inference & Deployment
+    "onnxruntime>=1.21.0",
+
+    # ML/AI - NLP & Transformers
+    "transformers>=4.48.0",
+    "openai>=1.59.0",
+    
+    # ML/AI - Research Implementations (GPU Optimized)
+    "pytorch-tabnet>=4.1.0",
+    "efficient-kan @ git+https://github.com/Blealtan/efficient-kan.git",
+
+    # Configuration & Validation
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+
+    # Utilities
+    "numexpr>=2.8.0",
+    "threadpoolctl>=3.0.0",
+    "py-cpuinfo>=9.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.10.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "memory-profiler>=0.61.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Black formatter configuration
+[tool.black]
+line-length = 120
+target-version = ["py313"]
+include = '\.pyi?$'
+
+# Ruff linter configuration
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4"]
+ignore = ["N803", "N806"]
+
+# MyPy type checker configuration
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+# Pytest configuration

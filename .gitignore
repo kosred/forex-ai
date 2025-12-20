@@ -1,0 +1,9 @@
+.env
+keys.txt
+/data/
+/models/
+/cache/
+/reports/
+__pycache__/
+*.pyc
+.DS_Store

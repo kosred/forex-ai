@@ -1,0 +1,36 @@
+Metadata-Version: 2.4
+Name: forex-bot
+Version: 0.1.0
+Summary: Forex Trading Bot with Refactored Architecture
+Author-email: Konstantin <konst@example.com>
+Requires-Python: >=3.10
+Requires-Dist: numpy>=2.0.0
+Requires-Dist: pandas>=2.2.3
+Requires-Dist: pyarrow
+Requires-Dist: scipy>=1.14.0
+Requires-Dist: scikit-learn>=1.5.0
+Requires-Dist: joblib
+Requires-Dist: requests
+Requires-Dist: feedparser
+Requires-Dist: PyYAML
+Requires-Dist: matplotlib>=3.9.0
+Requires-Dist: psutil
+Requires-Dist: numba>=0.61.0
+Requires-Dist: MetaTrader5>=5.0.5000
+Requires-Dist: TA-Lib>=0.4.28
+Requires-Dist: lightgbm>=4.5.0
+Requires-Dist: xgboost>=2.1.0
+Requires-Dist: catboost>=1.2.7
+Requires-Dist: optuna>=4.0.0
+Requires-Dist: tianshou>=0.5.0
+Requires-Dist: gymnasium>=0.29.1
+Requires-Dist: stable-baselines3>=2.0.0
+Requires-Dist: cma
+Requires-Dist: torch>=2.6.0
+Requires-Dist: torchvision>=0.21.0
+Requires-Dist: torchaudio>=2.6.0
+Requires-Dist: onnxruntime>=1.20.0
+Requires-Dist: transformers>=4.30.0
+Requires-Dist: openai>=1.0.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: pydantic-settings>=2.0.0

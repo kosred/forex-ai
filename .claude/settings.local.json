@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(dir:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python -m pip install:*)",
+      "Bash(python:*)",
+      "Bash(env)",
+      "Bash(where:*)",
+      "Bash(cat:*)",
+      "WebSearch",
+      "Bash(xargs -I {} sh -c 'grep -l \"\"\"\"def.*pass$\"\"\"\" {} 2>/dev/null')",
+      "Bash(node --version:*)",
+      "Bash(npm --version:*)",
+      "Bash(gcloud --version:*)",
+      "Bash(npm install:*)",
+      "Bash(uvx:*)",
+      "Bash(pip:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(./GoogleCloudSDKInstaller.exe /?)",
+      "Bash(choco:*)",
+      "Bash(chmod:*)",
+      "Bash(npm run build:*)",
+      "Bash(gh pr list:*)",
+      "Bash(copy requirements.txt requirements.txt.backup)",
+      "Bash(ls:*)",
+      "Bash(timeout 10 python:*)",
+      "Bash(timeout 30 python:*)",
+      "Bash(for file in src/forex_bot/execution/mt5_state_manager.py src/forex_bot/execution/trade_doctor.py src/forex_bot/execution/meta_controller.py src/forex_bot/features/indicators.py src/forex_bot/execution/consistency.py src/forex_bot/data/news/base.py src/forex_bot/execution/brokers/mt5_local.py src/forex_bot/data/news/scorers.py src/forex_bot/data/news/store.py src/forex_bot/models/genetic.py src/forex_bot/models/evolution.py src/forex_bot/models/rl.py src/forex_bot/llm/strategist.py src/forex_bot/strategy/challenge.py src/forex_bot/models/rllib_agent.py src/forex_bot/strategy/quality.py src/forex_bot/strategy/evo_prop.py src/forex_bot/strategy/portfolio.py src/forex_bot/training/cpcv.py src/forex_bot/strategy/genetic.py)",
+      "Bash(do sed -i 's/@dataclass$/@dataclass(slots=True)/g' \"$file\")",
+      "Bash(done)",
+      "Bash(rg:*)",
+      "Bash(sort:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

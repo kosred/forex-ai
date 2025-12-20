@@ -1,0 +1,15 @@
+[Unit]
+Description=Forex Bot Training Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment="PYTHONPATH=/home/ubuntu/src"
+ExecStart=/home/ubuntu/venv/bin/python -m forex_bot.main
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
