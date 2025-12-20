@@ -59,7 +59,7 @@ def _apply_resources(cfg: Any, device: str, num_workers: int) -> Any:
 
     cfg = cfg.resources(num_gpus=learner_gpus, num_gpus_per_worker=worker_gpus, num_cpus_per_worker=1)
     # Optimize for CPU: Vectorize environments (4 per worker) to amortize overhead
-    cfg = cfg.rollouts(num_rollout_workers=worker_count, num_envs_per_worker=4)
+    cfg = cfg.env_runners(num_env_runners=worker_count, num_envs_per_env_runner=4)
     return cfg
 
 

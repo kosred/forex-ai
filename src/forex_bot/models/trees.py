@@ -419,8 +419,8 @@ class XGBoostExpert(ExpertModel):
         }
 
         if has_gpu:
-            self.params.setdefault("tree_method", "gpu_hist")
-            self.params.setdefault("predictor", "gpu_predictor")
+            self.params.setdefault("tree_method", "hist")
+            self.params.setdefault("device", "cuda")
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
         if not XGB_AVAILABLE:
