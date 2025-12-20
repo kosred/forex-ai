@@ -571,6 +571,26 @@ class HyperparameterOptimizer:
                     sampler=sampler,
                 )
 
+        # Try Redis with new JournalRedisBackend (Optuna 3.1+)
+        if storage_url.startswith("redis://"):
+            try:
+                from optuna.storages import JournalStorage
+                from optuna.storages.journal import JournalRedisBackend
+
+                redis_backend = JournalRedisBackend(storage_url)
+                storage = JournalStorage(redis_backend)
+                logger.info(f"Using Redis JournalStorage for Optuna: {storage_url}")
+                return optuna.create_study(
+                    study_name=full_name,
+                    storage=storage,
+                    load_if_exists=True,
+                    direction="maximize",
+                    pruner=pruner,
+                    sampler=sampler,
+                )
+            except Exception as exc:
+                logger.info(f"Redis JournalStorage failed: {exc}, trying file journal")
+
         try:
             return optuna.create_study(
                 study_name=full_name,
