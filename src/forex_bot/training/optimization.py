@@ -48,13 +48,22 @@ except ImportError:
 from ..core.config import Settings
 from ..models.device import get_available_gpus, select_device
 from ..models.evolution import EvoExpertCMA
-from ..models.kan import KANExpert
-from ..models.nbeats import NBeatsExpert
 from ..models.rl import RLExpertPPO, RLExpertSAC, _build_continuous_env
-from ..models.tabnet import TabNetExpert
-from ..models.tide import TiDEExpert
 from ..models.transformers import TransformerExpertTorch
 from ..models.trees import ElasticNetExpert, LightGBMExpert, RandomForestExpert
+
+# Dynamic GPU/CPU model selection - use GPU versions when available for Optuna
+_gpus = get_available_gpus()
+if _gpus:
+    from ..models.kan_gpu import KANExpert
+    from ..models.nbeats_gpu import NBeatsExpert
+    from ..models.tabnet_gpu import TabNetExpert
+    from ..models.tide_gpu import TiDEExpert
+else:
+    from ..models.kan import KANExpert
+    from ..models.nbeats import NBeatsExpert
+    from ..models.tabnet import TabNetExpert
+    from ..models.tide import TiDEExpert
 
 logger = logging.getLogger(__name__)
 _JOURNAL_STORAGE_SENTINEL = "__journal__"
