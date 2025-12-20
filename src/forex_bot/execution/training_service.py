@@ -3,12 +3,15 @@ import concurrent.futures
 import json
 import logging
 import os
+import pickle
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
+import torch.distributed as dist  # DDP Sync
 
 from ..core.config import Settings
 from ..data.loader import DataLoader
@@ -19,6 +22,7 @@ from ..strategy.discovery import AutonomousDiscoveryEngine
 from ..training.trainer import ModelTrainer
 
 logger = logging.getLogger(__name__)
+
 
 
 class TrainingService:
@@ -687,44 +691,75 @@ class TrainingService:
     async def _train_global_hpc(self, symbols: list[str], optimize: bool, stop_event: asyncio.Event | None) -> None:
         logger.info("?? HPC Mode Active: Switching to PARALLEL Global Training (All data in RAM).")
 
+        # DDP Synchronization
+        is_ddp = dist.is_available() and dist.is_initialized()
+        rank = dist.get_rank() if is_ddp else 0
+        
+        # Cache path for sharing data between ranks
+        cache_path = Path(self.settings.system.cache_dir) / "hpc_datasets.pkl"
+        
         datasets: list[tuple[str, PreparedDataset]] = []
-        max_workers = max(1, min(self.settings.system.n_jobs, os.cpu_count() or 1))
-        # Avoid spawning hundreds of idle processes when the symbol count is small.
-        max_workers = max(1, min(max_workers, len(symbols)))
 
-        analyzer = None
-        if self.settings.news.enable_news:
-            try:
-                analyzer = await get_sentiment_analyzer(self.settings)
-            except Exception as exc:
-                logger.warning(f"News analyzer unavailable (global HPC): {exc}")
+        if rank == 0:
+            # --- RANK 0: Heavy Lifting ---
+            max_workers = max(1, min(self.settings.system.n_jobs, os.cpu_count() or 1))
+            max_workers = max(1, min(max_workers, len(symbols)))
 
-        raw_frames_map = {}
-        news_map: dict[str, pd.DataFrame | None] = {}
-        for sym in symbols:
-            self.settings.system.symbol = sym
-            await self.data_loader.ensure_history(sym)
-            frames = await self.data_loader.get_training_data(sym)
-            raw_frames_map[sym] = frames
-            logger.info(f"HPC: Loaded raw data for {sym}")
-            if analyzer is not None:
-                news_map[sym] = self._build_news_features(analyzer, sym, frames)
-
-        # Parallel Feature Engineering
-        logger.info(f"HPC: Launching feature engineering on {max_workers} workers...")
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures: dict[concurrent.futures.Future, str] = {}
-            for sym, frames in raw_frames_map.items():
-                fut = executor.submit(_hpc_feature_worker, self.settings.model_copy(), frames, sym, news_map.get(sym))
-                futures[fut] = sym
-
-            for fut in concurrent.futures.as_completed(list(futures.keys())):
+            analyzer = None
+            if self.settings.news.enable_news:
                 try:
-                    sym = futures.get(fut, "UNKNOWN")
-                    ds = fut.result()
-                    datasets.append((sym, ds))
+                    analyzer = await get_sentiment_analyzer(self.settings)
+                except Exception as exc:
+                    logger.warning(f"News analyzer unavailable (global HPC): {exc}")
+
+            raw_frames_map = {}
+            news_map: dict[str, pd.DataFrame | None] = {}
+            
+            for sym in symbols:
+                self.settings.system.symbol = sym
+                await self.data_loader.ensure_history(sym)
+                frames = await self.data_loader.get_training_data(sym)
+                raw_frames_map[sym] = frames
+                logger.info(f"HPC (Rank 0): Loaded raw data for {sym}")
+                if analyzer is not None:
+                    news_map[sym] = self._build_news_features(analyzer, sym, frames)
+
+            # Parallel Feature Engineering
+            logger.info(f"HPC (Rank 0): Launching feature engineering on {max_workers} workers...")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures: dict[concurrent.futures.Future, str] = {}
+                for sym, frames in raw_frames_map.items():
+                    fut = executor.submit(_hpc_feature_worker, self.settings.model_copy(), frames, sym, news_map.get(sym))
+                    futures[fut] = sym
+
+                for fut in concurrent.futures.as_completed(list(futures.keys())):
+                    try:
+                        sym = futures.get(fut, "UNKNOWN")
+                        ds = fut.result()
+                        datasets.append((sym, ds))
+                    except Exception as e:
+                        logger.error(f"HPC Feature Gen failed: {e}")
+            
+            # Save for other ranks
+            if is_ddp:
+                try:
+                    logger.info("HPC (Rank 0): Saving datasets to disk for other ranks...")
+                    joblib.dump(datasets, cache_path)
                 except Exception as e:
-                    logger.error(f"HPC Feature Gen failed: {e}")
+                    logger.error(f"Failed to save HPC datasets: {e}")
+
+        # --- BARRIER ---
+        if is_ddp:
+            logger.info(f"Rank {rank}: Waiting for data preparation...")
+            dist.barrier()
+            
+            if rank > 0:
+                logger.info(f"Rank {rank}: Loading datasets from {cache_path}...")
+                try:
+                    datasets = joblib.load(cache_path)
+                except Exception as e:
+                    logger.error(f"Rank {rank} failed to load datasets: {e}")
+                    return
 
         if not datasets:
             logger.error("HPC: No datasets generated.")
