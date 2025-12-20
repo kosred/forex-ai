@@ -674,13 +674,12 @@ class ModelTrainer:
                                     buffer_dtype=torch.float16,
                                 )
                         shard = ShardingStrategy.FULL_SHARD if ShardingStrategy else None
+                        local_rank = int(os.environ.get("LOCAL_RANK", dist.get_rank() % torch.cuda.device_count()))
                         model.model = FSDP(
                             model.model,
                             sharding_strategy=shard,
                             mixed_precision=mp,
-                            device_id=dist.get_rank() % torch.cuda.device_count()
-                            if torch.cuda.is_available()
-                            else None,
+                            device_id=local_rank if torch.cuda.is_available() else None,
                         )
                         logger.info(f"FSDP enabled for {name}")
                     except Exception as e:
@@ -1064,6 +1063,9 @@ class ModelTrainer:
                     }
                     
                     assigned = []
+                    # Pre-compute sorted index map for O(1) lookup instead of O(n) per model
+                    sorted_models = sorted(models)
+                    index_map = {m: i for i, m in enumerate(sorted_models)}
                     for m in models:
                         if m in deep_models:
                             # Data Parallel: All ranks train this model together
@@ -1072,7 +1074,7 @@ class ModelTrainer:
                         else:
                             # Task Parallel: Split ML models across ranks
                             # deterministic assignment
-                            idx = sorted(models).index(m)
+                            idx = index_map[m]
                             if idx % world_size == rank:
                                 assigned.append(m)
                                 
