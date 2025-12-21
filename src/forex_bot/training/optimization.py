@@ -20,14 +20,6 @@ except Exception:
     redis = None  # type: ignore
     REDIS_PY_AVAILABLE = False
 
-try:  # optional GPU backtest
-    import cupy as cp  # type: ignore
-
-    CUPY_AVAILABLE = True
-except Exception:
-    cp = None  # type: ignore
-    CUPY_AVAILABLE = False
-
 try:
     import optuna
     from optuna.trial import Trial, TrialState
@@ -52,6 +44,7 @@ from ..models.evolution import EvoExpertCMA
 from ..models.rl import RLExpertPPO, RLExpertSAC, _build_continuous_env
 from ..models.transformers import TransformerExpertTorch
 from ..models.trees import ElasticNetExpert, LightGBMExpert, RandomForestExpert
+from ..strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
 
 # Dynamic GPU/CPU model selection - use GPU versions when available for Optuna
 _gpus = get_available_gpus()
@@ -68,239 +61,6 @@ else:
 
 logger = logging.getLogger(__name__)
 _JOURNAL_STORAGE_SENTINEL = "__journal__"
-
-
-def _infer_pip_metrics(symbol: str) -> tuple[float, float]:
-    """
-    Rough heuristic for pip size/pip value per lot for strategy evaluation.
-    """
-    sym = (symbol or "").upper()
-    if sym.startswith(("XAU", "XAG")):
-        return 0.1, 10.0
-    if "BTC" in sym or "ETH" in sym or "LTC" in sym:
-        return 1.0, 1.0
-    if sym.endswith("JPY") or sym.startswith("JPY"):
-        return 0.01, 9.0
-    return 0.0001, 10.0
-
-
-def _fast_backtest(
-    close_prices: np.ndarray,
-    high_prices: np.ndarray,
-    low_prices: np.ndarray,
-    signals: np.ndarray,
-    sl_pips: float,
-    tp_pips: float,
-    pip_value: float = 0.0001,
-    spread_pips: float = 1.5,
-    commission_per_trade: float = 0.0,
-    pip_value_per_lot: float = 10.0,
-) -> np.ndarray:
-    """
-    Lightweight backtester (adapted from fast_backtest) to avoid circular imports.
-    Returns metrics: [NetProfit, Sharpe, Sortino, MaxDD, WinRate, ProfitFactor, Expectancy, SQN, Trades]
-    """
-    n = len(close_prices)
-    equity = 100000.0
-    returns = np.zeros(n)
-    trade_count = 0
-    wins = 0
-    losses = 0
-    gross_profit = 0.0
-    gross_loss = 0.0
-
-    in_position = 0
-    entry_price = 0.0
-
-    cash_per_pip = pip_value_per_lot
-
-    for i in range(1, n):
-        if in_position != 0:
-            current_low = low_prices[i]
-            current_high = high_prices[i]
-
-            pnl = 0.0
-            exit_signal = False
-
-            if in_position == 1:
-                sl_price = entry_price - (sl_pips * pip_value)
-                tp_price = entry_price + (tp_pips * pip_value)
-                if current_low <= sl_price:
-                    pnl = (sl_price - entry_price) / pip_value * cash_per_pip
-                    exit_signal = True
-                elif current_high >= tp_price:
-                    pnl = (tp_price - entry_price) / pip_value * cash_per_pip
-                    exit_signal = True
-                elif signals[i] == -1:
-                    pnl = (close_prices[i] - entry_price) / pip_value * cash_per_pip
-                    exit_signal = True
-            elif in_position == -1:
-                sl_price = entry_price + (sl_pips * pip_value)
-                tp_price = entry_price - (tp_pips * pip_value)
-                if current_high >= sl_price:
-                    pnl = (entry_price - sl_price) / pip_value * cash_per_pip
-                    exit_signal = True
-                elif current_low <= tp_price:
-                    pnl = (entry_price - tp_price) / pip_value * cash_per_pip
-                    exit_signal = True
-                elif signals[i] == 1:
-                    pnl = (entry_price - close_prices[i]) / pip_value * cash_per_pip
-                    exit_signal = True
-
-            if exit_signal:
-                cost = (spread_pips * cash_per_pip) + commission_per_trade
-                pnl -= cost
-                equity += pnl
-                returns[trade_count] = pnl
-                trade_count += 1
-                in_position = 0
-                if pnl > 0:
-                    wins += 1
-                    gross_profit += pnl
-                else:
-                    losses += 1
-                    gross_loss += abs(pnl)
-
-        if in_position == 0:
-            sig = signals[i]
-            if sig == 1:
-                in_position = 1
-                entry_price = close_prices[i] + (spread_pips * pip_value)
-            elif sig == -1:
-                in_position = -1
-                entry_price = close_prices[i]
-
-    if trade_count == 0:
-        return np.zeros(10)
-
-    net_profit = equity - 100000.0
-    win_rate = wins / trade_count
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 99.0
-    trade_rets = returns[:trade_count]
-    avg_trade = np.mean(trade_rets)
-    std_trade = np.std(trade_rets)
-    sharpe = (avg_trade / std_trade) * np.sqrt(trade_count) if std_trade > 0 else 0.0
-    downside = trade_rets[trade_rets < 0]
-    std_down = np.std(downside) if len(downside) > 0 else 1.0
-    sortino = (avg_trade / std_down) * np.sqrt(trade_count) if std_down > 0 else 0.0
-    equity_curve = np.zeros(trade_count + 1)
-    equity_curve[0] = 100000.0
-    curr = 100000.0
-    max_dd = 0.0
-    peak = 100000.0
-    for k in range(trade_count):
-        curr += trade_rets[k]
-        equity_curve[k + 1] = curr
-        if curr > peak:
-            peak = curr
-        dd = (peak - curr) / peak
-        if dd > max_dd:
-            max_dd = dd
-    expectancy = avg_trade
-    sqn = (avg_trade / std_trade) * np.sqrt(trade_count) if std_trade > 0 else 0.0
-
-    if trade_count > 2:
-        x = np.arange(trade_count + 1, dtype=np.float32)
-        y = equity_curve[: trade_count + 1]
-        n_points = float(len(x))
-        sum_x = np.sum(x)
-        sum_y = np.sum(y)
-        sum_xy = np.sum(x * y)
-        sum_xx = np.sum(x * x)
-        sum_yy = np.sum(y * y)
-        numerator = (n_points * sum_xy) - (sum_x * sum_y)
-        denominator_x = (n_points * sum_xx) - (sum_x * sum_x)
-        denominator_y = (n_points * sum_yy) - (sum_y * sum_y)
-        if denominator_x > 0 and denominator_y > 0:
-            r = numerator / np.sqrt(denominator_x * denominator_y)
-            r_squared = r * r
-        else:
-            r_squared = 0.0
-    else:
-        r_squared = 0.0
-
-    return np.array(
-        [
-            net_profit,
-            sharpe,
-            sortino,
-            max_dd,
-            win_rate,
-            profit_factor,
-            expectancy,
-            sqn,
-            float(trade_count),
-            r_squared,
-        ]
-    )
-
-
-def _fast_backtest_gpu(
-    close_prices: np.ndarray,
-    high_prices: np.ndarray,
-    low_prices: np.ndarray,
-    signals: np.ndarray,
-    sl_pips: float,
-    tp_pips: float,
-    pip_value: float = 0.0001,
-    spread_pips: float = 1.5,
-    commission_per_trade: float = 0.0,
-    pip_value_per_lot: float = 10.0,
-) -> np.ndarray:
-    """
-    GPU-accelerated approximation of _fast_backtest.
-    Uses vectorized returns; ignores intra-bar SL/TP but keeps spread/commission.
-    """
-    if not CUPY_AVAILABLE:
-        raise RuntimeError("CuPy not available")
-    if close_prices.size == 0:
-        return np.zeros(10, dtype=np.float32)
-    c_close = cp.asarray(close_prices, dtype=cp.float32)
-    c_future = cp.roll(c_close, -1)
-    price_diff = c_future - c_close
-    c_sig = cp.asarray(signals.astype(np.int8))
-    # pip returns
-    pnl = (price_diff / pip_value) * pip_value_per_lot * c_sig
-    # costs
-    cost = spread_pips * pip_value_per_lot + commission_per_trade
-    pnl = pnl - cost * (c_sig != 0)
-    pnl = pnl[:-1]  # last element invalid due to roll
-    equity = cp.cumsum(pnl) + 100000.0
-    ret = pnl / 100000.0
-    trades = cp.count_nonzero(c_sig)
-    if trades <= 1:
-        return cp.zeros(10, dtype=cp.float32).get()
-    avg = cp.mean(ret)
-    std = cp.std(ret) + 1e-12
-    sharpe = float((avg / std) * cp.sqrt(len(ret)))
-    downside = cp.std(cp.minimum(ret, 0.0)) + 1e-12
-    sortino = float((avg / downside) * cp.sqrt(len(ret)))
-    cummax = cp.maximum.accumulate(equity)
-    drawdown = (cummax - equity) / cummax
-    max_dd = float(cp.max(drawdown))
-    win_rate = float(cp.mean(ret > 0))
-    gross_profit = float(cp.sum(ret[ret > 0])) if cp.any(ret > 0) else 0.0
-    gross_loss = float(cp.sum(ret[ret < 0])) if cp.any(ret < 0) else 0.0
-    profit_factor = abs(gross_profit / gross_loss) if gross_loss != 0 else 0.0
-    expectancy = float(cp.mean(ret))
-    sqn = float(cp.sqrt(trades) * expectancy / (std if std > 0 else 1e-6))
-    r_squared = 0.0
-    return cp.array(
-        [
-            float(equity[-2] - 100000.0),
-            sharpe,
-            sortino,
-            max_dd,
-            win_rate,
-            profit_factor,
-            expectancy,
-            sqn,
-            float(trades),
-            r_squared,
-        ],
-        dtype=cp.float32,
-    ).get()
-
 
 class HyperparameterOptimizer:
     """
@@ -886,10 +646,30 @@ class HyperparameterOptimizer:
             commission = float(getattr(self.settings.risk, "commission_per_lot", 7.0))
             dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.08))
 
-            use_gpu_bt = CUPY_AVAILABLE and bool(int(os.environ.get("GPU_BACKTEST", "1")))
             close_all = meta_val["close"].to_numpy()
             high_all = meta_val["high"].to_numpy()
             low_all = meta_val["low"].to_numpy()
+
+            # Month indices for consistency tracking (fast_backtest API).
+            month_indices_all = np.zeros(len(meta_val), dtype=np.int64)
+            try:
+                ts: pd.DatetimeIndex | None
+                idx = getattr(meta_val, "index", None)
+                if isinstance(idx, pd.DatetimeIndex):
+                    ts = idx
+                else:
+                    ts = None
+                    for col in ("timestamp", "time", "datetime", "date"):
+                        if col in meta_val.columns:
+                            ts = pd.DatetimeIndex(pd.to_datetime(meta_val[col], utc=True, errors="coerce"))
+                            break
+                if ts is not None and len(ts) == len(meta_val):
+                    if ts.tz is not None:
+                        ts = ts.tz_convert("UTC")
+                    raw = ts.year.to_numpy() * 12 + ts.month.to_numpy()
+                    month_indices_all = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
+            except Exception:
+                month_indices_all = np.zeros(len(meta_val), dtype=np.int64)
 
             # Multi-symbol pooled validation: score profitability per symbol and aggregate.
             sym_series = meta_val["symbol"] if "symbol" in meta_val.columns else None
@@ -906,48 +686,21 @@ class HyperparameterOptimizer:
                     high = high_all[mask]
                     low = low_all[mask]
                     sig = signals[mask]
-                    pip_size, pip_value_per_lot = _infer_pip_metrics(str(sym))
-
-                    if use_gpu_bt:
-                        try:
-                            metrics = _fast_backtest_gpu(
-                                close_prices=close,
-                                high_prices=high,
-                                low_prices=low,
-                                signals=sig,
-                                sl_pips=sl_pips,
-                                tp_pips=tp_pips,
-                                pip_value=pip_size,
-                                spread_pips=spread,
-                                commission_per_trade=commission,
-                                pip_value_per_lot=pip_value_per_lot,
-                            )
-                        except Exception:
-                            metrics = _fast_backtest(
-                                close_prices=close,
-                                high_prices=high,
-                                low_prices=low,
-                                signals=sig,
-                                sl_pips=sl_pips,
-                                tp_pips=tp_pips,
-                                pip_value=pip_size,
-                                spread_pips=spread,
-                                commission_per_trade=commission,
-                                pip_value_per_lot=pip_value_per_lot,
-                            )
-                    else:
-                        metrics = _fast_backtest(
-                            close_prices=close,
-                            high_prices=high,
-                            low_prices=low,
-                            signals=sig,
-                            sl_pips=sl_pips,
-                            tp_pips=tp_pips,
-                            pip_value=pip_size,
-                            spread_pips=spread,
-                            commission_per_trade=commission,
-                            pip_value_per_lot=pip_value_per_lot,
-                        )
+                    month_idx = month_indices_all[mask]
+                    pip_size, pip_value_per_lot = infer_pip_metrics(str(sym))
+                    metrics = fast_evaluate_strategy(
+                        close_prices=close,
+                        high_prices=high,
+                        low_prices=low,
+                        signals=sig,
+                        month_indices=month_idx,
+                        sl_pips=sl_pips,
+                        tp_pips=tp_pips,
+                        pip_value=pip_size,
+                        spread_pips=spread,
+                        commission_per_trade=commission,
+                        pip_value_per_lot=pip_value_per_lot,
+                    )
 
                     net_profit, sharpe, _sortino, max_dd, win_rate, profit_factor, _exp, _sqn, trades, _r2 = metrics
                     if max_dd >= dd_limit:
@@ -971,47 +724,20 @@ class HyperparameterOptimizer:
                 agg = weighted / max(total_trades, 1.0)
                 return float(self.prop_weight * agg + self.acc_weight * acc)
 
-            pip_size, pip_value_per_lot = _infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
-            if use_gpu_bt:
-                try:
-                    metrics = _fast_backtest_gpu(
-                        close_prices=close_all,
-                        high_prices=high_all,
-                        low_prices=low_all,
-                        signals=signals,
-                        sl_pips=sl_pips,
-                        tp_pips=tp_pips,
-                        pip_value=pip_size,
-                        spread_pips=spread,
-                        commission_per_trade=commission,
-                        pip_value_per_lot=pip_value_per_lot,
-                    )
-                except Exception:
-                    metrics = _fast_backtest(
-                        close_prices=close_all,
-                        high_prices=high_all,
-                        low_prices=low_all,
-                        signals=signals,
-                        sl_pips=sl_pips,
-                        tp_pips=tp_pips,
-                        pip_value=pip_size,
-                        spread_pips=spread,
-                        commission_per_trade=commission,
-                        pip_value_per_lot=pip_value_per_lot,
-                    )
-            else:
-                metrics = _fast_backtest(
-                    close_prices=close_all,
-                    high_prices=high_all,
-                    low_prices=low_all,
-                    signals=signals,
-                    sl_pips=sl_pips,
-                    tp_pips=tp_pips,
-                    pip_value=pip_size,
-                    spread_pips=spread,
-                    commission_per_trade=commission,
-                    pip_value_per_lot=pip_value_per_lot,
-                )
+            pip_size, pip_value_per_lot = infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
+            metrics = fast_evaluate_strategy(
+                close_prices=close_all,
+                high_prices=high_all,
+                low_prices=low_all,
+                signals=signals,
+                month_indices=month_indices_all,
+                sl_pips=sl_pips,
+                tp_pips=tp_pips,
+                pip_value=pip_size,
+                spread_pips=spread,
+                commission_per_trade=commission,
+                pip_value_per_lot=pip_value_per_lot,
+            )
 
             net_profit, sharpe, sortino, max_dd, win_rate, profit_factor, expectancy, sqn, trades, _r2 = metrics
             required = float(self._prop_required_trades(meta_val))

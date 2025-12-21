@@ -10,14 +10,6 @@ import numpy as np
 import pandas as pd
 import torch.distributed as dist
 
-try:
-    import cupy as cp  # type: ignore
-
-    CUPY_AVAILABLE = True
-except Exception:
-    cp = None  # type: ignore
-    CUPY_AVAILABLE = False
-
 from ..core.config import Settings
 from ..features.talib_mixer import TALIB_AVAILABLE, TALibStrategyMixer
 from .fast_backtest import fast_evaluate_strategy, infer_pip_metrics
@@ -61,6 +53,15 @@ class PropAwareStrategySearch:
     ) -> None:
         self.settings = settings
         self.df = df
+        self._month_indices = np.zeros(len(self.df), dtype=np.int64)
+        try:
+            idx = getattr(self.df, "index", None)
+            if isinstance(idx, pd.DatetimeIndex) and len(idx) == len(self.df):
+                ts = idx.tz_convert("UTC") if idx.tz is not None else idx
+                raw = ts.year.to_numpy() * 12 + ts.month.to_numpy()
+                self._month_indices = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
+        except Exception:
+            self._month_indices = np.zeros(len(self.df), dtype=np.int64)
         self.checkpoint_path = checkpoint_path
         self.max_time_hours = max_time_hours
         self.mixer = TALibStrategyMixer(device=getattr(settings.system, "device", "cpu"))
@@ -171,76 +172,33 @@ class PropAwareStrategySearch:
         sl_pips = float(getattr(gene, "sl_pips", 20.0))
         spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
         commission = float(getattr(self.settings.risk, "commission_per_lot", 7.0))
+        pip_size, pip_value_per_lot = infer_pip_metrics(self.symbol)
+        metrics = fast_evaluate_strategy(
+            close_prices=close,
+            high_prices=high,
+            low_prices=low,
+            signals=signals,
+            month_indices=self._month_indices,
+            sl_pips=sl_pips,
+            tp_pips=tp_pips,
+            spread_pips=spread,
+            commission_per_trade=commission,
+            pip_value=pip_size,
+            pip_value_per_lot=pip_value_per_lot,
+        )
 
-        use_gpu = CUPY_AVAILABLE and getattr(self.settings.system, "device", "cpu") == "cuda"
-        if use_gpu:
-            try:
-                metrics = _fast_backtest_gpu(
-                    close_prices=close,
-                    high_prices=high,
-                    low_prices=low,
-                    signals=signals,
-                    sl_pips=sl_pips,
-                    tp_pips=tp_pips,
-                    spread_pips=spread,
-                    commission_per_trade=commission,
-                )
-            except Exception as exc:
-                logger.warning(f"GPU backtest failed, falling back to CPU: {exc}")
-                use_gpu = False
-        # FIX: Generate month indices for consistency tracking
-        if not hasattr(self.df.index, "year"):
-            month_indices = np.zeros(len(self.df), dtype=np.int64)
-        else:
-            month_indices = (self.df.index.year * 12 + self.df.index.month).to_numpy(dtype=np.int64)
-
-        if not use_gpu:
-            pip_size, pip_value_per_lot = infer_pip_metrics(self.symbol)
-            metrics = fast_evaluate_strategy(
-                close_prices=close,
-                high_prices=high,
-                low_prices=low,
-                signals=signals,
-                month_indices=month_indices,
-                sl_pips=sl_pips,
-                tp_pips=tp_pips,
-                spread_pips=spread,
-                commission_per_trade=commission,
-                pip_value=pip_size,
-                pip_value_per_lot=pip_value_per_lot,
-            )
-        else:
-            # GPU path: add month_indices to metrics (append consistency=0 for parity)
-            if len(metrics) == 9:
-                metrics = np.concatenate([metrics, np.array([0.0])])
-
-        # Align metric unpacking (CPU returns 10 values incl consistency)
-        consistency = 0.0
-        if len(metrics) == 10:
-            (
-                net_profit,
-                sharpe,
-                sortino,
-                max_dd,
-                win_rate,
-                profit_factor,
-                expectancy,
-                sqn,
-                trades,
-                consistency,
-            ) = metrics
-        else:
-            (
-                net_profit,
-                sharpe,
-                sortino,
-                max_dd,
-                win_rate,
-                profit_factor,
-                expectancy,
-                sqn,
-                trades,
-            ) = metrics
+        (
+            net_profit,
+            sharpe,
+            sortino,
+            max_dd,
+            win_rate,
+            profit_factor,
+            expectancy,
+            sqn,
+            trades,
+            _consistency,
+        ) = metrics
         fitness = self._prop_metric(metrics)
         res = FitnessResult(
             fitness=fitness,
@@ -355,114 +313,3 @@ def run_evo_search(
         actual_balance=actual_balance,
     )
     return search.run(generations=generations)
-
-
-def _fast_backtest_gpu(
-    close_prices: np.ndarray,
-    high_prices: np.ndarray,
-    low_prices: np.ndarray,
-    signals: np.ndarray,
-    sl_pips: float,
-    tp_pips: float,
-    pip_value: float = 0.0001,
-    spread_pips: float = 1.5,
-    commission_per_trade: float = 0.0,
-) -> np.ndarray:
-    if not CUPY_AVAILABLE or cp is None:
-        raise RuntimeError("CuPy not available")
-    close = cp.asarray(close_prices)
-    high = cp.asarray(high_prices)
-    low = cp.asarray(low_prices)
-    sig = cp.asarray(signals)
-    n = close.shape[0]
-    equity = cp.float64(100000.0)
-    peak = cp.float64(100000.0)
-    returns = cp.zeros(n)
-    trade_count = 0
-    wins = 0
-    losses = 0
-    gross_profit = cp.float64(0.0)
-    gross_loss = cp.float64(0.0)
-    in_pos = 0
-    entry = cp.float64(0.0)
-
-    for i in range(1, n):
-        if in_pos != 0:
-            pnl = cp.float64(0.0)
-            exit_signal = False
-            if in_pos == 1:
-                sl_price = entry - (sl_pips * pip_value)
-                tp_price = entry + (tp_pips * pip_value)
-                if low[i] <= sl_price:
-                    pnl = (sl_price - entry) / pip_value * 10.0
-                    exit_signal = True
-                elif high[i] >= tp_price:
-                    pnl = (tp_price - entry) / pip_value * 10.0
-                    exit_signal = True
-                elif sig[i] == -1:
-                    pnl = (close[i] - entry) / pip_value * 10.0
-                    exit_signal = True
-            elif in_pos == -1:
-                sl_price = entry + (sl_pips * pip_value)
-                tp_price = entry - (tp_pips * pip_value)
-                if high[i] >= sl_price:
-                    pnl = (entry - sl_price) / pip_value * 10.0
-                    exit_signal = True
-                elif low[i] <= tp_price:
-                    pnl = (entry - tp_price) / pip_value * 10.0
-                    exit_signal = True
-                elif sig[i] == 1:
-                    pnl = (entry - close[i]) / pip_value * 10.0
-                    exit_signal = True
-            if exit_signal:
-                cost = (spread_pips * 10.0) + commission_per_trade
-                pnl -= cost
-                equity += pnl
-                returns[trade_count] = pnl
-                trade_count += 1
-                in_pos = 0
-                if pnl > 0:
-                    wins += 1
-                    gross_profit += pnl
-                else:
-                    losses += 1
-                    gross_loss += cp.abs(pnl)
-                peak = cp.maximum(peak, equity)
-        if in_pos == 0:
-            if sig[i] == 1:
-                in_pos = 1
-                entry = close[i] + (spread_pips * pip_value)
-            elif sig[i] == -1:
-                in_pos = -1
-                entry = close[i]
-
-    if trade_count == 0:
-        return np.zeros(9)
-
-    net_profit = float(equity.get() - 100000.0)
-    win_rate = float(wins / trade_count) if trade_count > 0 else 0.0
-    profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else 99.0
-    trade_rets = cp.asnumpy(returns[:trade_count])
-    avg_trade = float(trade_rets.mean())
-    std_trade = float(trade_rets.std())
-    sharpe = (avg_trade / std_trade) * np.sqrt(trade_count) if std_trade > 0 else 0.0
-    downside = trade_rets[trade_rets < 0]
-    std_down = downside.std() if len(downside) > 0 else 1.0
-    sortino = (avg_trade / std_down) * np.sqrt(trade_count) if std_down > 0 else 0.0
-    equity_curve = np.zeros(trade_count + 1)
-    equity_curve[0] = 100000.0
-    cur = 100000.0
-    max_dd = 0.0
-    peak_eq = 100000.0
-    for k in range(trade_count):
-        cur += trade_rets[k]
-        peak_eq = max(peak_eq, cur)
-        dd = (peak_eq - cur) / peak_eq
-        if dd > max_dd:
-            max_dd = dd
-    expectancy = avg_trade
-    sqn = (avg_trade / std_trade) * np.sqrt(trade_count) if std_trade > 0 else 0.0
-    # GPU path lacks month grouping info; set consistency to 0 by default
-    return np.array(
-        [net_profit, sharpe, sortino, max_dd, win_rate, profit_factor, expectancy, sqn, float(trade_count), 0.0]
-    )
