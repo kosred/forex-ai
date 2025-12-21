@@ -25,6 +25,7 @@ data.zip
 claude-gpu-on-hyperstack.txt
 2025-12-21-what-mcp-tools-you-have.txt
 eval*.md
+audit_log*.md
 launch_multi_gpu.sh
 nul
 __pycache__/
