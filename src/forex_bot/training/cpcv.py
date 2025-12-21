@@ -427,13 +427,18 @@ class CombinatorialPurgedCV:
         max_dd = 0.0
         if hasattr(x_test, "index") and "close" in x_test.columns:
             try:
-                close = x_test["close"].to_numpy()
-                future = np.roll(close, -1)
-                ret = (future - close) / close
+                close = x_test["close"].to_numpy(dtype=float)
+                if len(close) < 2:
+                    raise ValueError("Insufficient close prices for drawdown calc")
+
+                # Use next-bar returns and drop the last bar (no future).
+                base = np.clip(close[:-1], 1e-12, None)
+                ret = (close[1:] - close[:-1]) / base
                 pnl = []
                 equity = 1.0
                 peak = equity
-                for s, r in zip(y_pred, ret, strict=False):
+                y_pred_arr = np.asarray(y_pred)[: len(ret)]
+                for s, r in zip(y_pred_arr, ret, strict=False):
                     if s == 0:
                         pnl.append(0.0)
                     elif s == 1:

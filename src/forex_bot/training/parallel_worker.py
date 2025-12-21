@@ -37,8 +37,10 @@ def _load_memmap_dataset(dataset_dir: Path) -> tuple[pd.DataFrame, pd.Series]:
         meta = {}
 
     cols = json.loads(cols_path.read_text(encoding="utf-8"))
-    X_mm = np.load(x_path, mmap_mode="r")
-    y_mm = np.load(y_path, mmap_mode="r")
+    # Copy-on-write keeps the backing file read-only but marks the array writeable, which
+    # avoids unnecessary copies in some downstream pipelines that require writeable inputs.
+    X_mm = np.load(x_path, mmap_mode="c")
+    y_mm = np.load(y_path, mmap_mode="c")
 
     index = None
     if idx_path.exists():

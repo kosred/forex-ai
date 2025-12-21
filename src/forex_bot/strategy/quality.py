@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -223,11 +224,33 @@ class StrategyQualityAnalyzer:
     def _calculate_trade_frequency(self, trades: pd.DataFrame) -> float:
         if len(trades) == 0:
             return 0.0
-        start = pd.to_datetime(trades["entry_time"].min())
-        end = pd.to_datetime(trades["entry_time"].max())
-        days = (end - start).days
-        months = days / 30.0 if days > 0 else 1.0
-        return len(trades) / months
+        try:
+            ts = pd.to_datetime(trades["entry_time"], utc=True, errors="coerce")
+            ts = ts[~ts.isna()]
+            if len(ts) == 0:
+                return 0.0
+
+            # Count unique weekday dates that actually had trades. This naturally accounts for weekends/holidays.
+            ts = ts[ts.dt.weekday < 5]
+            if len(ts) == 0:
+                return 0.0
+            unique_days = pd.unique(ts.dt.normalize())
+            trading_days = float(len(unique_days))
+
+            try:
+                days_per_month = float(os.environ.get("FOREX_BOT_TRADING_DAYS_PER_MONTH", "21") or 21.0)
+            except Exception:
+                days_per_month = 21.0
+            days_per_month = max(1.0, days_per_month)
+
+            months = max(1e-6, trading_days / days_per_month)
+            return float(len(ts) / months)
+        except Exception:
+            start = pd.to_datetime(trades["entry_time"].min())
+            end = pd.to_datetime(trades["entry_time"].max())
+            days = (end - start).days
+            months = days / 30.0 if days > 0 else 1.0
+            return len(trades) / months
 
     def _score_strategy(self, metrics: StrategyMetrics) -> None:
         score = 0.0

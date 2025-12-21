@@ -13,13 +13,14 @@ if __name__ == "__main__" and __package__ is None:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     __package__ = "forex_bot"
 
-try:
-    print("[INIT] Checking and auto-installing dependencies (Hardware-Aware)...", flush=True)
-    from forex_bot.core.deps import ensure_dependencies
+if __name__ == "__main__":
+    try:
+        print("[INIT] Checking and auto-installing dependencies (Hardware-Aware)...", flush=True)
+        from forex_bot.core.deps import ensure_dependencies
 
-    ensure_dependencies()
-except Exception as dep_err:
-    print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
+        ensure_dependencies()
+    except Exception as dep_err:
+        print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
 
 from forex_bot.core.config import Settings
 from forex_bot.core.logging import setup_logging

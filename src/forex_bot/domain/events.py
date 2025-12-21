@@ -65,7 +65,8 @@ class RiskEvent:
 
     def __post_init__(self):
         # UUIDv4 avoids collisions and is fast; truncate for compactness.
-        self.event_id = uuid.uuid4().hex[:12]
+        # 16 hex chars = 64 bits; far lower collision risk than 12 (48 bits).
+        self.event_id = uuid.uuid4().hex[:16]
 
     def to_dict(self) -> dict:
         return {

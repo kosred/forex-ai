@@ -19,6 +19,7 @@ from ..execution.trade_doctor import TradeDoctor
 from ..execution.training_service import TrainingService
 from ..features.engine import SignalEngine
 from ..models.unsupervised import MarketRegimeClassifier
+from ..strategy.fast_backtest import infer_pip_metrics
 from ..training.online_learner import OnlineLearner
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,13 @@ class TradingEngine:
         self.last_prob = None
         self.last_close_price = None
         self.last_signal = None
+
+        # Drift "neutral" band should be symbol-aware (pip size differs across FX/JPY/metals/crypto).
+        try:
+            pip_size, _pip_value_per_lot = infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
+            self._drift_epsilon = max(1e-12, float(pip_size) * 0.1)  # 0.1 pip
+        except Exception:
+            self._drift_epsilon = 1e-5
 
         # Unsupervised Regime Classifier
         self.regime_classifier = MarketRegimeClassifier()
@@ -196,9 +204,10 @@ class TradingEngine:
                     # Determine true label for the *previous* period
                     # If price went up, y_true=1 (Buy). Down, y_true=-1 (Sell). Flat, y_true=0 (Neutral).
                     price_change = current_close - self.last_close_price
-                    if price_change > 1e-5:
+                    eps = float(getattr(self, "_drift_epsilon", 1e-5))
+                    if price_change > eps:
                         y_true = 1  # Buy/Up
-                    elif price_change < -1e-5:
+                    elif price_change < -eps:
                         y_true = -1  # Sell/Down
                     else:
                         y_true = 0  # Neutral

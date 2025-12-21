@@ -24,6 +24,7 @@ class GeneticGene:
     weights: dict[str, float] = field(default_factory=dict)
     preferred_regime: str = "any"
     fitness: float = 0.0
+    evaluated: bool = False
     sharpe_ratio: float = 0.0
     win_rate: float = 0.0
     max_drawdown: float = 0.0
@@ -138,9 +139,92 @@ class GeneticStrategyEvolution:
 
         logger.info("Initialized population with Hybrid Genesis + Gauntlet (Size: %s)", len(self.population))
 
+    @staticmethod
+    def _month_indices(df: pd.DataFrame) -> np.ndarray:
+        month_indices = np.zeros(len(df), dtype=np.int64)
+        try:
+            idx = getattr(df, "index", None)
+            if isinstance(idx, pd.DatetimeIndex) and len(idx) == len(df):
+                ts = idx.tz_convert("UTC") if idx.tz is not None else idx
+                raw = ts.year.to_numpy() * 12 + ts.month.to_numpy()
+                month_indices = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
+        except Exception:
+            month_indices = np.zeros(len(df), dtype=np.int64)
+        return month_indices
+
+    def _evaluate_population(self, df: pd.DataFrame, genes: list[GeneticGene]) -> None:
+        if not genes or self.mixer is None:
+            return
+
+        if not {"close", "high", "low"}.issubset(set(df.columns)):
+            logger.warning("Cannot evaluate genes: validation_data missing OHLC columns.")
+            for g in genes:
+                if not getattr(g, "evaluated", False):
+                    g.fitness = -1e9
+                    g.evaluated = True
+            return
+
+        from .fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+
+        close = df["close"].to_numpy(dtype=np.float64)
+        high = df["high"].to_numpy(dtype=np.float64)
+        low = df["low"].to_numpy(dtype=np.float64)
+        month_idx = self._month_indices(df)
+        pip_size, pip_value_per_lot = infer_pip_metrics("")
+
+        for gene in genes:
+            if getattr(gene, "evaluated", False):
+                continue
+            try:
+                sig = self.mixer.compute_signals(df, gene).to_numpy(dtype=np.int8)
+                arr = fast_evaluate_strategy(
+                    close_prices=close,
+                    high_prices=high,
+                    low_prices=low,
+                    signals=sig,
+                    month_indices=month_idx,
+                    sl_pips=float(getattr(gene, "sl_pips", 20.0)),
+                    tp_pips=float(getattr(gene, "tp_pips", 40.0)),
+                    pip_value=float(pip_size),
+                    spread_pips=1.5,
+                    commission_per_trade=0.0,
+                    pip_value_per_lot=float(pip_value_per_lot),
+                )
+
+                net_profit = float(arr[0])
+                sharpe = float(arr[1])
+                max_dd = float(arr[3])
+                win_rate = float(arr[4])
+                profit_factor = float(arr[5])
+                expectancy = float(arr[6])
+                trades = int(arr[8]) if len(arr) > 8 else 0
+
+                # Fitness: prioritize risk-adjusted return; heavily penalize "no trade" strategies.
+                if trades <= 0:
+                    fitness = -1e9
+                else:
+                    fitness = sharpe + (net_profit / 10_000.0) - (5.0 * max_dd)
+
+                gene.fitness = float(fitness)
+                gene.sharpe_ratio = sharpe
+                gene.win_rate = win_rate
+                gene.max_drawdown = max_dd
+                gene.profit_factor = profit_factor
+                gene.expectancy = expectancy
+                gene.trades_count = trades
+                gene.evaluated = True
+            except Exception as exc:
+                logger.debug(f"Gene evaluation failed for {gene.strategy_id}: {exc}")
+                gene.fitness = -1e9
+                gene.trades_count = 0
+                gene.evaluated = True
+
     def evolve(self, validation_data: pd.DataFrame | None = None) -> list[GeneticGene]:
         if not self.population:
             raise RuntimeError("Population not initialized. Call initialize_population() first.")
+
+        if validation_data is not None and self.mixer is not None:
+            self._evaluate_population(validation_data, self.population)
 
         self.population.sort(key=lambda x: x.fitness, reverse=True)
         self.best_gene = self.population[0]
@@ -157,18 +241,8 @@ class GeneticStrategyEvolution:
             child_gene.generation = self.generation + 1
             next_gen.append(child_gene)
 
-        # Evaluation Step (Fix for Zombie Evolution)
         if validation_data is not None and self.mixer is not None:
-            from .gauntlet import StrategyGauntlet
-
-            gauntlet = StrategyGauntlet(self.mixer, validation_data)
-
-            # Only evaluate new genes (fitness == 0.0) to save time
-            # Elite genes preserve their fitness
-            for gene in next_gen:
-                if gene.fitness == 0.0:
-                    gauntlet.run(gene)
-                    gene.generation = self.generation + 1
+            self._evaluate_population(validation_data, next_gen)
 
         self.population = next_gen
         # Re-sort to put best new children at top
@@ -188,6 +262,7 @@ class GeneticStrategyEvolution:
         child_dict: dict[str, Any] = {}
         for k, v in asdict(p1).items():
             if k in [
+                "evaluated",
                 "fitness",
                 "sharpe_ratio",
                 "win_rate",

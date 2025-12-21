@@ -116,22 +116,36 @@ class PersistenceService:
 
         prefer_gpu = self._prefer_gpu()
         for name in active:
+            candidates: list[type[ExpertModel]] = []
             try:
-                cls = get_model_class(name, prefer_gpu=prefer_gpu)
-                model = cls()
-                model.load(str(self.models_dir))
-                models[name] = model
-            except Exception as e:
-                if prefer_gpu:
-                    try:
-                        cls_cpu = get_model_class(name, prefer_gpu=False)
-                        model = cls_cpu()
-                        model.load(str(self.models_dir))
-                        models[name] = model
-                        continue
-                    except Exception:
-                        pass
-                logger.warning(f"Failed to load {name}: {e}")
+                candidates.append(get_model_class(name, prefer_gpu=prefer_gpu))
+            except Exception:
+                candidates = []
+            try:
+                candidates.append(get_model_class(name, prefer_gpu=not prefer_gpu))
+            except Exception:
+                pass
+
+            # De-duplicate while preserving order.
+            unique: list[type[ExpertModel]] = []
+            for cls in candidates:
+                if cls not in unique:
+                    unique.append(cls)
+
+            last_exc: Exception | None = None
+            loaded = False
+            for cls in unique:
+                try:
+                    model = cls()
+                    model.load(str(self.models_dir))
+                    models[name] = model
+                    loaded = True
+                    break
+                except Exception as exc:
+                    last_exc = exc
+
+            if not loaded:
+                logger.warning(f"Failed to load {name}: {last_exc}")
 
         try:
             blender = MetaBlender.load(self.models_dir / "meta_blender.joblib")

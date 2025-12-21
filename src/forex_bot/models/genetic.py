@@ -150,20 +150,19 @@ class GeneticStrategyExpert(ExpertModel):
             # Average vote
             avg_vote = total_vote / len(self.portfolio)
 
-            probs = np.zeros((n, 3), dtype=float)
-
-            # Thresholding for consensus
-            # > 0.3 means "Weak Buy", > 0.6 means "Strong Buy"
-            # Here we map simple majority
-            probs[avg_vote > 0.1, 1] = 1.0  # Buy
-            probs[avg_vote < -0.1, 2] = 1.0  # Sell
-            probs[(avg_vote >= -0.1) & (avg_vote <= 0.1), 0] = 1.0  # Neutral
-
-            # Normalize rows to sum to 1 just in case
-            row_sums = probs.sum(axis=1, keepdims=True) + 1e-9
-            probs = probs / row_sums
-
-            return probs
+            # Map average vote into smooth 3-class probabilities.
+            # - Neutral dominates near 0 vote
+            # - Buy/Sell dominate as vote moves away from 0
+            avg_vote = np.clip(avg_vote, -1.0, 1.0).astype(np.float32, copy=False)
+            k = 3.0
+            neutral_base = 2.0
+            neutral_alpha = 4.0
+            neutral_logit = neutral_base - neutral_alpha * np.abs(avg_vote)
+            logits = np.stack([neutral_logit, k * avg_vote, -k * avg_vote], axis=1).astype(np.float32, copy=False)
+            logits = logits - logits.max(axis=1, keepdims=True)
+            exp = np.exp(logits)
+            probs = exp / (exp.sum(axis=1, keepdims=True) + 1e-12)
+            return probs.astype(float, copy=False)
         except Exception as e:
             logger.error(f"Genetic predict failed: {e}", exc_info=True)
             return np.zeros((n, 3))
