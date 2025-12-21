@@ -528,11 +528,12 @@ class MT5StateManager:
                 except Exception as exc:
                     logger.debug(f"Async persistence failed: {exc}")
 
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(_async_write())
-            else:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
                 asyncio.run(_async_write())
+            else:
+                loop.create_task(_async_write())
 
         except Exception as exc:
             logger.debug(f"Failed to schedule persistence: {exc}")

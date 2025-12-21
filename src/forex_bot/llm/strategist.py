@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..core.config import Settings
-from ..data.news.scorers import _load_key_from_file
+from ..data.news.scorers import _load_key_from_file, _safe_json_object_loads
 from ..data.news.searchers import PerplexitySearcher
 
 logger = logging.getLogger(__name__)
@@ -130,7 +130,10 @@ class LLMStrategist:
                 max_completion_tokens=getattr(self.settings.news, "openai_max_tokens", 256),
             )
             content = resp.choices[0].message.content if resp.choices else ""
-            data = json.loads(content)
+            data = _safe_json_object_loads(content)
+            if not data:
+                logger.warning("Strategist returned non-JSON; skipping advice.")
+                return None
             stance = str(data.get("stance", "balanced"))
             risk_adj = data.get("risk_adjustments", {}) or {}
             trade_filters = data.get("trade_filters", {}) or {}
@@ -143,5 +146,5 @@ class LLMStrategist:
                 raw=data,
             )
         except Exception as exc:  # pragma: no cover
-            logger.error(f"LLM strategist error: {exc}", exc_info=True)
-            raise
+            logger.warning(f"LLM strategist error: {exc}")
+            return None

@@ -1039,6 +1039,14 @@ class TALibStrategyMixer:
                     except Exception:
                         cache[k] = np.zeros(len(df), dtype=np.float32)
 
+            if self.use_gpu and cp is not None:
+                try:
+                    # Prevent CuPy memory pool fragmentation during long-running genetic searches.
+                    cp.get_default_memory_pool().free_all_blocks()
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
             # Optional: Aggressive GC if needed, though usually automatic
 
         return cache

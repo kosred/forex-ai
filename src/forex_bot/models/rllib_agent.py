@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -74,6 +75,26 @@ def _maybe_init_ray() -> bool:
     except Exception as exc:
         logger.info(f"Ray init failed, skipping RLlib: {exc}")
         return False
+
+
+def _find_latest_checkpoint(checkpoint_dir: Path) -> str | None:
+    marker = checkpoint_dir / "checkpoint_path.txt"
+    if marker.exists():
+        try:
+            text = marker.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+    try:
+        candidates = [p for p in checkpoint_dir.glob("checkpoint_*") if p.name != "checkpoint_path.txt"]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return str(candidates[0])
+    except Exception:
+        return None
 
 
 class _TabularEnv:
@@ -175,10 +196,36 @@ class RLlibPPOAgent(ExpertModel):
             raise
 
     def save(self, path: str) -> None:
-        return
+        if self.algo is None:
+            return
+        out_dir = Path(path) / "rllib_ppo"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            checkpoint_path = self.algo.save(str(out_dir))
+            (out_dir / "checkpoint_path.txt").write_text(str(checkpoint_path), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"RLlib PPO save failed: {exc}")
 
     def load(self, path: str) -> None:
-        return
+        if not RAY_AVAILABLE:
+            return
+        if not _maybe_init_ray():
+            return
+
+        base_dir = Path(path) / "rllib_ppo"
+        if not base_dir.exists():
+            return
+
+        checkpoint_path = _find_latest_checkpoint(base_dir)
+        if not checkpoint_path:
+            return
+
+        try:
+            from ray.rllib.algorithms.algorithm import Algorithm  # type: ignore
+
+            self.algo = Algorithm.from_checkpoint(checkpoint_path)
+        except Exception as exc:
+            logger.warning(f"RLlib PPO load failed: {exc}")
 
 
 @dataclass(slots=True)
@@ -231,7 +278,33 @@ class RLlibSACAgent(ExpertModel):
             raise
 
     def save(self, path: str) -> None:
-        return
+        if self.algo is None:
+            return
+        out_dir = Path(path) / "rllib_sac"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            checkpoint_path = self.algo.save(str(out_dir))
+            (out_dir / "checkpoint_path.txt").write_text(str(checkpoint_path), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"RLlib SAC save failed: {exc}")
 
     def load(self, path: str) -> None:
-        return
+        if not RAY_AVAILABLE:
+            return
+        if not _maybe_init_ray():
+            return
+
+        base_dir = Path(path) / "rllib_sac"
+        if not base_dir.exists():
+            return
+
+        checkpoint_path = _find_latest_checkpoint(base_dir)
+        if not checkpoint_path:
+            return
+
+        try:
+            from ray.rllib.algorithms.algorithm import Algorithm  # type: ignore
+
+            self.algo = Algorithm.from_checkpoint(checkpoint_path)
+        except Exception as exc:
+            logger.warning(f"RLlib SAC load failed: {exc}")

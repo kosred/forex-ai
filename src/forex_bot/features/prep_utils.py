@@ -1,4 +1,6 @@
+import importlib.util
 import logging
+from functools import lru_cache
 from typing import Any
 
 import pandas as pd
@@ -6,18 +8,14 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=1)
 def have_cudf() -> bool:
-    try:
-        return True
-    except Exception:
-        return False
+    return importlib.util.find_spec("cudf") is not None
 
 
+@lru_cache(maxsize=1)
 def have_polars() -> bool:
-    try:
-        return True
-    except Exception:
-        return False
+    return importlib.util.find_spec("polars") is not None
 
 
 def to_polars(df: pd.DataFrame):

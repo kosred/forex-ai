@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
@@ -110,7 +110,7 @@ class OrderExecutor:
             if isinstance(current_bar_time, str):
                 current_bar_time = datetime.fromisoformat(current_bar_time)
         except Exception:
-            current_bar_time = datetime.utcnow()
+            current_bar_time = datetime.now(UTC)
         order_type = "buy" if signal_result.signal == 1 else "sell"
 
         logger.info(f"Executing {order_type.upper()} {size} lots (SL={sl:.5f}, TP={tp:.5f})...")

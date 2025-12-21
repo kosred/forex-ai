@@ -631,7 +631,7 @@ class DataLoader:
             return None
 
         years = 10
-        end_date = datetime.now()
+        end_date = datetime.now(UTC)
         start_date = end_date - timedelta(days=365 * years)
 
         logger.info(f"Downloading M1 history for {symbol} from {start_date.date()}...")
