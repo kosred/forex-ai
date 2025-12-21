@@ -67,6 +67,112 @@ class TrainingService:
         except Exception as exc:
             logger.warning(f"Failed to persist incremental progress: {exc}")
 
+    @staticmethod
+    def _parse_int_env(name: str) -> int | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return None
+        try:
+            return int(str(raw).strip())
+        except Exception:
+            return None
+
+    def _infer_global_pool_cap_per_symbol(self, *, n_features: int, n_symbols: int) -> int | None:
+        """
+        Determine a safe per-symbol row cap for multi-symbol pooled training.
+
+        Order of precedence:
+        1) `FOREX_BOT_GLOBAL_MAX_ROWS_PER_SYMBOL` (int)
+        2) `FOREX_BOT_GLOBAL_MAX_ROWS` (int) divided by symbol count
+        3) Auto-fit to available RAM (conservative estimate)
+
+        Set either env var to a value <= 0 to disable capping.
+        """
+        n_symbols = max(1, int(n_symbols))
+        n_features = max(1, int(n_features))
+
+        explicit_per_symbol = self._parse_int_env("FOREX_BOT_GLOBAL_MAX_ROWS_PER_SYMBOL")
+        if explicit_per_symbol is None:
+            explicit_per_symbol = int(
+                getattr(getattr(self.settings, "models", None), "global_max_rows_per_symbol", 0) or 0
+            )
+        if explicit_per_symbol is not None and explicit_per_symbol <= 0:
+            return None
+        if explicit_per_symbol is not None and explicit_per_symbol > 0:
+            return int(explicit_per_symbol)
+
+        explicit_total = self._parse_int_env("FOREX_BOT_GLOBAL_MAX_ROWS")
+        if explicit_total is None:
+            explicit_total = int(getattr(getattr(self.settings, "models", None), "global_max_rows", 0) or 0)
+        if explicit_total is not None and explicit_total <= 0:
+            return None
+        if explicit_total is not None and explicit_total > 0:
+            return max(1, int(explicit_total) // n_symbols)
+
+        # Auto cap based on available RAM. Keep conservative to avoid OOM on Windows.
+        try:
+            import psutil
+
+            available = float(psutil.virtual_memory().available)
+        except Exception:
+            return None
+
+        try:
+            mem_frac = float(os.environ.get("FOREX_BOT_GLOBAL_POOL_MEM_FRAC", "0.25") or 0.25)
+        except Exception:
+            mem_frac = 0.25
+        mem_frac = float(min(0.80, max(0.05, mem_frac)))
+
+        try:
+            overhead = float(os.environ.get("FOREX_BOT_GLOBAL_POOL_OVERHEAD", "3.0") or 3.0)
+        except Exception:
+            overhead = 3.0
+        overhead = float(min(10.0, max(1.5, overhead)))
+
+        bytes_per_row = float(n_features) * 4.0 * overhead  # float32 payload + pandas overhead factor
+        budget = available * mem_frac
+        total_rows = int(budget // max(bytes_per_row, 1.0))
+        per_symbol = max(1, total_rows // n_symbols)
+
+        try:
+            floor = int(os.environ.get("FOREX_BOT_GLOBAL_MIN_ROWS_PER_SYMBOL", "50000") or 50000)
+        except Exception:
+            floor = 50000
+        per_symbol = max(1, max(floor, per_symbol))
+        return int(per_symbol)
+
+    @staticmethod
+    def _tail_dataset(ds: PreparedDataset, rows: int) -> PreparedDataset:
+        if rows <= 0:
+            return ds
+        try:
+            n = len(ds.X)
+        except Exception:
+            return ds
+        if n <= rows:
+            return ds
+
+        def _tail(obj):
+            try:
+                if hasattr(obj, "iloc"):
+                    return obj.iloc[-rows:]
+                return obj[-rows:]
+            except Exception:
+                return obj
+
+        X = _tail(ds.X)
+        y = _tail(ds.y)
+        labels = _tail(ds.labels) if ds.labels is not None else None
+        meta = _tail(ds.metadata) if isinstance(ds.metadata, pd.DataFrame) else ds.metadata
+        return PreparedDataset(
+            X=X,
+            y=y,
+            index=getattr(X, "index", None),
+            feature_names=list(getattr(X, "columns", ds.feature_names)),
+            metadata=meta,
+            labels=labels,
+        )
+
     async def train(self, optimize: bool = True, stop_event: asyncio.Event | None = None) -> None:
         """Run the full training pipeline for the single active symbol."""
         symbol = self.settings.system.symbol
@@ -361,7 +467,7 @@ class TrainingService:
         aligned: list[tuple[str, PreparedDataset]] = []
         for sym, d in datasets:
             try:
-                X = d.X.reindex(columns=cols, fill_value=0.0).astype(np.float32)
+                X = d.X.reindex(columns=cols, fill_value=0.0).astype(np.float32, copy=False)
                 y = d.y
                 if not isinstance(y, pd.Series):
                     y = pd.Series(y, index=X.index)
@@ -480,6 +586,24 @@ class TrainingService:
             logger.error("Global training: no datasets provided.")
             return
 
+        # Apply an additional cap here (covers HPC path and any callers that didn't cap during dataset creation).
+        try:
+            first = next((d for _sym, d in datasets if getattr(d, "X", None) is not None), None)
+            n_features = int(getattr(first.X, "shape", (0, 0))[1]) if first is not None else 0
+        except Exception:
+            n_features = 0
+        cap = self._infer_global_pool_cap_per_symbol(n_features=n_features, n_symbols=len(datasets))
+        if cap is not None:
+            capped: list[tuple[str, PreparedDataset]] = []
+            for sym, d in datasets:
+                try:
+                    if len(d.X) > cap:
+                        d = self._tail_dataset(d, cap)
+                except Exception:
+                    pass
+                capped.append((sym, d))
+            datasets = capped
+
         # Align feature spaces across symbols.
         cols, aligned = self._align_global_feature_space(datasets)
         if not aligned:
@@ -505,37 +629,42 @@ class TrainingService:
             logger.warning("Global training: no eval splits produced; metrics will be limited.")
 
         # Pool training data.
-        pooled_frames: list[pd.DataFrame] = []
+        X_parts: list[pd.DataFrame] = []
+        y_parts: list[pd.Series] = []
         pooled_meta: list[pd.DataFrame] = []
         for sym, d in train_parts:
-            frame = d.X.copy()
-            y_s = d.y if isinstance(d.y, pd.Series) else pd.Series(d.y, index=frame.index)
-            frame["_y"] = y_s.to_numpy()
-            pooled_frames.append(frame)
-            if d.metadata is not None and isinstance(d.metadata, pd.DataFrame) and len(d.metadata) == len(frame):
+            X_part = d.X
+            y_part = d.y if isinstance(d.y, pd.Series) else pd.Series(d.y, index=X_part.index)
+            X_parts.append(X_part)
+            y_parts.append(y_part)
+
+            if d.metadata is not None and isinstance(d.metadata, pd.DataFrame) and len(d.metadata) == len(X_part):
                 try:
                     m = d.metadata[["high", "low", "close"]].copy()
                     m["symbol"] = sym
                     pooled_meta.append(m)
                 except Exception:
                     pass
-        pooled = pd.concat(pooled_frames, axis=0)
-        pooled = pooled.sort_index(kind="mergesort")
-        y_train = pooled.pop("_y").astype(int)
-        X_train = pooled.astype(np.float32)
+
+        X_train = pd.concat(X_parts, axis=0, copy=False)
+        y_train = pd.concat(y_parts, axis=0, copy=False).astype(int, copy=False)
+        X_train = X_train.astype(np.float32, copy=False)
 
         meta_train: pd.DataFrame | None = None
         if pooled_meta:
             try:
-                meta_train = pd.concat(pooled_meta, axis=0).sort_index(kind="mergesort")
+                meta_train = pd.concat(pooled_meta, axis=0, copy=False)
                 # Ensure 1:1 alignment with pooled training rows.
-                if not meta_train.index.equals(X_train.index):
+                if len(meta_train) != len(X_train) or not meta_train.index.equals(X_train.index):
                     logger.warning(
                         "Global training: pooled metadata index misaligned; disabling metadata for optimizer."
                     )
                     meta_train = None
                 else:
-                    meta_train = meta_train.astype({"high": np.float32, "low": np.float32, "close": np.float32})
+                    meta_train = meta_train.astype(
+                        {"high": np.float32, "low": np.float32, "close": np.float32},
+                        copy=False,
+                    )
                     meta_train["symbol"] = meta_train["symbol"].astype("category")
             except Exception:
                 meta_train = None
@@ -806,6 +935,14 @@ class TrainingService:
 
                 news_feats = self._build_news_features(analyzer, sym, frames) if analyzer is not None else None
                 ds = self.feature_engineer.prepare(frames, news_features=news_feats, symbol=sym)
+
+                cap = self._infer_global_pool_cap_per_symbol(n_features=int(ds.X.shape[1]), n_symbols=len(symbols))
+                if cap is not None and len(ds.X) > cap:
+                    logger.info(
+                        f"[GLOBAL {idx}/{total}] Capping {sym} dataset from {len(ds.X):,} -> {cap:,} rows "
+                        "(override via FOREX_BOT_GLOBAL_MAX_ROWS[_PER_SYMBOL])."
+                    )
+                    ds = self._tail_dataset(ds, cap)
                 datasets.append((sym, ds))
             except Exception as e:
                 logger.error(f"Failed to prepare {sym}: {e}", exc_info=True)

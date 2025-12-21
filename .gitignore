@@ -1,5 +1,6 @@
 .env
 /models/
+/models_snapshots/
 /cache/
 /reports/
 /logs/
