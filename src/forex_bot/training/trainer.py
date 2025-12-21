@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -478,40 +479,95 @@ class ModelTrainer:
         except Exception:
             self.run_summary["feature_columns"] = []
 
-        # Holdout split for out-of-sample evaluation + stacking
+        # Holdout split for out-of-sample evaluation + stacking.
+        #
+        # IMPORTANT: For pooled multi-symbol datasets, row-order is often NOT time-ordered
+        # (e.g., concatenated by symbol). A positional split would leak "future" rows into
+        # the fit set and invalidate evaluation. Prefer a timestamp-based split when possible.
         n = len(y)
         holdout_pct = float(getattr(self.settings.models, "train_holdout_pct", 0.2) or 0.2)
         holdout_pct = float(min(0.5, max(0.0, holdout_pct)))
-        holdout_n = int(n * holdout_pct)
-        eval_start = max(0, n - holdout_n)
+        min_split = 50  # Lower threshold since we filtered
 
-        # Ensure both splits have enough data
-        if eval_start < 50 or (n - eval_start) < 50:  # Lower threshold since we filtered
-            eval_start = n  # disable holdout
-
-        self.run_summary["train_holdout_pct"] = float(holdout_pct if eval_start < n else 0.0)
-        self.run_summary["train_holdout_n"] = int(n - eval_start)
-        self.run_summary["train_fit_n"] = int(eval_start)
-
-        X_fit = X.iloc[:eval_start]
-        y_fit = y.iloc[:eval_start]
-
-        # Robust metadata slicing
+        X_fit = X
+        y_fit = y
+        X_eval = X.iloc[:0]
+        y_eval = y.iloc[:0]
         meta_fit = None
-        if meta_subset is not None:
-            try:
-                meta_fit = meta_subset.iloc[:eval_start]
-            except Exception:
-                logger.warning("Failed to slice metadata for training fit set.")
-
-        X_eval = X.iloc[eval_start:]
-
         meta_eval = None
-        if meta_subset is not None:
+        holdout_cutoff: str | None = None
+        split_strategy = "none"
+
+        def _finalize_summary() -> None:
+            fit_n = int(len(X_fit))
+            eval_n = int(len(X_eval))
+            self.run_summary["train_holdout_pct"] = float(holdout_pct if eval_n > 0 else 0.0)
+            self.run_summary["train_holdout_n"] = int(eval_n)
+            self.run_summary["train_fit_n"] = int(fit_n)
+            self.run_summary["train_holdout_split"] = {
+                "strategy": split_strategy,
+                "cutoff": holdout_cutoff,
+            }
+
+        # Time-based split if index is datetime (works even if the frame is not pre-sorted).
+        if holdout_pct > 0.0 and isinstance(X.index, pd.DatetimeIndex) and n > 0:
             try:
-                meta_eval = meta_subset.iloc[eval_start:]
-            except Exception:
-                logger.warning("Failed to slice metadata for evaluation set.")
+                idx_ns = X.index.view("int64")
+                nat = np.iinfo(np.int64).min
+                valid = idx_ns != nat
+
+                if valid.any():
+                    times_valid = np.array(idx_ns[valid], copy=True)
+                    fit_frac = float(1.0 - holdout_pct)
+                    k = int(max(0, min(len(times_valid) - 1, int(len(times_valid) * fit_frac) - 1)))
+                    cut_ns = int(np.partition(times_valid, k)[k])
+                    cutoff_ts = pd.to_datetime(cut_ns, utc=True)
+
+                    fit_mask = idx_ns <= cut_ns
+                    eval_mask = idx_ns > cut_ns
+                    fit_n = int(fit_mask.sum())
+                    eval_n = int(eval_mask.sum())
+
+                    if fit_n >= min_split and eval_n >= min_split:
+                        X_fit = X.loc[fit_mask]
+                        y_fit = y.loc[fit_mask]
+                        X_eval = X.loc[eval_mask]
+                        y_eval = y.loc[eval_mask]
+                        if meta_subset is not None:
+                            with contextlib.suppress(Exception):
+                                meta_fit = meta_subset.loc[fit_mask]
+                            with contextlib.suppress(Exception):
+                                meta_eval = meta_subset.loc[eval_mask]
+                        holdout_cutoff = cutoff_ts.isoformat()
+                        split_strategy = "time_cutoff"
+                        _finalize_summary()
+                    else:
+                        split_strategy = "time_cutoff_insufficient"
+            except Exception as exc:
+                logger.warning(f"Holdout time-based split failed; falling back to positional: {exc}")
+
+        # Fallback: positional split (assumes row-order is time-ordered).
+        if split_strategy in {"none", "time_cutoff_insufficient"}:
+            holdout_n = int(n * holdout_pct)
+            eval_start = max(0, n - holdout_n)
+            if eval_start < min_split or (n - eval_start) < min_split:
+                eval_start = n  # disable holdout
+
+            X_fit = X.iloc[:eval_start]
+            y_fit = y.iloc[:eval_start]
+            X_eval = X.iloc[eval_start:]
+            y_eval = y.iloc[eval_start:]
+
+            meta_fit = None
+            meta_eval = None
+            if meta_subset is not None:
+                with contextlib.suppress(Exception):
+                    meta_fit = meta_subset.iloc[:eval_start]
+                with contextlib.suppress(Exception):
+                    meta_eval = meta_subset.iloc[eval_start:]
+
+            split_strategy = "positional" if eval_start < n else "positional_disabled"
+            _finalize_summary()
 
         # Feature drift detection between train and eval sets
         if len(X_fit) > 0 and len(X_eval) > 0:
@@ -844,14 +900,22 @@ class ModelTrainer:
 
         # 7. Meta Blender
         if not stop_event or not stop_event.is_set():
-            self._train_blender(X, y)
+            self._train_blender(X_eval, y_eval)
 
         # 8. Evaluation
         if not stop_event or not stop_event.is_set():
-            self.run_summary["walkforward"] = self.evaluator.run_walkforward(
-                dataset, self.models, self._ensemble_proba, start_index=eval_start
+            eval_dataset = PreparedDataset(
+                X=X_eval,
+                y=y_eval,
+                index=X_eval.index,
+                feature_names=list(getattr(X_eval, "columns", [])),
+                metadata=meta_eval,
+                labels=y_eval,
             )
-            self.run_summary["cpcv"] = self.evaluator.run_cpcv(dataset, self.models)
+            self.run_summary["walkforward"] = self.evaluator.run_walkforward(
+                eval_dataset, self.models, self._ensemble_proba, start_index=0
+            )
+            self.run_summary["cpcv"] = self.evaluator.run_cpcv(eval_dataset, self.models)
 
         # 9. Persistence
         self.run_summary["train_durations_sec"] = durations
@@ -1100,23 +1164,23 @@ class ModelTrainer:
     def _train_blender(self, X, y):
         try:
             self.meta_blender = MetaBlender()
-            holdout_pct = float(getattr(self.settings.models, "train_holdout_pct", 0.2) or 0.2)
-            holdout_pct = float(min(0.5, max(0.0, holdout_pct)))
-            split = int(len(X) * (1.0 - holdout_pct))
-            split = max(0, min(len(X), split))
-            X_m, y_m = X.iloc[split:], y.iloc[split:]
-            if len(X_m) < 200:
+            X_m = X
+            y_m = y
+            if len(X_m) < 200 or len(y_m) < 200:
                 return
             feats = pd.DataFrame(index=X_m.index)
             for name, m in self.models.items():
                 p = self._pad_probs(m.predict_proba(X_m))
                 feats[f"{name}_buy"] = p[:, 1]
                 # ...
-            feats["label"] = y_m.values
+            feats["label"] = np.asarray(y_m, dtype=int)
+
+            if hasattr(feats.index, "is_monotonic_increasing") and not feats.index.is_monotonic_increasing:
+                feats = feats.sort_index(kind="mergesort")
             self.meta_blender.fit(feats)
             self.meta_blender.save(self.models_dir / "meta_blender.joblib")
         except Exception as e:
-            logger.warning(f"Meta-blender training failed: {e}", exc_info=True)
+            logger.error(f"Meta-blender training failed: {e}", exc_info=True)
 
     def _ensemble_proba(self, X):
         probs = []

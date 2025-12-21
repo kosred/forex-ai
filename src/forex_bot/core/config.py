@@ -215,6 +215,8 @@ class ModelsConfig(BaseModel):
     cpcv_embargo_pct: float = 0.01
     cpcv_purge_pct: float = 0.02
     cpcv_min_phi: float = 0.80
+    # Guardrail: CPCV is memory-heavy (sklearn casts to float64). Cap rows to keep local runs stable.
+    cpcv_max_rows: int = 250_000
 
 
 class NewsConfig(BaseModel):

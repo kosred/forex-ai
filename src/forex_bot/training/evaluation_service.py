@@ -1,5 +1,7 @@
+import contextlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -105,17 +107,62 @@ class EvaluationService:
             logger.info("Running CPCV...")
             X = dataset.X
             y = dataset.y
+            y = pd.Series(y, index=X.index) if isinstance(y, (np.ndarray, list)) else y
+            meta = dataset.metadata
+
+            # CPCV can easily explode memory on multi-million row datasets (scikit-learn casts to float64).
+            # Keep it bounded by default; override via config or FOREX_BOT_CPCV_MAX_ROWS.
+            max_rows_cfg = int(getattr(self.settings.models, "cpcv_max_rows", 250_000) or 0)
+            env_override = str(os.environ.get("FOREX_BOT_CPCV_MAX_ROWS", "")).strip()
+            if env_override:
+                with contextlib.suppress(Exception):
+                    max_rows_cfg = int(env_override)
+
+            if max_rows_cfg > 0 and len(X) > max_rows_cfg:
+                before = int(len(X))
+                if isinstance(X.index, pd.DatetimeIndex):
+                    idx_ns = X.index.view("int64")
+                    nat = np.iinfo(np.int64).min
+                    valid = idx_ns != nat
+                    if valid.any():
+                        times_valid = np.array(idx_ns[valid], copy=True)
+                        start_k = max(0, min(len(times_valid) - 1, len(times_valid) - max_rows_cfg))
+                        cut_ns = int(np.partition(times_valid, start_k)[start_k])
+                        keep = idx_ns >= cut_ns
+                        X = X.loc[keep]
+                        y = y.loc[keep]
+                        if meta is not None:
+                            meta = meta.loc[keep]
+                    else:
+                        X = X.iloc[-max_rows_cfg:]
+                        y = y.iloc[-max_rows_cfg:]
+                        if meta is not None:
+                            meta = meta.iloc[-max_rows_cfg:]
+                else:
+                    X = X.iloc[-max_rows_cfg:]
+                    y = y.iloc[-max_rows_cfg:]
+                    if meta is not None:
+                        meta = meta.iloc[-max_rows_cfg:]
+
+                logger.info(f"CPCV: Capped rows {before:,} -> {len(X):,} (max_rows={max_rows_cfg:,})")
+
+            # Ensure time-ordering for CPCV purging/embargo logic.
+            if hasattr(X.index, "is_monotonic_increasing") and not X.index.is_monotonic_increasing:
+                X = X.sort_index(kind="mergesort")
+                y = y.reindex(X.index)
+                if meta is not None:
+                    meta = meta.reindex(X.index)
 
             def model_factory():
                 if LogisticRegression:
                     return LogisticRegression(max_iter=200, n_jobs=-1)
                 return None
 
-            if hasattr(dataset, "metadata") and dataset.metadata is not None:
+            if meta is not None:
                 res = cpcv_backtest(
                     x=X,
                     y=y,
-                    metadata=dataset.metadata,
+                    metadata=meta,
                     model_factory=model_factory,
                     n_splits=self.settings.models.cpcv_n_splits,
                     n_test_groups=self.settings.models.cpcv_n_test_groups,
@@ -127,5 +174,5 @@ class EvaluationService:
                 return res
             return {}
         except Exception as e:
-            logger.warning(f"CPCV eval failed: {e}")
+            logger.error(f"CPCV eval failed: {e}")
             return {}

@@ -77,12 +77,17 @@ class MetaBlender:
         if "label" not in dataset:
             raise ValueError("Dataset must include 'label' column")
 
-        # Validate time-ordering if index is datetime
-        if hasattr(dataset.index, 'is_monotonic_increasing'):
+        # Enforce chronological ordering for time-series splits (prevents look-ahead bias).
+        if hasattr(dataset.index, "is_monotonic_increasing") and not dataset.index.is_monotonic_increasing:
             try:
-                validate_time_ordering(dataset, context="MetaBlender.fit")
-            except ValueError as e:
-                logger.warning(f"MetaBlender: {e}. Proceeding without time validation.")
+                dataset = dataset.sort_index(kind="mergesort")
+            except Exception as exc:
+                raise ValueError(
+                    "MetaBlender.fit: Data index is NOT monotonically increasing and could not be sorted. "
+                    "Time-series models require chronologically ordered data to prevent look-ahead bias."
+                ) from exc
+
+        validate_time_ordering(dataset, context="MetaBlender.fit")
 
         labels_raw = dataset.pop("label").astype(int).to_numpy()
         # Backward compat: some older components used 2=sell; normalize to -1.

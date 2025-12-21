@@ -96,11 +96,11 @@ class CombinatorialPurgedCV:
 
         Returns list of (train_indices, test_indices) tuples.
         """
-        # FIX: Check for time-ordering
+        # CPCV relies on time-ordered data for purging/embargo to be meaningful.
         if hasattr(x, "index") and not x.index.is_monotonic_increasing:
-            logger.warning(
-                "⚠️ CPCV Warning: Data index is NOT monotonic increasing. "
-                "CPCV assumes time-ordered data. Purging/Embargo logic will be invalid on shuffled data!"
+            raise ValueError(
+                "CPCV requires time-ordered data (monotonic increasing index). "
+                "Sort by timestamp before running CPCV to avoid look-ahead bias."
             )
 
         n_samples = len(x)
