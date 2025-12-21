@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,39 @@ except Exception:
 import joblib
 
 logger = logging.getLogger(__name__)
+
+
+def _cpu_threads_hint() -> int:
+    try:
+        return max(0, int(os.environ.get("FOREX_BOT_CPU_THREADS", "0") or 0))
+    except Exception:
+        return 0
+
+
+def _tree_device_preference() -> str:
+    """
+    Controls whether tree models should run on GPU or CPU.
+
+    Env:
+      - FOREX_BOT_TREE_DEVICE=auto|gpu|cpu  (default: auto)
+    """
+    raw = str(os.environ.get("FOREX_BOT_TREE_DEVICE", "auto")).strip().lower()
+    if raw in {"cpu", "gpu", "auto"}:
+        return raw
+    if raw in {"0", "false", "no", "off"}:
+        return "cpu"
+    if raw in {"1", "true", "yes", "on"}:
+        return "gpu"
+    return "auto"
+
+
+def _torch_cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
+    except Exception:
+        return False
 
 
 def _get_model_classes(model: Any) -> list[int] | None:
@@ -166,14 +200,36 @@ class LightGBMExpert(ExpertModel):
             params = self.params.copy()
             params["class_weight"] = class_weight if class_weight else None
 
-            # LightGBM: CPU with n_jobs=-1 is FASTER than GPU for tree models
-            # on multi-core servers (tested: 252 cores = 2.5x faster than GPU)
-            params["device_type"] = "cpu"
-            params["n_jobs"] = -1  # Use all available cores
-            params.pop("gpu_use_dp", None)
-            params.pop("gpu_device_id", None)
-            # max_bin=255 for better accuracy on CPU
-            params.setdefault("max_bin", 255)
+            # Respect worker thread partitioning when set (prevents oversubscription on large CPUs).
+            cpu_threads = _cpu_threads_hint()
+            if cpu_threads > 0:
+                params["n_jobs"] = cpu_threads
+
+            pref = _tree_device_preference()
+            has_cuda = _torch_cuda_available()
+            requested = str(params.get("device_type", "")).strip().lower()
+
+            if requested == "cpu" or pref == "cpu":
+                use_gpu = False
+            elif requested == "gpu" or pref == "gpu":
+                use_gpu = has_cuda
+                if not has_cuda:
+                    logger.warning("LightGBM GPU requested but no CUDA devices detected; falling back to CPU.")
+            else:
+                # auto: use GPU when available
+                use_gpu = has_cuda
+
+            if use_gpu:
+                params["device_type"] = "gpu"
+                params.setdefault("max_bin", 63)  # critical for GPU speed
+                params.setdefault("gpu_use_dp", False)
+                params.setdefault("gpu_device_id", 0)
+            else:
+                params["device_type"] = "cpu"
+                params.pop("gpu_use_dp", None)
+                params.pop("gpu_device_id", None)
+                # max_bin=255 for better accuracy on CPU
+                params.setdefault("max_bin", 255)
 
             binary = len(uniq) <= 2
             if binary:
@@ -216,8 +272,10 @@ class LightGBMExpert(ExpertModel):
                 if params.get("device_type") == "gpu":
                     logger.warning(f"LightGBM GPU training failed ({e}), falling back to CPU.")
                     params["device_type"] = "cpu"
-                    params.pop("max_bin", None)
                     params.pop("gpu_use_dp", None)
+                    params.pop("gpu_device_id", None)
+                    params.pop("max_bin", None)
+                    params.setdefault("max_bin", 255)
                     self.model = lgb.LGBMClassifier(**params)
                     self.model.fit(
                         x_train,
@@ -392,8 +450,6 @@ class XGBoostExpert(ExpertModel):
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
 
-        # XGBoost: CPU with n_jobs=-1 is FASTER than GPU for tree models
-        # on multi-core servers (tested: 252 cores = faster than GPU)
         self.params = params or {
             "n_estimators": 500,
             "max_depth": 6,
@@ -403,8 +459,31 @@ class XGBoostExpert(ExpertModel):
             "random_state": 42,
             "n_jobs": -1,
             "verbosity": 0,
-            "tree_method": "hist",  # CPU histogram method (fast)
+            "tree_method": "hist",  # works for both CPU and GPU (device=cuda)
         }
+
+        cpu_threads = _cpu_threads_hint()
+        if cpu_threads > 0 and int(self.params.get("n_jobs", -1) or -1) < 0:
+            self.params["n_jobs"] = cpu_threads
+
+        pref = _tree_device_preference()
+        has_cuda = _torch_cuda_available()
+        requested = str(self.params.get("device", "")).strip().lower()
+
+        if requested.startswith("cuda"):
+            use_gpu = has_cuda
+        elif pref == "cpu":
+            use_gpu = False
+        elif pref == "gpu":
+            use_gpu = has_cuda
+        else:
+            use_gpu = has_cuda
+
+        if use_gpu:
+            # Newer XGBoost prefers `tree_method=hist` + `device=cuda`.
+            self.params.setdefault("device", "cuda")
+        else:
+            self.params.pop("device", None)
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
         if not XGB_AVAILABLE:
@@ -452,13 +531,8 @@ class CatBoostExpert(ExpertModel):
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
 
-        has_gpu = False
-        try:
-            import torch
-
-            has_gpu = torch.cuda.is_available()
-        except ImportError:
-            pass
+        pref = _tree_device_preference()
+        has_cuda = _torch_cuda_available()
 
         self.params = params or {
             "iterations": 500,
@@ -470,10 +544,29 @@ class CatBoostExpert(ExpertModel):
             "thread_count": -1,
         }
 
-        if has_gpu:
+        cpu_threads = _cpu_threads_hint()
+        if cpu_threads > 0 and int(self.params.get("thread_count", -1) or -1) < 0:
+            self.params["thread_count"] = cpu_threads
+
+        requested = str(self.params.get("task_type", "")).strip().lower()
+        if requested == "gpu":
+            use_gpu = has_cuda
+        elif pref == "cpu":
+            use_gpu = False
+        elif pref == "gpu":
+            use_gpu = has_cuda
+        else:
+            use_gpu = has_cuda
+
+        if use_gpu:
             self.params.setdefault("task_type", "GPU")
             self.params.setdefault("devices", "0")
             self.params.setdefault("border_count", 32)
+        else:
+            # Ensure we don't accidentally try to run CatBoost in GPU mode without devices.
+            if str(self.params.get("task_type", "")).strip().lower() == "gpu":
+                self.params.pop("task_type", None)
+                self.params.pop("devices", None)
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
         if not CAT_AVAILABLE:

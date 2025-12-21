@@ -330,6 +330,8 @@ class HyperparameterOptimizer:
         self.device_pool = get_available_gpus()
         self.default_device = select_device(getattr(self.settings.system, "device", "cpu"))
         self.stop_event: Any | None = None
+        # Set by `_run_study()` to prevent CPU oversubscription when Optuna runs parallel trials.
+        self._optuna_cpu_threads: int = 0
 
         if not OPTUNA_AVAILABLE:
             logger.warning("Optuna not available. Skipping optimization.")
@@ -749,8 +751,28 @@ class HyperparameterOptimizer:
             # Parallel execution: use threading for Optuna trials
             # Override with OPTUNA_N_JOBS env var for testing (default: use all GPUs)
             n_parallel = int(os.environ.get("OPTUNA_N_JOBS", len(self.device_pool) if self.device_pool else 1))
-            logger.info(f"Optuna study {study_name}: running {remaining} new trials (completed={completed}) with {n_parallel} parallel jobs.")
-            study.optimize(objective, n_trials=remaining, n_jobs=n_parallel, callbacks=[_cb], catch=(KeyboardInterrupt, MemoryError))
+            n_parallel = max(1, n_parallel)
+
+            cpu_total = max(1, os.cpu_count() or 1)
+            cpu_override = 0
+            try:
+                cpu_override = int(os.environ.get("FOREX_BOT_OPTUNA_CPU_THREADS", "0") or 0)
+            except Exception:
+                cpu_override = 0
+
+            self._optuna_cpu_threads = cpu_override if cpu_override > 0 else max(1, cpu_total // n_parallel)
+
+            logger.info(
+                f"Optuna study {study_name}: running {remaining} new trials (completed={completed}) "
+                f"with n_jobs={n_parallel} and cpu_threads_per_trial={self._optuna_cpu_threads}"
+            )
+            study.optimize(
+                objective,
+                n_trials=remaining,
+                n_jobs=n_parallel,
+                callbacks=[_cb],
+                catch=(KeyboardInterrupt, MemoryError),
+            )
         else:
             logger.info(f"Optuna study {study_name}: using existing {completed} trials; no new trials scheduled.")
         return study
@@ -1019,13 +1041,13 @@ class HyperparameterOptimizer:
                 "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
                 "objective": "binary" if y_train.nunique() == 2 else "multiclass",  # Adapt for Meta-Labeling
                 "num_class": y_train.nunique(),  # Adapt for Meta-Labeling
-                "n_jobs": -1,
+                "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
                 "verbosity": -1,
             }
             if device_id is not None:
                 params["device_type"] = "gpu"
                 params["gpu_device_id"] = device_id
-                params.setdefault("max_bin", 255)
+                params.setdefault("max_bin", 63)
             else:
                 params["device_type"] = "cpu"
             model = LightGBMExpert(params=params)
@@ -1056,7 +1078,7 @@ class HyperparameterOptimizer:
                 "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
                 "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
                 "criterion": trial.suggest_categorical("criterion", ["gini", "entropy"]),
-                "n_jobs": -1,
+                "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
                 "random_state": 42,
             }
             model = RandomForestExpert(params=params)
@@ -1091,7 +1113,7 @@ class HyperparameterOptimizer:
                 "l1_ratio": l1_ratio,
                 "max_iter": 1000,
                 "tol": 1e-3,
-                "n_jobs": -1,
+                "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
                 "random_state": 42,
             }
             model = ElasticNetExpert(params=params)
