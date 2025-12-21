@@ -478,10 +478,14 @@ def detect_feature_drift(
         summary = f"OK: {len(drifted_features)}/{total_features} features with minor drift"
 
     if drifted_features:
-        logger.warning(
+        msg = (
             f"Feature drift detected: {summary}. Top drifted: "
             f"{sorted(drifted_features, key=lambda x: drift_scores.get(x, 0), reverse=True)[:5]}"
         )
+        if critical or summary.startswith("WARNING:"):
+            logger.warning(msg)
+        else:
+            logger.info(msg)
 
     return {
         "drifted_features": drifted_features,
