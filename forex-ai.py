@@ -40,6 +40,14 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # Defer heavy imports (deps auto-install) to normal mode only.
+    try:
+        print("[INIT] Checking and auto-installing dependencies (Hardware-Aware)...", flush=True)
+        from forex_bot.core.deps import ensure_dependencies
+
+        ensure_dependencies()
+    except Exception as dep_err:
+        print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
+
     from forex_bot.main import _global_models_exist, main
 
     has_models = _global_models_exist()
