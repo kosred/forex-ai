@@ -165,22 +165,15 @@ class LightGBMExpert(ExpertModel):
 
             params = self.params.copy()
             params["class_weight"] = class_weight if class_weight else None
-            import torch
 
-            has_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 0
-
-            if has_gpu:
-                params.setdefault("device_type", "gpu")
-                params.setdefault("max_bin", 63)  # Critical for GPU speedup
-                params.setdefault("gpu_use_dp", False)  # FP32 is faster
-                if "gpu_device_id" not in params:
-                    params["gpu_device_id"] = 0
-            else:
-                # Force CPU if no usable CUDA device even if caller requested GPU
-                params["device_type"] = "cpu"
-                params.pop("gpu_use_dp", None)
-                params.pop("gpu_device_id", None)
-                params.pop("max_bin", None)
+            # LightGBM: CPU with n_jobs=-1 is FASTER than GPU for tree models
+            # on multi-core servers (tested: 252 cores = 2.5x faster than GPU)
+            params["device_type"] = "cpu"
+            params["n_jobs"] = -1  # Use all available cores
+            params.pop("gpu_use_dp", None)
+            params.pop("gpu_device_id", None)
+            # max_bin=255 for better accuracy on CPU
+            params.setdefault("max_bin", 255)
 
             binary = len(uniq) <= 2
             if binary:
@@ -399,14 +392,8 @@ class XGBoostExpert(ExpertModel):
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
 
-        has_gpu = False
-        try:
-            import torch
-
-            has_gpu = torch.cuda.is_available()
-        except ImportError:
-            pass
-
+        # XGBoost: CPU with n_jobs=-1 is FASTER than GPU for tree models
+        # on multi-core servers (tested: 252 cores = faster than GPU)
         self.params = params or {
             "n_estimators": 500,
             "max_depth": 6,
@@ -416,11 +403,8 @@ class XGBoostExpert(ExpertModel):
             "random_state": 42,
             "n_jobs": -1,
             "verbosity": 0,
+            "tree_method": "hist",  # CPU histogram method (fast)
         }
-
-        if has_gpu:
-            self.params.setdefault("tree_method", "hist")
-            self.params.setdefault("device", "cuda")
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
         if not XGB_AVAILABLE:
