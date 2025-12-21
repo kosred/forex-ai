@@ -1,0 +1,13 @@
+# Example secrets file (DO NOT COMMIT your real keys.txt)
+#
+# Create a local `keys.txt` (git-ignored) and put your real values there.
+# `src/forex_bot/main.py` loads `keys.txt` at startup and exports these to env vars.
+#
+# OpenAI / Perplexity
+OPENAI_API_KEY=YOUR_OPENAI_KEY_HERE
+PPLX_API_KEY=YOUR_PERPLEXITY_KEY_HERE
+#
+# MetaTrader 5 (Windows only)
+MT5_LOGIN=0
+MT5_PASSWORD=YOUR_MT5_PASSWORD_HERE
+MT5_SERVER=YOUR_MT5_SERVER_HERE

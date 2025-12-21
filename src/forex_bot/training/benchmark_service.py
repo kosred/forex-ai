@@ -6,7 +6,6 @@ from typing import Any
 import pandas as pd
 import torch
 
-from ..core.autotune import autotuner
 from ..models.device import select_device
 from ..models.registry import get_model_class
 
@@ -114,7 +113,8 @@ class BenchmarkService:
 
             # Use a simplified Transformer for the probe (good representative of heavy compute)
             # Ensure seq_len is small to avoid index errors on small slices
-            model = get_model_class("transformer", prefer_gpu=autotuner.gpu_available)(
+            prefer_gpu = str(device).startswith("cuda")
+            model = get_model_class("transformer", prefer_gpu=prefer_gpu)(
                 d_model=32,
                 nhead=2,
                 num_layers=1,
@@ -185,7 +185,8 @@ class BenchmarkService:
             if sig in self._probe_cache:
                 return self._probe_cache[sig]
 
-            cls = get_model_class(model_name, prefer_gpu=autotuner.gpu_available)
+            prefer_gpu = (simulated_gpu is not None) or str(device).startswith("cuda")
+            cls = get_model_class(model_name, prefer_gpu=prefer_gpu)
             # Small model config for probe to avoid long warmup
             kwargs = {}
             if model_name == "transformer":
@@ -393,7 +394,8 @@ class BenchmarkService:
             # Instantiate model
             try:
                 # Use simplified config to probe speed quickly
-                cls = get_model_class(model_name, prefer_gpu=autotuner.gpu_available)
+                prefer_gpu = str(device).startswith("cuda")
+                cls = get_model_class(model_name, prefer_gpu=prefer_gpu)
                 kwargs = {"max_time_sec": 30}  # Cap probe time
                 if "transformer" in model_name:
                     kwargs.update({"d_model": 32, "num_layers": 1})

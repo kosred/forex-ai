@@ -113,14 +113,14 @@ if NUMBA_AVAILABLE:
 
             for j in range(i + 1, end_idx):
                 h = high[j]
-                l = low[j]
+                lo = low[j]
 
                 # Check upper barrier (potential long profit)
                 if upper_hit_idx < 0 and h >= upper_barrier:
                     upper_hit_idx = j
 
                 # Check lower barrier (potential short profit)
-                if lower_hit_idx < 0 and l <= lower_barrier:
+                if lower_hit_idx < 0 and lo <= lower_barrier:
                     lower_hit_idx = j
 
                 # Both hit - determine which was first
@@ -438,12 +438,12 @@ else:
 
             for j in range(i + 1, end_idx):
                 h = high[j]
-                l = low[j]
+                lo = low[j]
 
                 if upper_hit_idx < 0 and h >= upper_barrier:
                     upper_hit_idx = j
 
-                if lower_hit_idx < 0 and l <= lower_barrier:
+                if lower_hit_idx < 0 and lo <= lower_barrier:
                     lower_hit_idx = j
 
                 if upper_hit_idx > 0 and lower_hit_idx > 0:

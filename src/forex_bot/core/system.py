@@ -19,6 +19,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def normalize_device_preference(value: Any | None) -> str:
+    """
+    Normalize user/device preference input to one of: "auto" | "cpu" | "gpu".
+
+    Accepts common synonyms used across config/env/CLI:
+      - cpu: "cpu", "false", "0", "no", "off"
+      - gpu: "gpu", "cuda", "true", "1", "yes", "on"
+      - auto: "auto" or anything else
+    """
+    raw = str(value or "auto").strip().lower()
+    if raw in {"cpu", "false", "0", "no", "off"}:
+        return "cpu"
+    if raw in {"gpu", "cuda", "true", "1", "yes", "on"}:
+        return "gpu"
+    return "auto"
+
+
 @contextlib.contextmanager
 def thread_limits(blas_threads: int | None = None) -> None:
     """
@@ -266,12 +283,12 @@ class AutoTuner:
         return hints
 
     def _evaluate_hints(self) -> AutoTuneHints:
-        preference = self.settings.system.enable_gpu_preference
+        preference = normalize_device_preference(getattr(self.settings.system, "enable_gpu_preference", "auto"))
         has_gpu = self.profile.num_gpus > 0
         enable_gpu = False
-        if preference == "true" and not has_gpu:
-            self.logger.warning("ENABLE_GPU=true requested but no GPU detected; defaulting to CPU")
-        if preference in {"auto", "true"} and has_gpu:
+        if preference == "gpu" and not has_gpu:
+            self.logger.warning("GPU requested but no GPU detected; defaulting to CPU")
+        if preference in {"auto", "gpu"} and has_gpu:
             enable_gpu = True
         device = "cuda" if enable_gpu else "cpu"
 

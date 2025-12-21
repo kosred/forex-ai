@@ -2,18 +2,23 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import joblib
 
-from ..core.autotune import autotuner
+from ..core.system import normalize_device_preference
 from ..models.base import ExpertModel
+from ..models.device import get_available_gpus
 from ..models.registry import get_model_class
 from ..training.ensemble import MetaBlender
 
 logger = logging.getLogger(__name__)
 
 _JOBLIB_TMP_SUFFIX = ".tmp"
+
+
+if TYPE_CHECKING:
+    from ..core.config import Settings
 
 
 def _atomic_joblib_dump(obj: Any, path: Path) -> None:
@@ -31,9 +36,10 @@ class PersistenceService:
     Handles saving/loading models, metadata, ONNX export, and log cleanup.
     """
 
-    def __init__(self, models_dir: Path, logs_dir: Path):
+    def __init__(self, models_dir: Path, logs_dir: Path, settings: "Settings | None" = None):
         self.models_dir = models_dir
         self.logs_dir = logs_dir
+        self.settings = settings
         self.models_dir.mkdir(exist_ok=True)
         self.logs_dir.mkdir(exist_ok=True)
 
@@ -85,6 +91,21 @@ class PersistenceService:
         except Exception as e:
             logger.warning(f"Failed to save models bundle: {e}")
 
+    def _prefer_gpu(self) -> bool:
+        try:
+            pref_raw = getattr(getattr(self.settings, "system", None), "enable_gpu_preference", "auto")
+        except Exception:
+            pref_raw = "auto"
+
+        pref = normalize_device_preference(pref_raw)
+        if pref == "cpu":
+            return False
+
+        try:
+            return bool(get_available_gpus())
+        except Exception:
+            return False
+
     def load_models(self) -> tuple[dict[str, ExpertModel], MetaBlender | None]:
         models = {}
         blender = None
@@ -93,13 +114,23 @@ class PersistenceService:
         except Exception:
             return {}, None
 
+        prefer_gpu = self._prefer_gpu()
         for name in active:
             try:
-                cls = get_model_class(name, prefer_gpu=autotuner.gpu_available)
+                cls = get_model_class(name, prefer_gpu=prefer_gpu)
                 model = cls()
                 model.load(str(self.models_dir))
                 models[name] = model
             except Exception as e:
+                if prefer_gpu:
+                    try:
+                        cls_cpu = get_model_class(name, prefer_gpu=False)
+                        model = cls_cpu()
+                        model.load(str(self.models_dir))
+                        models[name] = model
+                        continue
+                    except Exception:
+                        pass
                 logger.warning(f"Failed to load {name}: {e}")
 
         try:

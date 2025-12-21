@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from ..core.config import Settings
-from ..core.system import thread_limits
+from ..core.system import AutoTuner, HardwareProbe, thread_limits
 from .model_factory import ModelFactory
 from .optimization import HyperparameterOptimizer
 
@@ -86,6 +86,12 @@ def run_worker(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     settings = Settings()
+    try:
+        profile = HardwareProbe().detect()
+        AutoTuner(settings, profile).apply()
+    except Exception:
+        # Worker can still proceed with safe defaults if probing fails.
+        pass
     X, y = _load_memmap_dataset(Path(args.dataset_dir))
 
     optimizer = HyperparameterOptimizer(settings)

@@ -683,7 +683,12 @@ class MT5StateManager:
                 steps = round(volume / volume_step)
                 aligned_volume = steps * volume_step
                 if abs(volume - aligned_volume) > 0.0001:
-                    logger.error(f"Lot size {volume} not aligned with step {volume_step} (nearest: {aligned_volume:.5f})")
+                    logger.error(
+                        "Lot size %s not aligned with step %s (nearest: %.5f)",
+                        volume,
+                        volume_step,
+                        aligned_volume,
+                    )
                     return False
 
             return True

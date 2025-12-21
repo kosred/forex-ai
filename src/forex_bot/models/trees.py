@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .base import ExpertModel, validate_time_ordering, time_series_train_val_split
+from .base import ExpertModel, time_series_train_val_split, validate_time_ordering
 
 try:
     import lightgbm as lgb
@@ -67,9 +67,9 @@ def _tree_device_preference() -> str:
     Controls whether tree models should run on GPU or CPU.
 
     Env:
-      - FOREX_BOT_TREE_DEVICE=auto|gpu|cpu  (default: auto)
+      - FOREX_BOT_TREE_DEVICE=auto|gpu|cpu  (default: cpu)
     """
-    raw = str(os.environ.get("FOREX_BOT_TREE_DEVICE", "auto")).strip().lower()
+    raw = str(os.environ.get("FOREX_BOT_TREE_DEVICE", "cpu")).strip().lower()
     if raw in {"cpu", "gpu", "auto"}:
         return raw
     if raw in {"0", "false", "no", "off"}:
@@ -216,8 +216,8 @@ class LightGBMExpert(ExpertModel):
                 if not has_cuda:
                     logger.warning("LightGBM GPU requested but no CUDA devices detected; falling back to CPU.")
             else:
-                # auto: use GPU when available
-                use_gpu = has_cuda
+                # auto: default to CPU (tree models are often faster on multi-core CPU)
+                use_gpu = False
 
             if use_gpu:
                 params["device_type"] = "gpu"
@@ -477,7 +477,8 @@ class XGBoostExpert(ExpertModel):
         elif pref == "gpu":
             use_gpu = has_cuda
         else:
-            use_gpu = has_cuda
+            # auto: default to CPU (tree models are often faster on multi-core CPU)
+            use_gpu = False
 
         if use_gpu:
             # Newer XGBoost prefers `tree_method=hist` + `device=cuda`.
@@ -556,7 +557,8 @@ class CatBoostExpert(ExpertModel):
         elif pref == "gpu":
             use_gpu = has_cuda
         else:
-            use_gpu = has_cuda
+            # auto: default to CPU (tree models are often faster on multi-core CPU)
+            use_gpu = False
 
         if use_gpu:
             self.params.setdefault("task_type", "GPU")

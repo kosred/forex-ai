@@ -1,6 +1,6 @@
 import ctypes
-import time
 import logging
+import time
 from ctypes import wintypes
 
 logger = logging.getLogger(__name__)
@@ -99,18 +99,18 @@ def ensure_autotrading_enabled(mt5_module):
     info = mt5_module.terminal_info()
     if not info:
         return False
-    
+
     if info.trade_allowed:
         logger.info("AutoTrading is already ENABLED.")
         return True
-    
+
     logger.warning("AutoTrading is DISABLED. Attempting to enable via hotkey (Ctrl+E)...")
-    
+
     focus_mt5_window()
     time.sleep(1.0) # Wait for focus
     send_ctrl_e()
     time.sleep(1.0) # Wait for toggle
-    
+
     # Verify
     info = mt5_module.terminal_info()
     if info and info.trade_allowed:

@@ -46,6 +46,7 @@ except ImportError:
 
 
 from ..core.config import Settings
+from ..core.system import normalize_device_preference
 from ..models.device import get_available_gpus, select_device
 from ..models.evolution import EvoExpertCMA
 from ..models.rl import RLExpertPPO, RLExpertSAC, _build_continuous_env
@@ -327,8 +328,11 @@ class HyperparameterOptimizer:
         self.prop_min_trades = int(getattr(self.settings.models, "prop_min_trades", 30))
         self.prop_weight = float(getattr(self.settings.models, "prop_metric_weight", 1.0))
         self.acc_weight = float(getattr(self.settings.models, "prop_accuracy_weight", 0.1))
-        self.device_pool = get_available_gpus()
-        self.default_device = select_device(getattr(self.settings.system, "device", "cpu"))
+        dev_pref = normalize_device_preference(getattr(self.settings.system, "enable_gpu_preference", "auto"))
+        self.device_pool = get_available_gpus() if dev_pref != "cpu" else []
+        if dev_pref == "gpu" and not self.device_pool:
+            logger.warning("GPU requested for Optuna but no CUDA devices detected; falling back to CPU.")
+        self.default_device = select_device("cpu" if dev_pref == "cpu" else "auto")
         self.stop_event: Any | None = None
         # Set by `_run_study()` to prevent CPU oversubscription when Optuna runs parallel trials.
         self._optuna_cpu_threads: int = 0
@@ -1115,7 +1119,8 @@ class HyperparameterOptimizer:
                 "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
                 "verbosity": -1,
             }
-            if device_id is not None:
+            tree_pref = normalize_device_preference(os.environ.get("FOREX_BOT_TREE_DEVICE", "cpu"))
+            if tree_pref == "gpu" and device_id is not None:
                 params["device_type"] = "gpu"
                 params["gpu_device_id"] = device_id
                 params.setdefault("max_bin", 63)

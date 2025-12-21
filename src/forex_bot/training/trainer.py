@@ -65,7 +65,7 @@ class ModelTrainer:
         # Services
         self.evaluator = EvaluationService(settings, self.models_dir)
         self.factory = ModelFactory(settings, self.models_dir)
-        self.persistence = PersistenceService(self.models_dir, self.logs_dir)
+        self.persistence = PersistenceService(self.models_dir, self.logs_dir, settings=self.settings)
         self.benchmarker = BenchmarkService()
 
         # State
@@ -1057,11 +1057,11 @@ class ModelTrainer:
                 world_size = dist.get_world_size()
                 if world_size > 1:
                     deep_models = {
-                        "transformer", "kan", "nbeats", "tide", "tabnet", 
+                        "transformer", "kan", "nbeats", "tide", "tabnet",
                         "rl_ppo", "rl_sac", "rllib_ppo", "rllib_sac",
                         "genetic", "evolution" # GA runs independent islands, so all ranks ok
                     }
-                    
+
                     assigned = []
                     # Pre-compute sorted index map for O(1) lookup instead of O(n) per model
                     sorted_models = sorted(models)
@@ -1077,7 +1077,7 @@ class ModelTrainer:
                             idx = index_map[m]
                             if idx % world_size == rank:
                                 assigned.append(m)
-                                
+
                     logger.info(f"Rank {rank}/{world_size} hybrid assignment: {assigned}")
                     return assigned
         except Exception as e:

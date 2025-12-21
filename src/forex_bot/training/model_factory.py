@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 
 from ..core.config import Settings
+from ..core.system import normalize_device_preference
 from ..models.base import ExpertModel
 from ..models.device import get_available_gpus
 from ..models.registry import get_model_class
@@ -13,18 +14,16 @@ logger = logging.getLogger(__name__)
 class ModelFactory:
     """
     Handles instantiation, configuration, and warm-starting of ExpertModels.
-    Uses Autotuner for hardware-aware parameter selection.
+    Uses settings + hardware availability for device selection.
     """
 
     def __init__(self, settings: Settings, models_dir: Path):
         self.settings = settings
         self.models_dir = models_dir
-        self.available_gpus = get_available_gpus()
 
-        # Use Autotuner's detection as the source of truth
-        from ..core.autotune import autotuner
-
-        self.prefer_gpu = autotuner.gpu_available
+        pref = normalize_device_preference(getattr(self.settings.system, "enable_gpu_preference", "auto"))
+        self.available_gpus = get_available_gpus() if pref != "cpu" else []
+        self.prefer_gpu = bool(self.available_gpus) and pref in {"auto", "gpu"}
 
     def create_model(self, model_name: str, best_params: dict, idx: int) -> ExpertModel:
         """Create and configure a model instance."""
@@ -51,17 +50,11 @@ class ModelFactory:
         elif model_name in best_params:
             params = best_params[model_name].copy()
 
-        # 2. Autotune Batch Size (if not fixed by params or config)
+        # 2. Batch size (config override if not fixed by Optuna params)
         if "batch_size" not in params:
-            # Check if config has a hard override, otherwise autotune
             cfg_bs = getattr(self.settings.models, "train_batch_size", None)
-            if cfg_bs:
+            if cfg_bs and int(cfg_bs) > 0:
                 params["batch_size"] = int(cfg_bs)
-            else:
-                from ..core.autotune import autotuner
-
-                params["batch_size"] = autotuner.get_optimal_batch_size(model_name)
-                logger.debug(f"Autotuned batch size for {model_name}: {params['batch_size']}")
 
         # 4. Filter Init Kwargs based on Signature
         init_kwargs = params.copy()

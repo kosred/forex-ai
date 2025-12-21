@@ -2,6 +2,31 @@
 /models/
 /cache/
 /reports/
+/logs/
+/.claude/
+/.pytest_cache/
+/.ruff_cache/
+/catboost_info/
+
+# Local secrets / keys (keep out of git)
+keys.txt
+keys*.txt
+!keys.example.txt
+*.pem
+*.pub
+*.key
+
+# Local databases / artifacts
+*.sqlite
+*.db
+*.log
+*.tfevents*
+data.zip
+claude-gpu-on-hyperstack.txt
+2025-12-21-what-mcp-tools-you-have.txt
+eval.md
+launch_multi_gpu.sh
+nul
 __pycache__/
 *.pyc
 .DS_Store

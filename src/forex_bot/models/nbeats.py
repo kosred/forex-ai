@@ -118,9 +118,9 @@ class NBeatsExpert(ExpertModel):
 
         pin_mem = str(self.device) != "cpu"
         loader = DataLoader(
-            dataset, 
-            batch_size=self.batch_size, 
-            shuffle=(sampler is None), 
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=(sampler is None),
             sampler=sampler,
             pin_memory=pin_mem
         )

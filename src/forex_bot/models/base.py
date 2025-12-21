@@ -284,7 +284,7 @@ def stratified_downsample(
     total = len(y)
     sampled_indices: list[int] = []
 
-    for label, indices in class_indices.items():
+    for _label, indices in class_indices.items():
         # Proportion of this class in original data
         class_ratio = len(indices) / total
         # Target samples for this class
@@ -338,7 +338,7 @@ def compute_class_weights(y: pd.Series | np.ndarray) -> dict[int, float]:
     n_classes = len(unique)
 
     weights = {}
-    for cls, count in zip(unique, counts):
+    for cls, count in zip(unique, counts, strict=False):
         if count > 0:
             # sklearn-style balanced weight
             weights[int(cls)] = n_samples / (n_classes * count)

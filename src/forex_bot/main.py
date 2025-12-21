@@ -395,6 +395,21 @@ def parse_args():
         help="Delete generated artifacts before starting (cache/models/tool caches).",
     )
     parser.add_argument("--clean-only", action="store_true", help="Run cleanup then exit.")
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "gpu"],
+        help="Force CPU/GPU selection (overrides config.yaml).",
+    )
+    parser.add_argument(
+        "--tree-device",
+        choices=["auto", "cpu", "gpu"],
+        help="Force tree models device (LightGBM/XGBoost/CatBoost). Overrides FOREX_BOT_TREE_DEVICE.",
+    )
+    parser.add_argument(
+        "--features-device",
+        choices=["auto", "cpu", "gpu"],
+        help="Force feature-engineering device. Overrides FOREX_BOT_FEATURES_DEVICE.",
+    )
     return parser.parse_args()
 
 
@@ -428,11 +443,11 @@ async def run_bot_instance(settings: Settings, stop_event: asyncio.Event):
 async def main_async():
     # Initialize DDP if launched via torchrun (RANK/WORLD_SIZE env vars present)
     ddp_rank = maybe_init_distributed()
-    
+
     args = parse_args()
     setup_logging(verbose=args.verbose)
     logger = logging.getLogger(__name__)
-    
+
     if ddp_rank:
         logger.info(f"?? Distributed Training Active (Local Rank: {ddp_rank})")
 
@@ -461,15 +476,22 @@ async def main_async():
 
     base_settings = Settings()
 
-    # Intelligent Auto-Configuration (Zero-Config Mode)
-    try:
-        from forex_bot.core.autoconfig import AutoConfigurator
+    # Runtime overrides (CLI wins over config.yaml)
+    if getattr(args, "device", None):
+        base_settings.system.enable_gpu_preference = str(args.device)
+    if getattr(args, "tree_device", None):
+        os.environ["FOREX_BOT_TREE_DEVICE"] = str(args.tree_device)
+    if getattr(args, "features_device", None):
+        os.environ["FOREX_BOT_FEATURES_DEVICE"] = str(args.features_device)
 
-        # This will automatically tune Hardware (GPU/CPU), Risk (Prop Firm), and Models
-        # based on the environment, effectively providing "Zero Config" out of the box.
-        base_settings = AutoConfigurator(base_settings).auto_tune()
-    except Exception as e:
-        logger.warning(f"Auto-configuration failed: {e}")
+    # Hardware auto-tune (single source of truth).
+    try:
+        from forex_bot.core.system import AutoTuner, HardwareProbe
+
+        profile = HardwareProbe().detect()
+        AutoTuner(base_settings, profile).apply()
+    except Exception as exc:
+        logger.warning(f"Hardware auto-tune failed: {exc}", exc_info=True)
 
     # Auto-detect Broker Backend based on OS
     if sys.platform == "win32":

@@ -11,7 +11,9 @@ import pandas as pd
 from pandas import DataFrame, Series
 
 from ..core.config import Settings
+from ..core.system import normalize_device_preference
 from ..domain.events import PreparedDataset
+from ..models.device import get_available_gpus
 
 # Modular Imports
 from .cpu.indicators import (
@@ -60,10 +62,12 @@ class FeatureEngineer:
             logger.info("Feature caching disabled.")
         self._symbol = None
 
-        # Autotuner handles detection; check if pandas acceleration is viable
-        from ..core.autotune import autotuner
+        self._gpu_pool = get_available_gpus()
+        pref = normalize_device_preference(getattr(self.settings.system, "enable_gpu_preference", "auto"))
+        self._gpu_enabled = bool(self._gpu_pool) and pref in {"auto", "gpu"}
 
-        if autotuner.gpu_available and have_cudf():
+        # cuDF pandas mode is powerful but invasive (it monkey-patches pandas globally), so keep it opt-in.
+        if self._gpu_enabled and have_cudf() and bool(int(os.environ.get("FOREX_BOT_CUDF_PANDAS", "0") or 0)):
             self._enable_cudf_pandas()
 
     def _enable_cudf_pandas(self) -> None:
@@ -152,10 +156,16 @@ class FeatureEngineer:
         if base is None or (isinstance(base, pd.DataFrame) and base.empty):
             raise ValueError(f"No data available for timeframe {base_tf}")
 
-        # Check autotuner for device preference for this specific workload size
-        from ..core.autotune import autotuner
-
-        use_gpu = autotuner.should_use_gpu_for_features(len(base))
+        features_pref = normalize_device_preference(os.environ.get("FOREX_BOT_FEATURES_DEVICE", "auto"))
+        use_gpu = False
+        if features_pref == "gpu":
+            use_gpu = self._gpu_enabled and CUPY_AVAILABLE
+        elif features_pref == "auto":
+            try:
+                min_rows = int(os.environ.get("FOREX_BOT_FEATURES_GPU_MIN_ROWS", "200000") or 200000)
+            except Exception:
+                min_rows = 200000
+            use_gpu = self._gpu_enabled and CUPY_AVAILABLE and len(base) >= min_rows
         smc_cuda_enabled = bool(getattr(self.settings.system, "smc_use_cuda", True))
 
         df = base.copy()

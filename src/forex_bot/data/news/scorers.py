@@ -111,7 +111,12 @@ class OpenAIScorer:
                 # Enhanced logging for empty/invalid responses
                 finish_reason = getattr(resp.choices[0], "finish_reason", "unknown")
                 refusal = getattr(resp.choices[0].message, "refusal", None)
-                logger.warning(f"OpenAI Empty Content. Finish: {finish_reason}, Refusal: {refusal}, Content: {repr(content)}")
+                logger.warning(
+                    "OpenAI Empty Content. Finish: %s, Refusal: %s, Content: %r",
+                    finish_reason,
+                    refusal,
+                    content,
+                )
                 self._log_parse_issue(content)
                 return None
 

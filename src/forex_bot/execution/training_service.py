@@ -4,7 +4,6 @@ import json
 import logging
 import multiprocessing
 import os
-import pickle
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -695,10 +694,10 @@ class TrainingService:
         # DDP Synchronization
         is_ddp = dist.is_available() and dist.is_initialized()
         rank = dist.get_rank() if is_ddp else 0
-        
+
         # Cache path for sharing data between ranks
         cache_path = Path(self.settings.system.cache_dir) / "hpc_datasets.pkl"
-        
+
         datasets: list[tuple[str, PreparedDataset]] = []
 
         if rank == 0:
@@ -715,7 +714,7 @@ class TrainingService:
 
             raw_frames_map = {}
             news_map: dict[str, pd.DataFrame | None] = {}
-            
+
             for sym in symbols:
                 self.settings.system.symbol = sym
                 await self.data_loader.ensure_history(sym)
@@ -727,11 +726,17 @@ class TrainingService:
 
             # Parallel Feature Engineering (use spawn to avoid CUDA fork issues)
             logger.info(f"HPC (Rank 0): Launching feature engineering on {max_workers} workers...")
-            spawn_ctx = multiprocessing.get_context('spawn')
+            spawn_ctx = multiprocessing.get_context("spawn")
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
                 futures: dict[concurrent.futures.Future, str] = {}
                 for sym, frames in raw_frames_map.items():
-                    fut = executor.submit(_hpc_feature_worker, self.settings.model_copy(), frames, sym, news_map.get(sym))
+                    fut = executor.submit(
+                        _hpc_feature_worker,
+                        self.settings.model_copy(),
+                        frames,
+                        sym,
+                        news_map.get(sym),
+                    )
                     futures[fut] = sym
 
                 for fut in concurrent.futures.as_completed(list(futures.keys())):
@@ -741,7 +746,7 @@ class TrainingService:
                         datasets.append((sym, ds))
                     except Exception as e:
                         logger.error(f"HPC Feature Gen failed: {e}")
-            
+
             # Save for other ranks
             if is_ddp:
                 try:
@@ -754,7 +759,7 @@ class TrainingService:
         if is_ddp:
             logger.info(f"Rank {rank}: Waiting for data preparation...")
             dist.barrier()
-            
+
             if rank > 0:
                 logger.info(f"Rank {rank}: Loading datasets from {cache_path}...")
                 try:
