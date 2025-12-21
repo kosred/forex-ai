@@ -438,9 +438,12 @@ class HyperparameterOptimizer:
             )
         else:
             dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.08))
+            required = float(self._prop_required_trades(meta_val))
+            tdays = self._infer_meta_trading_days(meta_val)
+            span_msg = f" val_trading_days={tdays:.0f}" if tdays is not None else ""
             logger.info(
                 "Optuna objective: prop-aware (OHLC available) "
-                f"| conf>={self.prop_conf_threshold:.2f} min_trades>={self.prop_min_trades} "
+                f"| conf>={self.prop_conf_threshold:.2f} min_trades>={required:.1f}{span_msg} "
                 f"dd_limit={dd_limit:.2%}"
             )
 
@@ -777,6 +780,72 @@ class HyperparameterOptimizer:
             logger.info(f"Optuna study {study_name}: using existing {completed} trials; no new trials scheduled.")
         return study
 
+    @staticmethod
+    def _infer_meta_trading_days(meta: pd.DataFrame) -> float | None:
+        """
+        Best-effort estimate of how many trading days (Mon–Fri) are present in a metadata slice.
+
+        This uses timestamps present in the data, so missing holidays/sessions naturally reduce the count.
+        """
+        try:
+            if meta is None or len(meta) < 2:
+                return None
+
+            ts: pd.DatetimeIndex | None
+            idx = getattr(meta, "index", None)
+            if isinstance(idx, pd.DatetimeIndex):
+                ts = idx
+            else:
+                ts = None
+                for col in ("timestamp", "time", "datetime", "date"):
+                    if col in meta.columns:
+                        ts = pd.to_datetime(meta[col], utc=True, errors="coerce")
+                        break
+                if ts is None:
+                    return None
+                ts = pd.DatetimeIndex(ts)
+
+            if ts.tz is not None:
+                ts = ts.tz_convert("UTC")
+
+            ts = ts[~ts.isna()]
+            if len(ts) == 0:
+                return None
+
+            # Count unique weekday dates.
+            mask = ts.weekday < 5
+            if not np.any(mask):
+                return None
+            days = pd.unique(ts[mask].normalize())
+            return float(len(days))
+        except Exception:
+            return None
+
+    def _prop_required_trades(self, meta_val: pd.DataFrame | None) -> float:
+        """
+        Interpret `prop_min_trades` as a *monthly* requirement and scale it to the validation window length
+        using trading days (Mon–Fri) when datetime metadata is available.
+
+        Override the assumed trading days per month via `FOREX_BOT_TRADING_DAYS_PER_MONTH` (default: 21).
+        """
+        base = float(self.prop_min_trades)
+        if not bool(getattr(self.settings.risk, "prop_firm_rules", False)):
+            return base
+        if meta_val is None:
+            return base
+        trading_days = self._infer_meta_trading_days(meta_val)
+        if trading_days is None:
+            return base
+        days_per_month = 21.0
+        try:
+            days_per_month = float(os.environ.get("FOREX_BOT_TRADING_DAYS_PER_MONTH", "21") or 21.0)
+        except Exception:
+            days_per_month = 21.0
+        days_per_month = max(1.0, float(days_per_month))
+
+        required = base * (trading_days / days_per_month)
+        return max(1.0, float(required))
+
     def _objective_base(self, y_true: np.ndarray, y_pred_proba: np.ndarray, meta_val: pd.DataFrame | None) -> float:
         """
         Prop-aware composite objective: prop PnL metric + small accuracy term.
@@ -892,7 +961,8 @@ class HyperparameterOptimizer:
                     total_trades += float(trades)
                     weighted += float(trades) * float(prop_score)
 
-                if total_trades < float(self.prop_min_trades):
+                required = float(self._prop_required_trades(meta_val))
+                if total_trades < required:
                     return -1e9
                 agg = weighted / max(total_trades, 1.0)
                 return float(self.prop_weight * agg + self.acc_weight * acc)
@@ -940,7 +1010,8 @@ class HyperparameterOptimizer:
                 )
 
             net_profit, sharpe, sortino, max_dd, win_rate, profit_factor, expectancy, sqn, trades, _r2 = metrics
-            if trades < self.prop_min_trades or max_dd >= dd_limit:
+            required = float(self._prop_required_trades(meta_val))
+            if trades < required or max_dd >= dd_limit:
                 return -1e9
 
             monthly_ret = net_profit / 100000.0  # baseline equity in _fast_backtest

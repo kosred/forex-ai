@@ -144,6 +144,144 @@ async def _run_global_training(base_settings: Settings, symbols: list[str], stop
     await bot.train_global(symbols=symbols, optimize=True, stop_event=stop_event)
 
 
+async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> None:
+    """
+    Offline backtest using local historical data + currently saved models.
+
+    This does NOT require the market to be open (useful on weekends) and does not place orders.
+    Writes summary JSON to `reports/offline_backtest.json`.
+    """
+    logger = logging.getLogger(__name__)
+    import json
+    import time
+
+    import numpy as np
+    import pandas as pd
+
+    from forex_bot.features.engine import SignalEngine
+    from forex_bot.features.pipeline import FeatureEngineer
+    from forex_bot.strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+    from forex_bot.training.evaluation import prop_backtest
+
+    models_dir = Path(os.environ.get("FOREX_BOT_MODELS_DIR", "models"))
+    if not _global_models_exist(models_dir):
+        logger.error(f"[BACKTEST] No trained models found in {models_dir}. Train first.")
+        return
+
+    engine = SignalEngine(base_settings)
+    engine.load_models(str(models_dir))
+    if not getattr(engine, "models", None) and not getattr(engine, "_use_onnx", False):
+        logger.error(f"[BACKTEST] Failed to load models from {models_dir}.")
+        return
+
+    loader = DataLoader(base_settings)
+    fe = FeatureEngineer(base_settings)
+
+    out_dir = Path("reports")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[dict[str, Any]] = []
+    for sym in symbols:
+        base_settings.system.symbol = sym
+
+        ok = await loader.ensure_history(sym)
+        if not ok:
+            logger.error(f"[BACKTEST] Missing data for {sym}. Skipping.")
+            continue
+        frames = await loader.get_training_data(sym)
+
+        dataset = fe.prepare(frames, news_features=None, symbol=sym)
+        result = engine.generate_ensemble_signals(dataset)
+        if dataset.metadata is None or result.signals is None or len(dataset.metadata) == 0:
+            logger.error(f"[BACKTEST] Missing metadata/signals for {sym}. Skipping.")
+            continue
+
+        df = dataset.metadata
+        sig = result.signals
+
+        prop_metrics = prop_backtest(
+            df,
+            sig,
+            max_daily_dd_pct=float(getattr(base_settings.risk, "daily_drawdown_limit", 0.05)),
+            daily_dd_warn_pct=float(getattr(base_settings.risk, "daily_drawdown_limit", 0.05)) * 0.8,
+            max_trades_per_day=int(getattr(base_settings.risk, "max_trades_per_day", 10)),
+            use_gpu=False,
+        )
+
+        fast_metrics: dict[str, Any] = {}
+        try:
+            if {"close", "high", "low"}.issubset(set(df.columns)):
+                idx = df.index
+                if not isinstance(idx, pd.DatetimeIndex):
+                    idx = pd.to_datetime(idx, utc=True, errors="coerce")
+                month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
+
+                pip_size, pip_value_per_lot = infer_pip_metrics(sym)
+                sl_pips = float(getattr(base_settings.risk, "meta_label_sl_pips", 20.0))
+                rr = float(getattr(base_settings.risk, "min_risk_reward", 2.0))
+                tp_pips_cfg = float(getattr(base_settings.risk, "meta_label_tp_pips", sl_pips * rr))
+                tp_pips = max(tp_pips_cfg, sl_pips * rr)
+
+                spread = float(getattr(base_settings.risk, "backtest_spread_pips", 1.5))
+                commission = float(getattr(base_settings.risk, "commission_per_lot", 0.0))
+
+                arr = fast_evaluate_strategy(
+                    close_prices=df["close"].to_numpy(dtype=np.float64),
+                    high_prices=df["high"].to_numpy(dtype=np.float64),
+                    low_prices=df["low"].to_numpy(dtype=np.float64),
+                    signals=sig.to_numpy(dtype=np.int8),
+                    month_indices=month_idx,
+                    sl_pips=sl_pips,
+                    tp_pips=tp_pips,
+                    pip_value=pip_size,
+                    spread_pips=spread,
+                    commission_per_trade=commission,
+                    pip_value_per_lot=pip_value_per_lot,
+                )
+
+                keys = [
+                    "net_profit",
+                    "sharpe",
+                    "sortino",
+                    "max_dd",
+                    "win_rate",
+                    "profit_factor",
+                    "expectancy",
+                    "sqn",
+                    "trades",
+                    "consistency_score",
+                ]
+                fast_metrics = {k: float(v) for k, v in zip(keys, arr.tolist(), strict=False)}
+        except Exception as exc:
+            logger.warning(f"[BACKTEST] Fast metrics failed for {sym}: {exc}")
+
+        logger.info(
+            f"[BACKTEST] {sym}: pnl={prop_metrics.get('pnl_score', 0.0):.4f} "
+            f"win_rate={prop_metrics.get('win_rate', 0.0):.3f} "
+            f"max_dd={prop_metrics.get('max_dd_pct', 0.0):.3f} "
+            f"trades={prop_metrics.get('trades', 0)}"
+        )
+
+        results.append(
+            {
+                "symbol": sym,
+                "bars": int(len(df)),
+                "prop": prop_metrics,
+                "fast": fast_metrics,
+            }
+        )
+
+    out_path = out_dir / "offline_backtest.json"
+    payload = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "models_dir": str(models_dir),
+        "symbols": list(symbols),
+        "results": results,
+    }
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    logger.info(f"[BACKTEST] Wrote {out_path}")
+
+
 async def _listen_for_escape(stop_event: asyncio.Event) -> None:
     """Listen for DOUBLE ESC key (Windows) to trigger graceful shutdown."""
     if sys.platform != "win32":
@@ -239,6 +377,11 @@ def parse_args():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--train", action="store_true", help="Train models and exit (no live trading)")
     mode.add_argument("--run", action="store_true", help="Run live trading (skip global pre-train step)")
+    mode.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Offline backtest using saved models + local data, then exit.",
+    )
     parser.add_argument("--symbol", type=str, help="Override symbol from config (comma-separated for multiple)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument(
@@ -377,6 +520,14 @@ async def main_async():
         await loader.ensure_all_history(symbols)
     except Exception as exc:
         logger.warning(f"Preflight data setup skipped: {exc}")
+
+    if getattr(args, "backtest", False):
+        logger.info("Offline backtest mode requested (--backtest).")
+        try:
+            await _run_offline_backtest(base_settings, symbols)
+        except asyncio.CancelledError:
+            logger.info("Backtest cancelled by user.")
+        return
 
     stop_event = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), stop_event)
