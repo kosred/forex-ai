@@ -40,6 +40,22 @@ from .persistence_service import PersistenceService
 
 logger = logging.getLogger(__name__)
 
+
+def _find_entrypoint_script() -> Path:
+    """
+    Locate the repo's `forex-ai.py` entrypoint.
+
+    This trainer sometimes runs from installed packages or different working directories, so we
+    search upward from the current file rather than assuming a fixed directory depth.
+    """
+    here = Path(__file__).resolve()
+    for parent in [here.parent, *here.parents]:
+        candidate = parent / "forex-ai.py"
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Cannot locate entrypoint script `forex-ai.py` from {here}")
+
+
 # Optional FSDP imports
 try:  # pragma: no cover
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: N817
@@ -301,10 +317,7 @@ class ModelTrainer:
         cfg_exists = cfg_path.exists()
         self._export_memmap_dataset(X_fit, y_fit, dataset_dir)
 
-        repo_root = Path(__file__).resolve().parents[3]
-        entry = repo_root / "forex-ai.py"
-        if not entry.exists():
-            raise FileNotFoundError(f"Cannot locate entrypoint script: {entry}")
+        entry = _find_entrypoint_script()
 
         procs: list[tuple[int, Path, subprocess.Popen, Any]] = []
         try:
@@ -343,7 +356,7 @@ class ModelTrainer:
                 log_f = open(log_path, "w", encoding="utf-8")
                 proc = subprocess.Popen(
                     cmd,
-                    cwd=str(repo_root),
+                    cwd=str(entry.parent),
                     env=env,
                     stdout=log_f,
                     stderr=subprocess.STDOUT,
