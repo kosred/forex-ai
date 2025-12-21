@@ -122,6 +122,13 @@ class RiskManager:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+
+        # Use configured session timezone for all "day boundary" logic to avoid local-time drift.
+        # Defaults to UTC if misconfigured.
+        try:
+            self._session_tz = ZoneInfo(settings.system.session_timezone)
+        except Exception:
+            self._session_tz = ZoneInfo("UTC")
         self.risk_ledger = RiskLedger(max_events=settings.system.risk_ledger_max_events)
 
         initial_balance = float(getattr(settings.risk, "initial_balance", 0.0) or 0.0)
@@ -136,7 +143,7 @@ class RiskManager:
         )
         self._base_prop_max_trades = self.prop_rules.max_trades_per_day
         self.month_start_equity: float = 0.0  # Will be updated from MT5
-        self.month_start_date: date = datetime.now().date().replace(day=1)
+        self.month_start_date: date = datetime.now(self._session_tz).date().replace(day=1)
         self.monthly_return_pct: float = 0.0
         self.monthly_profit_target_pct: float = getattr(settings.risk, "monthly_profit_target_pct", 0.04)
         self.monthly_target_hit: bool = False
@@ -154,7 +161,7 @@ class RiskManager:
         self.day_peak_equity: float = float(initial_balance)
         self.phase_trade_days: set[date] = set()
 
-        self.challenge_start_date = datetime.now().date()
+        self.challenge_start_date = datetime.now(self._session_tz).date()
         self.daily_pnl_tracker = {}
         self.consecutive_winning_days = 0
         self.consecutive_losing_days = 0
@@ -172,11 +179,6 @@ class RiskManager:
 
         self.consistency_score = 100.0
         self.revenge_trading_detector = RevengeTradeDetector()
-
-        try:
-            self._session_tz = ZoneInfo(settings.system.session_timezone)
-        except Exception:
-            self._session_tz = ZoneInfo("UTC")
 
         self._session_start = self._parse_time(settings.system.trading_session_start)
         self._session_end = self._parse_time(settings.system.trading_session_end)
