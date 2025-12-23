@@ -22,6 +22,14 @@ except Exception:  # pragma: no cover
     NF_TimesNet = None  # type: ignore
     NF_AVAILABLE = False
 
+try:  # pragma: no cover
+    from sklearn.linear_model import LogisticRegression
+
+    SKLEARN_AVAILABLE = True
+except Exception:
+    LogisticRegression = None  # type: ignore
+    SKLEARN_AVAILABLE = False
+
 
 class _NFWrapper(ExpertModel):
     """
@@ -49,6 +57,7 @@ class _NFWrapper(ExpertModel):
         self.model = None
         self._nf = None
         self.feature_columns: list[str] = []
+        self.calibrator = None
 
     def _build_nf_model(self, input_dim: int):
         if not NF_AVAILABLE:
@@ -93,6 +102,29 @@ class _NFWrapper(ExpertModel):
         self._nf.fit(df=df)
         self.model = nf_model
 
+        # Optional calibration using holdout
+        if SKLEARN_AVAILABLE and LogisticRegression is not None:
+            try:
+                val_size = max(200, int(0.15 * len(df)))
+                if val_size >= 50:
+                    val_df = df.iloc[-val_size:].copy()
+                    val_y = y.iloc[-val_size:].to_numpy(dtype=int)
+                    fcst = self._nf.predict(df=val_df)
+                    col = self.model.__class__.__name__
+                    if col not in fcst.columns:
+                        col = fcst.columns[-1]
+                    z = fcst[col].to_numpy(dtype=float)
+
+                    uniq = list(dict.fromkeys(int(v) for v in val_y))
+                    mapping = {lab: i for i, lab in enumerate(uniq)}
+                    y_contig = np.array([mapping[int(v)] for v in val_y], dtype=int)
+
+                    clf = LogisticRegression(max_iter=1000, multi_class="multinomial")
+                    clf.fit(z.reshape(-1, 1), y_contig)
+                    self.calibrator = (clf, mapping)
+            except Exception as exc:
+                logger.debug(f"Calibration skipped: {exc}")
+
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
         if self._nf is None or self.model is None:
             raise RuntimeError("Model not fitted")
@@ -108,6 +140,12 @@ class _NFWrapper(ExpertModel):
         if col not in fcst.columns:
             col = fcst.columns[-1]
         val = fcst[col].to_numpy(dtype=float)
+        if self.calibrator:
+            clf, mapping = self.calibrator
+            inv = {v: k for k, v in mapping.items()}
+            proba = clf.predict_proba(val.reshape(-1, 1))
+            classes = [inv.get(i, i) for i in range(proba.shape[1])]
+            return self._pad_probs(proba, classes)
         # Map to neutral/buy/sell probabilities via tanh-based logits
         val_clipped = np.tanh(val)  # between -1 and 1
         logits = np.stack([0.0 * val_clipped, val_clipped, -val_clipped], axis=1)
@@ -115,6 +153,33 @@ class _NFWrapper(ExpertModel):
         exp = np.exp(logits)
         probs = exp / (exp.sum(axis=1, keepdims=True) + 1e-12)
         return probs.astype(float, copy=False)
+
+    @staticmethod
+    def _pad_probs(p: np.ndarray, classes: list[int] | None = None) -> np.ndarray:
+        """Pad/reorder to [neutral(0), buy(1), sell(-1)]."""
+        arr = np.asarray(p, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        n = arr.shape[0]
+        out = np.zeros((n, 3), dtype=float)
+        if classes and len(classes) == arr.shape[1]:
+            for col, cls in enumerate(classes):
+                if cls == 0:
+                    out[:, 0] = arr[:, col]
+                elif cls == 1:
+                    out[:, 1] = arr[:, col]
+                elif cls == -1 or cls == 2:
+                    out[:, 2] = arr[:, col]
+            return out
+        if arr.shape[1] == 2:
+            out[:, 0] = arr[:, 0]
+            out[:, 1] = arr[:, 1]
+        elif arr.shape[1] >= 3:
+            out = arr[:, :3]
+        else:
+            out[:, 0] = 1.0 - arr[:, 0]
+            out[:, 1] = arr[:, 0]
+        return out
 
     def save(self, path: str) -> None:
         if self._nf is None:
@@ -134,6 +199,8 @@ class _NFWrapper(ExpertModel):
                 "device": self.device,
             }
             joblib.dump(meta, out_dir / "meta.pkl")
+            if self.calibrator is not None:
+                joblib.dump(self.calibrator, out_dir / "calibrator.pkl")
         except Exception as e:
             logger.warning(f"Failed to save neuralforecast model {self.model_name}: {e}")
 
@@ -159,6 +226,12 @@ class _NFWrapper(ExpertModel):
             self._nf = NeuralForecast(models=[nf_model], freq="D")
             self._nf.load(out_dir)
             self.model = nf_model
+            cal_path = out_dir / "calibrator.pkl"
+            if cal_path.exists():
+                try:
+                    self.calibrator = joblib.load(cal_path)
+                except Exception:
+                    self.calibrator = None
         except Exception as e:
             logger.warning(f"Failed to load neuralforecast model {self.model_name}: {e}")
 

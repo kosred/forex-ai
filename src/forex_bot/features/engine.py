@@ -72,6 +72,11 @@ class SignalEngine:
         self._run_summary: dict[str, Any] = {}
         self._onnx_engine: ONNXInferenceEngine | None = None
         self._use_onnx = False  # Automatically enabled if available
+        # Prop firm safety gates
+        self._daily_dd_cutoff = float(getattr(settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
+        self._total_dd_cutoff = float(getattr(settings.risk, "max_drawdown_limit", 0.07) or 0.07)
+        self._profit_target = float(getattr(settings.risk, "monthly_profit_target", 0.04) or 0.04)
+        self._max_trades_per_day = int(getattr(settings.risk, "max_trades_per_day", 20) or 20)
 
     def prepare_dataset(
         self,
@@ -515,6 +520,10 @@ class SignalEngine:
         model_pred_store: dict[str, np.ndarray] = {}
 
         if self._use_onnx and self._onnx_engine:
+            onnx_preds: dict[str, np.ndarray] = {}
+            onnx_missing: set[str] = set()
+            available = set(self._onnx_engine.model_names)
+
             for name in self._onnx_engine.model_names:
                 if name == "evolution" or name == "meta_blender":
                     continue  # Already handled or handled later
@@ -526,11 +535,26 @@ class SignalEngine:
                         classes = [-1, 0, 1]  # common sklearn class order for y ∈ {-1,0,1}
                     probs = self._pad_probs(self._onnx_engine.predict_proba(name, X), classes=classes)
                     probs = self._softmax(probs)
-                    probs_list.append(probs)
-                    components.append((name, probs))
-                    model_pred_store[name] = probs
+                    onnx_preds[name] = probs
                 except Exception as e:
                     logger.warning(f"ONNX {name} prediction failed: {e}")
+                    onnx_missing.add(name)
+
+            # All-or-nothing: if any ONNX model missing/fails, return neutral (no trade)
+            if onnx_missing:
+                logger.warning(f"ONNX missing/failed models: {sorted(onnx_missing)}; disabling trading signals.")
+                return np.zeros((len(X), 3)), {"components": components}
+            if set(onnx_preds.keys()) != available:
+                missing = available - set(onnx_preds.keys())
+                if missing:
+                    logger.warning(f"ONNX models missing predictions: {sorted(missing)}; disabling trading signals.")
+                    return np.zeros((len(X), 3)), {"components": components}
+
+            for name, probs in onnx_preds.items():
+                probs_list.append(probs)
+                components.append((name, probs))
+                model_pred_store[name] = probs
+
         else:
             for name, wrapper in self.models.items():
                 if name == "evolution":
