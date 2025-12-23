@@ -113,7 +113,7 @@ models:
   prop_accuracy_weight: 0.1
   prop_min_trades: 30
   prop_conf_threshold: 0.55
-  walkforward_splits: 0  # leave at 0 if you want to skip walk-forward; set >0 to re-enable
+  walkforward_splits: 20  # time-based walk-forward splits for OOS validation
   embargo_minutes: 120
   # CPCV (Combinatorial Purged Cross-Validation) settings
   enable_cpcv: true

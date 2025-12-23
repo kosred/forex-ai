@@ -959,7 +959,7 @@ class ModelTrainer:
         if not stop_event or not stop_event.is_set():
             self._train_blender(X_eval, y_eval)
 
-        # 8. Evaluation
+        # 8. Evaluation (enforce walkforward/CPCV)
         if not stop_event or not stop_event.is_set():
             eval_dataset = PreparedDataset(
                 X=X_eval,
