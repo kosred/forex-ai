@@ -28,6 +28,29 @@ class GeneticStrategyExpert(ExpertModel):
     def __post_init__(self):
         self.mixer = TALibStrategyMixer()
 
+    def _validate_gene(self, gene: TALibStrategyGene) -> TALibStrategyGene | None:
+        """
+        Ensure gene only references available indicators and sane thresholds.
+        Returns a sanitized gene or None if it cannot be used.
+        """
+        if not self.mixer or not self.mixer.available_indicators:
+            return None
+
+        valid_set = set(self.mixer.available_indicators)
+        filtered_inds = [ind for ind in gene.indicators if ind in valid_set]
+        if not filtered_inds:
+            return None
+
+        gene.indicators = filtered_inds
+        # Drop params/weights for missing indicators
+        gene.params = {k: v for k, v in gene.params.items() if k in valid_set}
+        gene.weights = {k: float(v) for k, v in (gene.weights or {}).items() if k in filtered_inds}
+
+        # Clamp thresholds to reasonable bounds to avoid degenerate always-long/always-short
+        gene.long_threshold = float(np.clip(gene.long_threshold, 0.1, 1.5))
+        gene.short_threshold = float(np.clip(gene.short_threshold, -1.5, -0.1))
+        return gene
+
     def fit(self, x: pd.DataFrame, y: pd.Series, metadata: pd.DataFrame | None = None) -> None:
         if metadata is None:
             logger.warning("GeneticStrategyExpert requires metadata (OHLC) to fit. Skipping.")
@@ -82,7 +105,11 @@ class GeneticStrategyExpert(ExpertModel):
                                 sl_pips=bg_data.get("sl_pips", 20.0),
                             )
                             gene.fitness = bg_data.get("fitness", 0.0)
-                            self.portfolio.append(gene)
+                            gene = self._validate_gene(gene)
+                            if gene:
+                                self.portfolio.append(gene)
+                            else:
+                                logger.debug("Discovery Engine gene rejected during validation.")
                         except Exception as exc:
                             logger.debug(
                                 "Skipping invalid Discovery Engine gene payload: %s", exc, exc_info=True
@@ -98,9 +125,12 @@ class GeneticStrategyExpert(ExpertModel):
 
         logger.info(f"Evolving strategies over {self.generations} generations (Fallback Internal Mode)...")
         # ... Fallback legacy code ...
-        population = [
-            self.mixer.generate_random_strategy(max_indicators=self.max_indicators) for _ in range(self.population_size)
-        ]
+        population: list[TALibStrategyGene] = []
+        while len(population) < self.population_size:
+            gene = self.mixer.generate_random_strategy(max_indicators=self.max_indicators)
+            gene = self._validate_gene(gene)
+            if gene:
+                population.append(gene)
 
         df = metadata.copy()
         best_fitness = -np.inf

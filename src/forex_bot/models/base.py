@@ -441,18 +441,13 @@ def detect_feature_drift(
                 continue
 
             if method == "psi":
-                score = _compute_psi(train_vals, val_vals)
+                try:
+                    score = _compute_psi(train_vals, val_vals)
+                except Exception as exc:
+                    logger.debug(f"PSI failed for {col}, falling back to stats: {exc}", exc_info=True)
+                    score = _compute_stats_drift(train_vals, val_vals)
             else:
-                # Simple stats comparison
-                train_mean, train_std = np.mean(train_vals), np.std(train_vals)
-                val_mean, val_std = np.mean(val_vals), np.std(val_vals)
-
-                if train_std > 1e-9:
-                    mean_shift = abs(val_mean - train_mean) / train_std
-                    std_ratio = val_std / train_std if train_std > 0 else 1.0
-                    score = mean_shift + abs(1.0 - std_ratio)
-                else:
-                    score = 0.0
+                score = _compute_stats_drift(train_vals, val_vals)
 
             drift_scores[col] = float(score)
 
@@ -510,15 +505,28 @@ def _compute_psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> 
     eps = 1e-6
 
     # Create bins from expected distribution
+    n_bins = max(3, n_bins)
     breakpoints = np.percentile(expected, np.linspace(0, 100, n_bins + 1))
     breakpoints = np.unique(breakpoints)  # Remove duplicates
 
     if len(breakpoints) < 2:
         return 0.0
 
-    # Compute bin counts
-    expected_counts = np.histogram(expected, bins=breakpoints)[0]
-    actual_counts = np.histogram(actual, bins=breakpoints)[0]
+    def _hist(vals: np.ndarray, bps: np.ndarray) -> np.ndarray:
+        return np.histogram(vals, bins=bps)[0]
+
+    expected_counts = _hist(expected, breakpoints)
+    actual_counts = _hist(actual, breakpoints)
+
+    # If bins are too sparse, retry once with coarser bins
+    if (expected_counts < 3).any() or (actual_counts < 3).any():
+        coarse_bins = max(3, min(5, len(breakpoints) - 1))
+        coarse_breaks = np.percentile(expected, np.linspace(0, 100, coarse_bins + 1))
+        coarse_breaks = np.unique(coarse_breaks)
+        if len(coarse_breaks) >= 2 and len(coarse_breaks) < len(breakpoints):
+            breakpoints = coarse_breaks
+            expected_counts = _hist(expected, breakpoints)
+            actual_counts = _hist(actual, breakpoints)
 
     # Convert to percentages
     expected_pct = expected_counts / (len(expected) + eps)
@@ -532,3 +540,16 @@ def _compute_psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> 
     psi = np.sum((actual_pct - expected_pct) * np.log(actual_pct / expected_pct))
 
     return float(psi)
+
+
+def _compute_stats_drift(train_vals: np.ndarray, val_vals: np.ndarray) -> float:
+    """Fallback drift metric based on mean/std shift."""
+    train_mean, train_std = np.mean(train_vals), np.std(train_vals)
+    val_mean, val_std = np.mean(val_vals), np.std(val_vals)
+    eps = np.finfo(np.float64).eps
+
+    if train_std > eps:
+        mean_shift = abs(val_mean - train_mean) / max(train_std, eps)
+        std_ratio = val_std / max(train_std, eps)
+        return float(mean_shift + abs(1.0 - std_ratio))
+    return 0.0
