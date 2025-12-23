@@ -191,6 +191,8 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
         "stable-baselines3[extra]",
         # Full TiDE and other SOTA models
         "neuralforecast",
+        # Time-Series Library (TSL) for PatchTST/TimesNet variants and others
+        "tslib",
     ]
     for lib in optional_libs:
         base_name = lib.split("[")[0]
@@ -206,6 +208,9 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
                 continue
             if "neuralforecast" in lib and system == "windows":
                 logger.info("Skipping neuralforecast on Windows; install on Linux/WSL for full TiDE.")
+                continue
+            if "tslib" in lib and system == "windows":
+                logger.info("Skipping tslib on Windows; install on Linux/WSL for TS transformers.")
                 continue
 
             logger.info(f"Installing {lib} (Best Effort)...")

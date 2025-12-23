@@ -85,6 +85,24 @@ try:
 except ImportError as e:
     logger.warning(f"Transformer models not available: {e}")
 
+# NeuralForecast Transformers (PatchTST / TimesNet)
+try:
+    from .transformer_nf import PatchTSTExpert, TimesNetExpert
+
+    register_model("patchtst", PatchTSTExpert)
+    register_model("timesnet", TimesNetExpert)
+except ImportError as e:
+    logger.warning(f"NeuralForecast transformers not available: {e}")
+
+# NeuralForecast TiDE / NBEATSx
+try:
+    from .forecast_nf import TiDENFExpert, NBEATSxNFExpert
+
+    register_model("tide_nf", TiDENFExpert)
+    register_model("nbeatsx_nf", NBEATSxNFExpert)
+except ImportError as e:
+    logger.warning(f"NeuralForecast TiDE/NBEATSx not available: {e}")
+
 try:
     from .rl import RLExpertPPO, RLExpertSAC
 
