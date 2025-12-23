@@ -11,6 +11,8 @@ from .device import get_available_gpus
 
 logger = logging.getLogger(__name__)
 
+_RAY_OWNED = False  # Track if this module initialized Ray
+
 try:
     import ray  # type: ignore
     from ray.rllib.algorithms.ppo import PPOConfig  # type: ignore
@@ -22,6 +24,14 @@ except Exception:
     PPOConfig = None
     SACConfig = None
     RAY_AVAILABLE = False
+
+try:
+    import gymnasium as _gym  # type: ignore
+
+    GYM_AVAILABLE = True
+except Exception:
+    _gym = None
+    GYM_AVAILABLE = False
 
 
 def _default_config(device: str, num_workers: int = 1) -> dict[str, Any]:
@@ -65,16 +75,58 @@ def _apply_resources(cfg: Any, device: str, num_workers: int) -> Any:
 
 
 def _maybe_init_ray() -> bool:
+    global _RAY_OWNED
     if not RAY_AVAILABLE or ray is None:
         return False
     if ray.is_initialized():
         return True
     try:
         ray.init(ignore_reinit_error=True, include_dashboard=False)
+        _RAY_OWNED = True
         return True
     except Exception as exc:
         logger.info(f"Ray init failed, skipping RLlib: {exc}")
         return False
+
+
+def _maybe_shutdown_ray() -> None:
+    """Shutdown Ray only if this module started it."""
+    global _RAY_OWNED
+    if not RAY_AVAILABLE or ray is None:
+        return
+    if not _RAY_OWNED:
+        return
+    try:
+        if ray.is_initialized():
+            ray.shutdown()
+    except Exception as exc:
+        logger.debug(f"Ray shutdown failed: {exc}", exc_info=True)
+    finally:
+        _RAY_OWNED = False
+
+
+def _stop_algo(algo: Any) -> None:
+    """Best-effort cleanup for RLlib Algorithm instances."""
+    if algo is None:
+        return
+    try:
+        if hasattr(algo, "stop"):
+            algo.stop()
+        elif hasattr(algo, "cleanup"):
+            algo.cleanup()
+    except Exception as exc:
+        logger.debug(f"Algorithm cleanup failed: {exc}", exc_info=True)
+
+
+def _deps_ready(context: str) -> bool:
+    """Check that required runtime dependencies are present."""
+    if not RAY_AVAILABLE:
+        logger.info("%s: Ray not available; skipping RLlib path.", context)
+        return False
+    if not GYM_AVAILABLE:
+        logger.info("%s: gymnasium not available; skipping RLlib path.", context)
+        return False
+    return True
 
 
 def _find_latest_checkpoint(checkpoint_dir: Path) -> str | None:
@@ -104,7 +156,8 @@ class _TabularEnv:
     """
 
     def __init__(self, config: dict = None) -> None:
-        import gymnasium as gym
+        if not GYM_AVAILABLE or _gym is None:
+            raise ImportError("gymnasium is required for RLlib tabular environment.")
 
         config = config or {}
         self.data = config.get("data")
@@ -116,8 +169,10 @@ class _TabularEnv:
             self.data = np.zeros((10, 10), dtype=np.float32)
             self.labels = np.zeros(10, dtype=np.int64)
 
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.data.shape[1],), dtype=np.float32)
-        self.action_space = gym.spaces.Discrete(3)
+        self.observation_space = _gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.data.shape[1],), dtype=np.float32
+        )
+        self.action_space = _gym.spaces.Discrete(3)
         self.i = 0
         self.n = len(self.labels)
 
@@ -141,13 +196,14 @@ class RLlibPPOAgent(ExpertModel):
     parallel_envs: int = 1
     config_overrides: dict[str, Any] = field(default_factory=dict)
     algo: Any = None
+    ray_owned: bool = False
 
     def fit(self, x: pd.DataFrame, y: pd.Series, env_fn: Any | None = None) -> None:
-        if not RAY_AVAILABLE or PPOConfig is None:
-            logger.info("RLlib PPO not available; skipping fit.")
+        if not _deps_ready("RLlib PPO fit") or PPOConfig is None:
             return
         if not _maybe_init_ray():
             return
+        self.ray_owned = _RAY_OWNED
 
         # Prepare data for the env
         data_obs = x.to_numpy(dtype=np.float32)
@@ -171,15 +227,23 @@ class RLlibPPOAgent(ExpertModel):
             except Exception as e:
                 logger.info(f"RLlib config update failed: {e}", exc_info=True)
 
-        self.algo = config.build()
+        self.algo = None
         try:
+            self.algo = config.build()
             self.algo.train()
         except Exception as exc:
             logger.info(f"RLlib PPO training failed: {exc}")
+            _stop_algo(self.algo)
+            self.algo = None
+            if self.ray_owned:
+                _maybe_shutdown_ray()
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
         if self.algo is None:
             raise RuntimeError("RLlib PPO not loaded")
+        if not _deps_ready("RLlib PPO predict"):
+            # Dependencies missing after load; safer to abort than return stale algo output
+            raise RuntimeError("RLlib PPO dependencies unavailable")
         try:
             obs = x.to_numpy(dtype=np.float32)
             actions, _, _ = self.algo.compute_actions(
@@ -193,6 +257,10 @@ class RLlibPPOAgent(ExpertModel):
             return probs
         except Exception as e:
             logger.error(f"RLlib PPO prediction failed: {e}", exc_info=True)
+            _stop_algo(self.algo)
+            self.algo = None
+            if self.ray_owned:
+                _maybe_shutdown_ray()
             raise
 
     def save(self, path: str) -> None:
@@ -205,19 +273,28 @@ class RLlibPPOAgent(ExpertModel):
             (out_dir / "checkpoint_path.txt").write_text(str(checkpoint_path), encoding="utf-8")
         except Exception as exc:
             logger.warning(f"RLlib PPO save failed: {exc}")
+            _stop_algo(self.algo)
+            self.algo = None
+            if self.ray_owned:
+                _maybe_shutdown_ray()
 
     def load(self, path: str) -> None:
-        if not RAY_AVAILABLE:
+        if not _deps_ready("RLlib PPO load"):
             return
         if not _maybe_init_ray():
             return
+        self.ray_owned = _RAY_OWNED
 
         base_dir = Path(path) / "rllib_ppo"
         if not base_dir.exists():
+            if self.ray_owned:
+                _maybe_shutdown_ray()
             return
 
         checkpoint_path = _find_latest_checkpoint(base_dir)
         if not checkpoint_path:
+            if self.ray_owned:
+                _maybe_shutdown_ray()
             return
 
         try:
@@ -226,6 +303,10 @@ class RLlibPPOAgent(ExpertModel):
             self.algo = Algorithm.from_checkpoint(checkpoint_path)
         except Exception as exc:
             logger.warning(f"RLlib PPO load failed: {exc}")
+            _stop_algo(self.algo)
+            self.algo = None
+            if self.ray_owned:
+                _maybe_shutdown_ray()
 
 
 @dataclass(slots=True)
@@ -236,13 +317,14 @@ class RLlibSACAgent(ExpertModel):
     parallel_envs: int = 1
     config_overrides: dict[str, Any] = field(default_factory=dict)
     algo: Any = None
+    ray_owned: bool = False
 
     def fit(self, x: pd.DataFrame, y: pd.Series, env_fn: Any | None = None) -> None:
-        if not RAY_AVAILABLE or SACConfig is None:
-            logger.info("RLlib SAC not available; skipping fit.")
+        if not _deps_ready("RLlib SAC fit") or SACConfig is None:
             return
         if not _maybe_init_ray():
             return
+        self.ray_owned = _RAY_OWNED
 
         data_obs = x.to_numpy(dtype=np.float32)
         labels = y.to_numpy(dtype=np.int64)
@@ -256,15 +338,22 @@ class RLlibSACAgent(ExpertModel):
 
         config = SACConfig().environment(env=env_cls, env_config=env_config)
         config = _apply_resources(config, self.device, self.parallel_envs)
-        self.algo = config.build()
+        self.algo = None
         try:
+            self.algo = config.build()
             self.algo.train()
         except Exception as exc:
             logger.info(f"RLlib SAC training failed: {exc}")
+            _stop_algo(self.algo)
+            self.algo = None
+            if self.ray_owned:
+                _maybe_shutdown_ray()
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
         if self.algo is None:
             raise RuntimeError("RLlib SAC not loaded")
+        if not _deps_ready("RLlib SAC predict"):
+            raise RuntimeError("RLlib SAC dependencies unavailable")
         try:
             obs = x.to_numpy(dtype=np.float32)
             actions, _, _ = self.algo.compute_actions(observations=obs, explore=False)
@@ -275,6 +364,10 @@ class RLlibSACAgent(ExpertModel):
             return probs
         except Exception as e:
             logger.error(f"RLlib SAC prediction failed: {e}", exc_info=True)
+            _stop_algo(self.algo)
+            self.algo = None
+            if self.ray_owned:
+                _maybe_shutdown_ray()
             raise
 
     def save(self, path: str) -> None:
@@ -287,19 +380,28 @@ class RLlibSACAgent(ExpertModel):
             (out_dir / "checkpoint_path.txt").write_text(str(checkpoint_path), encoding="utf-8")
         except Exception as exc:
             logger.warning(f"RLlib SAC save failed: {exc}")
+            _stop_algo(self.algo)
+            self.algo = None
+            if self.ray_owned:
+                _maybe_shutdown_ray()
 
     def load(self, path: str) -> None:
-        if not RAY_AVAILABLE:
+        if not _deps_ready("RLlib SAC load"):
             return
         if not _maybe_init_ray():
             return
+        self.ray_owned = _RAY_OWNED
 
         base_dir = Path(path) / "rllib_sac"
         if not base_dir.exists():
+            if self.ray_owned:
+                _maybe_shutdown_ray()
             return
 
         checkpoint_path = _find_latest_checkpoint(base_dir)
         if not checkpoint_path:
+            if self.ray_owned:
+                _maybe_shutdown_ray()
             return
 
         try:
@@ -308,3 +410,7 @@ class RLlibSACAgent(ExpertModel):
             self.algo = Algorithm.from_checkpoint(checkpoint_path)
         except Exception as exc:
             logger.warning(f"RLlib SAC load failed: {exc}")
+            _stop_algo(self.algo)
+            self.algo = None
+            if self.ray_owned:
+                _maybe_shutdown_ray()

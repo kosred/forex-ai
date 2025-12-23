@@ -459,7 +459,8 @@ def detect_feature_drift(
             if score >= threshold:
                 drifted_features.append(col)
 
-        except Exception:
+        except Exception as exc:
+            logger.debug(f"Drift score computation failed for column '{col}': {exc}", exc_info=True)
             continue
 
     # Calculate overall drift severity

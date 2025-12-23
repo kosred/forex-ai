@@ -83,7 +83,10 @@ class GeneticStrategyExpert(ExpertModel):
                             )
                             gene.fitness = bg_data.get("fitness", 0.0)
                             self.portfolio.append(gene)
-                        except Exception:
+                        except Exception as exc:
+                            logger.debug(
+                                "Skipping invalid Discovery Engine gene payload: %s", exc, exc_info=True
+                            )
                             continue
 
                     if self.portfolio:
@@ -115,7 +118,8 @@ class GeneticStrategyExpert(ExpertModel):
                     fitness = sharpe if (pos.diff().abs() > 0).sum() > 10 else -1.0
                     gene.fitness = fitness
                     scores.append((fitness, gene))
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Genetic training fitness failed for gene %s: %s", getattr(gene, "strategy_id", "?"), exc, exc_info=True)
                     scores.append((-1.0, gene))
 
             if scores:

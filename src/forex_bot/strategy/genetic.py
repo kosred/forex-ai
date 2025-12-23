@@ -214,7 +214,7 @@ class GeneticStrategyEvolution:
                 gene.trades_count = trades
                 gene.evaluated = True
             except Exception as exc:
-                logger.debug(f"Gene evaluation failed for {gene.strategy_id}: {exc}")
+                logger.debug(f"Gene evaluation failed for {gene.strategy_id}: {exc}", exc_info=True)
                 gene.fitness = -1e9
                 gene.trades_count = 0
                 gene.evaluated = True
