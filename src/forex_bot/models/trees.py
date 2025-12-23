@@ -172,13 +172,28 @@ def _reorder_to_neutral_buy_sell(probs: np.ndarray, classes: list[int] | None) -
     return out
 
 
+def _remap_labels_to_contiguous(y: pd.Series | np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
+    """
+    Map {-1,0,1} style labels to contiguous {0,1,2} expected by some tree libs.
+    Returns remapped array and mapping dict.
+    """
+    y_arr = np.asarray(y, dtype=int)
+    mapping: dict[int, int] = {}
+    # Unique in stable order
+    uniq = list(dict.fromkeys(int(v) for v in y_arr))
+    for new_idx, old in enumerate(uniq):
+        mapping[old] = new_idx
+    remapped = np.array([mapping[int(v)] for v in y_arr], dtype=int)
+    return remapped, mapping
+
+
 class LightGBMExpert(ExpertModel):
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
         self.params = params or {
-            "n_estimators": 500,
-            "num_leaves": 64,
-            "learning_rate": 0.05,
+            "n_estimators": 800,
+            "num_leaves": 96,
+            "learning_rate": 0.03,
             "objective": "multiclass",
             "num_class": 3,
             "random_state": 42,
@@ -192,6 +207,12 @@ class LightGBMExpert(ExpertModel):
             return
 
         try:
+            # Enforce time ordering if index is datetime and not monotonic
+            if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
+                order = np.argsort(x.index.view("int64"))
+                x = x.iloc[order]
+                y = y.iloc[order]
+
             uniq, counts = np.unique(y, return_counts=True)
             class_weight = {
                 int(cls): float(len(y) / (len(uniq) * cnt)) for cls, cnt in zip(uniq, counts, strict=False) if cnt > 0
@@ -216,8 +237,8 @@ class LightGBMExpert(ExpertModel):
                 if not has_cuda:
                     logger.warning("LightGBM GPU requested but no CUDA devices detected; falling back to CPU.")
             else:
-                # auto: default to CPU (tree models are often faster on multi-core CPU)
-                use_gpu = False
+                # auto: prefer GPU if available
+                use_gpu = has_cuda
 
             if use_gpu:
                 params["device_type"] = "gpu"
@@ -245,19 +266,22 @@ class LightGBMExpert(ExpertModel):
             if len(y) > 500:
                 try:
                     validate_time_ordering(x, context="LightGBMExpert.fit")
+                    y_arr, mapping = _remap_labels_to_contiguous(y)
                     x_train, x_val, y_train, y_val = time_series_train_val_split(
-                        x, y, val_ratio=0.15, min_train_samples=100, embargo_samples=0
+                        x, pd.Series(y_arr, index=y.index), val_ratio=0.15, min_train_samples=100, embargo_samples=0
                     )
                     eval_set = [(x_val, y_val)]
                 except ValueError:
                     # Fall back to simple positional split if validation fails
                     split_idx = int(len(x) * 0.85)
+                    y_arr, mapping = _remap_labels_to_contiguous(y)
                     x_train, x_val = x.iloc[:split_idx], x.iloc[split_idx:]
-                    y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+                    y_train, y_val = y_arr[:split_idx], y_arr[split_idx:]
                     eval_set = [(x_val, y_val)]
             else:
-                x_train, y_train = x, y
-                eval_set = [(x, y)]
+                y_arr, mapping = _remap_labels_to_contiguous(y)
+                x_train, y_train = x, y_arr
+                eval_set = [(x, y_arr)]
 
             self.model = lgb.LGBMClassifier(**params)
             try:
@@ -451,15 +475,18 @@ class XGBoostExpert(ExpertModel):
         self.model = None
 
         self.params = params or {
-            "n_estimators": 500,
-            "max_depth": 6,
+            "n_estimators": 800,
+            "max_depth": 8,
             "learning_rate": 0.05,
             "objective": "multi:softprob",
             "num_class": 3,
             "random_state": 42,
             "n_jobs": -1,
             "verbosity": 0,
-            "tree_method": "hist",  # works for both CPU and GPU (device=cuda)
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "eval_metric": "mlogloss",
+            "tree_method": "hist",  # default; overridden to gpu_hist if GPU
         }
 
         cpu_threads = _cpu_threads_hint()
@@ -477,20 +504,27 @@ class XGBoostExpert(ExpertModel):
         elif pref == "gpu":
             use_gpu = has_cuda
         else:
-            # auto: default to CPU (tree models are often faster on multi-core CPU)
-            use_gpu = False
+            # auto: prefer GPU if available
+            use_gpu = has_cuda
 
         if use_gpu:
             # Newer XGBoost prefers `tree_method=hist` + `device=cuda`.
             self.params.setdefault("device", "cuda")
+            self.params["tree_method"] = "gpu_hist"
         else:
             self.params.pop("device", None)
+            self.params["tree_method"] = "hist"
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
         if not XGB_AVAILABLE:
             logger.warning("XGBoost not available")
             return
         try:
+            if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
+                order = np.argsort(x.index.view("int64"))
+                x = x.iloc[order]
+                y = y.iloc[order]
+
             # XGBoost's sklearn wrapper expects multiclass labels to be contiguous: {0,1,2,...}.
             # Our project uses {-1,0,1} where -1=sell, 0=neutral, 1=buy.
             y_arr = np.asarray(y, dtype=int)
@@ -536,11 +570,11 @@ class CatBoostExpert(ExpertModel):
         has_cuda = _torch_cuda_available()
 
         self.params = params or {
-            "iterations": 500,
-            "depth": 6,
+            "iterations": 800,
+            "depth": 8,
             "learning_rate": 0.05,
             "loss_function": "MultiClass",
-            "random_state": 42,
+            "random_seed": 42,
             "verbose": False,
             "thread_count": -1,
         }
@@ -557,8 +591,8 @@ class CatBoostExpert(ExpertModel):
         elif pref == "gpu":
             use_gpu = has_cuda
         else:
-            # auto: default to CPU (tree models are often faster on multi-core CPU)
-            use_gpu = False
+            # auto: prefer GPU if available
+            use_gpu = has_cuda
 
         if use_gpu:
             self.params.setdefault("task_type", "GPU")
@@ -575,6 +609,11 @@ class CatBoostExpert(ExpertModel):
             logger.warning("CatBoost not available")
             return
         try:
+            if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
+                order = np.argsort(x.index.view("int64"))
+                x = x.iloc[order]
+                y = y.iloc[order]
+
             uniq, counts = np.unique(y, return_counts=True)
             class_weights = {
                 int(cls): float(len(y) / (len(uniq) * cnt)) for cls, cnt in zip(uniq, counts, strict=False) if cnt > 0

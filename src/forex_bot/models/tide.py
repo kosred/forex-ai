@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from ..core.system import thread_limits
 from .base import EarlyStopper, ExpertModel, dataframe_to_float32_numpy
+from .device import select_device
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,7 @@ class ResidualBlock(nn.Module):
 
 class TiDEExpert(ExpertModel):
     """
-    CPU-Optimized TiDE (Custom Lite Implementation).
-    Features: Quantization, JIT, Small Batches.
+    TiDE-inspired classifier (deeper than Lite). Supports CPU/GPU.
     """
 
     MAX_TRAIN_ROWS = 0
@@ -44,10 +44,11 @@ class TiDEExpert(ExpertModel):
 
     def __init__(
         self,
-        hidden_dim: int = 128,
+        hidden_dim: int = 256,
         lr: float = 1e-3,
-        batch_size: int = 64,
-        max_time_sec: int = 1800,
+        batch_size: int = 128,
+        max_epochs: int = 300,
+        max_time_sec: int = 3600,
         device: str = "cpu",
         **kwargs: Any,
     ) -> None:
@@ -55,18 +56,38 @@ class TiDEExpert(ExpertModel):
         self.hidden_dim = hidden_dim
         self.lr = lr
         self.batch_size = batch_size
+        self.max_epochs = max_epochs
         self.max_time_sec = max_time_sec
-        self.device = torch.device("cpu")
+        self.device = select_device(device)
         self.input_dim = 0
 
     def _build_model(self):
         class TiDENet(nn.Module):
-            def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3) -> None:
+            def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3, dropout: float = 0.2) -> None:
                 super().__init__()
-                self.feature_proj = nn.Linear(input_dim, hidden_dim)
-                self.encoder = nn.Sequential(ResidualBlock(hidden_dim), ResidualBlock(hidden_dim))
-                self.decoder = nn.Sequential(ResidualBlock(hidden_dim), ResidualBlock(hidden_dim))
-                self.temporal_link = nn.Linear(hidden_dim, hidden_dim)
+                self.feature_proj = nn.Sequential(
+                    nn.LayerNorm(input_dim),
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                )
+                self.encoder = nn.Sequential(
+                    ResidualBlock(hidden_dim, dropout),
+                    ResidualBlock(hidden_dim, dropout),
+                    ResidualBlock(hidden_dim, dropout),
+                    ResidualBlock(hidden_dim, dropout),
+                )
+                self.decoder = nn.Sequential(
+                    ResidualBlock(hidden_dim, dropout),
+                    ResidualBlock(hidden_dim, dropout),
+                    ResidualBlock(hidden_dim, dropout),
+                    ResidualBlock(hidden_dim, dropout),
+                )
+                self.temporal_link = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                )
                 self.final = nn.Linear(hidden_dim, output_dim)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -101,24 +122,31 @@ class TiDEExpert(ExpertModel):
         y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device=self.device)
 
         dataset = TensorDataset(X_t, y_t)
-        loader = DataLoader(dataset, batch_size=max(8, int(self.batch_size)), shuffle=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=max(32, int(self.batch_size)),
+            shuffle=True,
+            pin_memory=str(self.device).startswith("cuda"),
+        )
 
         optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss()
-        early_stopper = EarlyStopper(patience=8, min_delta=0.001)
+        early_stopper = EarlyStopper(patience=20, min_delta=0.0005)
 
         import time
 
         start = time.time()
         self.model.train()
 
+        torch.backends.cudnn.benchmark = True
+
         with thread_limits(blas_threads=max(1, multiprocessing.cpu_count() - 1)):
-            for _epoch in range(100):
+            for _epoch in range(self.max_epochs):
                 if time.time() - start > self.max_time_sec:
                     break
 
                 for bx, by in loader:
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     out = self.model(bx)
                     loss = criterion(out, by)
                     loss.backward()

@@ -10,6 +10,15 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+# Optional Numba acceleration for signal combination
+try:  # pragma: no cover
+    from numba import njit
+
+    NUMBA_AVAILABLE = True
+except Exception:  # pragma: no cover
+    njit = None  # type: ignore
+    NUMBA_AVAILABLE = False
+
 # Optional GPU backend (CuPy ≥13 supports Python 3.13 & CUDA 12.8+)
 try:  # pragma: no cover
     import cupy as cp
@@ -1098,11 +1107,18 @@ class TALibStrategyMixer:
         weight_sum = np.sum(weight_vec) + 1e-9
         norm_weights = weight_vec / weight_sum
 
-        combined = signal_matrix @ norm_weights
-
-        final_signal = np.zeros(n_samples, dtype=np.int8)
-        final_signal[combined >= strategy.long_threshold] = 1
-        final_signal[combined <= strategy.short_threshold] = -1
+        if _combine_signals_numba is not None:
+            final_signal = _combine_signals_numba(
+                signal_matrix.astype(np.float32, copy=False),
+                norm_weights.astype(np.float32, copy=False),
+                float(strategy.long_threshold),
+                float(strategy.short_threshold),
+            )
+        else:
+            combined = signal_matrix @ norm_weights
+            final_signal = np.zeros(n_samples, dtype=np.int8)
+            final_signal[combined >= strategy.long_threshold] = 1
+            final_signal[combined <= strategy.short_threshold] = -1
 
         # ... (SMC Logic remains the same)
         cols = set(df.columns)
@@ -1148,6 +1164,28 @@ class TALibStrategyMixer:
             final_signal[mask_entry] = 0
 
         return pd.Series(final_signal, index=df.index)
+
+
+if NUMBA_AVAILABLE:
+
+    @njit(cache=True, fastmath=True)
+    def _combine_signals_numba(
+        signal_matrix: np.ndarray, weights: np.ndarray, long_th: float, short_th: float
+    ) -> np.ndarray:
+        n_samples, n_indicators = signal_matrix.shape
+        out = np.zeros(n_samples, dtype=np.int8)
+        for i in range(n_samples):
+            acc = 0.0
+            for j in range(n_indicators):
+                acc += signal_matrix[i, j] * weights[j]
+            if acc >= long_th:
+                out[i] = 1
+            elif acc <= short_th:
+                out[i] = -1
+        return out
+
+else:
+    _combine_signals_numba = None
 
     def save_knowledge(self, path: Path) -> None:
         data = {

@@ -602,18 +602,12 @@ class ModelTrainer:
         else:
             best_params = self.optimizer.load_params()
 
-        # Prevent multi-symbol OHLC metadata from leaking into models that assume a single continuous series.
+        # Preserve metadata even for multi-symbol runs so OHLC-dependent models can train globally.
+        # NOTE: downstream models that assume a single continuous series should handle the symbol column explicitly.
         meta_fit_models = meta_fit
         meta_eval_models = meta_eval
-        multi_symbol_meta = False
         if meta_fit is not None and isinstance(meta_fit, pd.DataFrame) and "symbol" in meta_fit.columns:
-            try:
-                multi_symbol_meta = int(meta_fit["symbol"].nunique(dropna=True)) > 1
-            except Exception:
-                multi_symbol_meta = False
-        if multi_symbol_meta:
-            meta_fit_models = None
-            meta_eval_models = None
+            logger.info("Multi-symbol metadata detected; passing through to OHLC-dependent models for global training.")
 
         # 4. Model Selection
         enabled_models = self._get_enabled_models()
@@ -691,6 +685,8 @@ class ModelTrainer:
             # In pooled multi-symbol runs, we intentionally disable metadata to avoid single-series leakage.
             # Skip those experts up-front instead of calling fit() with missing metadata,
             # which would otherwise produce noisy warnings.
+            # Allow OHLC-dependent models to run with global (multi-symbol) metadata; they should
+            # handle the 'symbol' column internally to avoid leakage.
             if name in {"genetic", "rl_ppo", "rl_sac"} and meta_fit_models is None:
                 logger.info(f"[{idx}/{total}] Skipping {name}: OHLC metadata unavailable for this training run.")
                 durations[name] = 0.0
@@ -699,6 +695,22 @@ class ModelTrainer:
             t0 = time.perf_counter()
             try:
                 logger.info(f"[{idx}/{total}] Training {name}...")
+
+                # Ensure time-ordered data for models that rely on chronological sequences
+                time_order_models = {"genetic", "rl_ppo", "rl_sac", "rllib_ppo", "rllib_sac", "evolution"}
+                if name in time_order_models and isinstance(X_fit.index, pd.DatetimeIndex):
+                    if not X_fit.index.is_monotonic_increasing:
+                        order = np.argsort(X_fit.index.view("int64"))
+                        X_fit = X_fit.iloc[order]
+                        y_fit = y_fit.iloc[order]
+                        if meta_fit_models is not None:
+                            meta_fit_models = meta_fit_models.iloc[order]
+                        if len(X_eval) > 0 and isinstance(X_eval.index, pd.DatetimeIndex):
+                            eval_order = np.argsort(X_eval.index.view("int64"))
+                            X_eval = X_eval.iloc[eval_order]
+                            y_eval = y_eval.iloc[eval_order]
+                            if meta_eval_models is not None:
+                                meta_eval_models = meta_eval_models.iloc[eval_order]
 
                 model = self.factory.create_model(name, best_params, idx)
 

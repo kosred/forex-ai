@@ -16,6 +16,15 @@ from .device import select_device
 
 logger = logging.getLogger(__name__)
 
+# Optional full KAN (efficient-kan)
+try:  # pragma: no cover
+    from efficient_kan import KAN as EfficientKAN  # type: ignore
+
+    _KAN_AVAILABLE = True
+except Exception:  # pragma: no cover
+    EfficientKAN = None  # type: ignore
+    _KAN_AVAILABLE = False
+
 
 class KANLayerBSpline(nn.Module):
     """
@@ -63,6 +72,17 @@ class KANExpert(ExpertModel):
         self.input_dim = 0
 
     def _build_model(self) -> nn.Module:
+        if _KAN_AVAILABLE:
+            try:
+                # Full KAN with spline activations (efficient-kan)
+                return EfficientKAN(
+                    layer_sizes=[self.input_dim, self.hidden_dim, self.hidden_dim, 3],
+                    grid_size=8,
+                    spline_order=3,
+                ).to(self.device)
+            except Exception as exc:
+                logger.warning(f"efficient-kan available but init failed, falling back to Lite KAN: {exc}")
+
         class KANNet(nn.Module):
             def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3) -> None:
                 super().__init__()
@@ -117,7 +137,8 @@ class KANExpert(ExpertModel):
         else:
             self._train_loop(loader, optimizer, criterion, start, early_stopper, X_val_norm, X_v, y_v)
 
-        if str(self.device) == "cpu":
+        if str(self.device) == "cpu" and not _KAN_AVAILABLE:
+            # JIT not applied to efficient-kan (not TorchScript friendly)
             self._optimize_for_cpu_inference()
 
     def _train_loop(self, loader, optimizer, criterion, start, early_stopper, X_val, X_v, y_v):
@@ -190,7 +211,7 @@ class KANExpert(ExpertModel):
                 torch.jit.save(self.model, Path(path) / "kan_cpu.pt")
             else:
                 torch.save(self.model.state_dict(), Path(path) / "kan.pt")
-            joblib.dump({"input_dim": self.input_dim, "hidden": self.hidden_dim}, Path(path) / "kan_meta.pkl")
+            joblib.dump({"input_dim": self.input_dim, "hidden": self.hidden_dim, "full_kan": _KAN_AVAILABLE}, Path(path) / "kan_meta.pkl")
 
     def load(self, path: str) -> None:
         # Similar fallback logic: prefer GPU model if available?
@@ -221,5 +242,6 @@ class KANExpert(ExpertModel):
 
         if p_std.exists():
             self.model = self._build_model()
-            self.model.load_state_dict(torch.load(p_std, map_location="cpu"))
-            self._optimize_for_cpu_inference()
+            self.model.load_state_dict(torch.load(p_std, map_location=str(self.device)))
+            if str(self.device) == "cpu" and not _KAN_AVAILABLE:
+                self._optimize_for_cpu_inference()

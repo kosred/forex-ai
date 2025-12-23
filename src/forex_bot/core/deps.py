@@ -18,10 +18,10 @@ logger = logging.getLogger(__name__)
 _DEPS_CHECKED = False
 _APT_REFRESHED = False
 
-# Target torch baseline (aligned with project testing)
-TORCH_VERSION = "2.9.1"
-VISION_VERSION = "0.24.1"
-AUDIO_VERSION = "2.9.1"
+# Target torch baseline (latest supported on CUDA runtime; override if needed)
+TORCH_VERSION = "2.5.1"
+VISION_VERSION = "0.20.1"
+AUDIO_VERSION = "2.5.1"
 
 
 def _get_cuda_version() -> str | None:
@@ -67,7 +67,7 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
 
     installed_any = False
 
-    # 1. PyTorch (Hardware-Aware Dynamic Install)
+    # 1. PyTorch (Hardware-Aware Dynamic Install - latest stable)
     try:
         importlib_metadata.version("torch")
     except importlib_metadata.PackageNotFoundError:
@@ -119,19 +119,12 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
             except Exception as e:
                 logger.warning(f"Failed to auto-install CuPy: {e}")
 
-    # 2b. numba-cuda (for CUDA 12.x+, Python 3.13 best effort)
-    if has_gpu and sys.version_info >= (3, 13):
+    # 2b. numba-cuda (best effort; wheels are scarce on py3.13, so default to numba CPU)
+    if has_gpu:
         try:
-            import importlib
-
-            importlib.import_module("numba.cuda")
+            import numba.cuda  # type: ignore
         except Exception:
-            logger.info("Installing numba-cuda for GPU kernels (best effort)...")
-            try:
-                _install(["numba-cuda"])
-                installed_any = True
-            except Exception as e:
-                logger.warning(f"numba-cuda install failed (GPU SMC will use CPU): {e}")
+            logger.info("numba-cuda not available; continuing with CPU numba for GPU kernels fallback.")
 
     # 3. TA-Lib (OS Specific)
     try:
@@ -160,8 +153,8 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
         "scikit-learn>=1.5",
         "joblib",
         "psutil",
-        "numba>=0.61.2",
-        "llvmlite>=0.44.0",
+        "numba>=0.60",
+        "llvmlite>=0.43",
         "matplotlib",
         "PyYAML",
         "tqdm",
@@ -171,6 +164,7 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
         "redis>=5.0",  # for Optuna Redis storage
         "duckdb>=1.0.0",
         "duckdb-engine>=0.12.0",
+        "optuna>=4.0.0",
     ]
 
     logger.info("Verifying essential packages...")
@@ -187,17 +181,31 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
         _install(missing_essentials)
         installed_any = True
 
-    # 5. Specialized Model Libraries (Best Effort)
-    # Keep this list minimal to avoid surprising upgrades (e.g., NumPy) during a normal bot run.
-    optional_libs = ["efficient-kan", "pytorch-tabnet", "ray[rllib]"]
+    # 5. Specialized Model Libraries (Required for full feature set on Linux; best effort on Windows)
+    optional_libs = [
+        "efficient-kan",
+        "pytorch-tabnet",
+        "ray[rllib]",
+        "gymnasium[box2d,atari]",
+        # Prefer stable SB3; fall back to git main if wheel unavailable.
+        "stable-baselines3[extra]",
+        # Full TiDE and other SOTA models
+        "neuralforecast",
+    ]
     for lib in optional_libs:
         base_name = lib.split("[")[0]
         try:
             importlib_metadata.version(base_name)
         except importlib_metadata.PackageNotFoundError:
             # Skip ray[rllib] on Windows + Python 3.13+
-            if "ray" in lib and system == "windows" and sys.version_info >= (3, 13):
-                logger.info("Skipping RLlib on Python 3.13+ (Windows) - Not yet supported.")
+            if "ray" in lib and system == "windows":
+                logger.info("Skipping RLlib on Windows (unsupported). Install on Linux/WSL for RLlib.")
+                continue
+            if "stable-baselines3" in lib and system == "windows":
+                logger.info("Skipping Stable-Baselines3 on Windows for RL usage; install on Linux/WSL.")
+                continue
+            if "neuralforecast" in lib and system == "windows":
+                logger.info("Skipping neuralforecast on Windows; install on Linux/WSL for full TiDE.")
                 continue
 
             logger.info(f"Installing {lib} (Best Effort)...")
@@ -205,6 +213,23 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
                 _install([lib])
                 installed_any = True
             except Exception as e:
+                if "stable-baselines3" in lib:
+                    logger.info("stable-baselines3 wheel unavailable; trying bleeding-edge from GitHub...")
+                    try:
+                        subprocess.check_call(
+                            [
+                                sys.executable,
+                                "-m",
+                                "pip",
+                                "install",
+                                "git+https://github.com/DLR-RM/stable-baselines3.git#egg=stable-baselines3[extra]",
+                            ]
+                        )
+                        installed_any = True
+                        continue
+                    except Exception:
+                        logger.warning("Failed to install stable-baselines3 from git; RL (SB3) will be unavailable.")
+
                 if "efficient-kan" in lib:
                     logger.info("Standard efficient-kan install failed. Trying bleeding-edge from GitHub...")
                     try:
