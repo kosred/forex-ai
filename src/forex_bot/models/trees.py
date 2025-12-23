@@ -193,13 +193,20 @@ class LightGBMExpert(ExpertModel):
         self.model = None
         self.params = params or {
             "n_estimators": 800,
-            "num_leaves": 96,
+            "num_leaves": 64,
             "learning_rate": 0.03,
             "objective": "multiclass",
             "num_class": 3,
             "random_state": 42,
             "n_jobs": -1,
             "verbosity": -1,
+            # Reduce overfitting, improve smoothness/extrapolation
+            "min_data_in_leaf": 50,
+            "feature_fraction": 0.6,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 1,
+            "path_smooth": 10,
+            "linear_tree": True,
         }
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
@@ -268,8 +275,13 @@ class LightGBMExpert(ExpertModel):
                 try:
                     validate_time_ordering(x, context="LightGBMExpert.fit")
                     y_arr, mapping = _remap_labels_to_contiguous(y)
+                    embargo = max(24, int(len(y_arr) * 0.01))
                     x_train, x_val, y_train, y_val = time_series_train_val_split(
-                        x, pd.Series(y_arr, index=y.index), val_ratio=0.15, min_train_samples=100, embargo_samples=0
+                        x,
+                        pd.Series(y_arr, index=y.index),
+                        val_ratio=0.15,
+                        min_train_samples=100,
+                        embargo_samples=embargo,
                     )
                     eval_set = [(x_val, y_val)]
                 except ValueError:

@@ -917,6 +917,7 @@ class ModelTrainer:
             gc.collect()
 
         # 7. Meta Blender
+        self._prune_low_quality_models()
         if not stop_event or not stop_event.is_set():
             self._train_blender(X_eval, y_eval)
 
@@ -956,6 +957,38 @@ class ModelTrainer:
             writer.close()
         self.persistence.cleanup_logs()
         logger.info("Training Complete.")
+
+    def _prune_low_quality_models(self, dd_limit: float = 0.10, pfloor: float = 1.0) -> None:
+        """
+        Remove trained models that violate basic risk/quality thresholds before
+        blending/export. This prevents obviously bad experts from dragging the
+        ensemble or ONNX export.
+        """
+        try:
+            metrics = self.run_summary.get("model_metrics", {})
+        except Exception:
+            metrics = {}
+
+        removed: list[str] = []
+        for name in list(self.models.keys()):
+            m = metrics.get(name, {})
+            fast = m.get("fast", m)
+            pf = fast.get("profit_factor", None)
+            dd = fast.get("max_dd", fast.get("max_dd_pct", None))
+            try:
+                if pf is not None and float(pf) <= pfloor:
+                    removed.append(name)
+                    continue
+                if dd is not None and float(dd) > dd_limit:
+                    removed.append(name)
+            except Exception:
+                continue
+
+        for name in removed:
+            self.models.pop(name, None)
+
+        if removed:
+            logger.info(f"Pruned low-quality models (pf<={pfloor} or dd>{dd_limit:.2%}): {removed}")
 
     def train_incremental(
         self, dataset: PreparedDataset, symbol: str, optimize: bool = False, stop_event: asyncio.Event | None = None
