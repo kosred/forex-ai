@@ -704,6 +704,30 @@ class SignalEngine:
             except Exception as e:
                 logger.warning(f"Correlation penalty calc failed: {e}", exc_info=True)
 
+        # Prop firm risk gates: block signals if risk limits are hit
+        try:
+            ledger = self.strategy_ledger
+            dd_day = float(getattr(ledger, "daily_drawdown", 0.0) or 0.0)
+            dd_total = float(getattr(ledger, "max_drawdown", 0.0) or 0.0)
+            monthly_pnl = float(getattr(ledger, "monthly_pnl", 0.0) or 0.0)
+            trades_today = int(getattr(ledger, "trades_today", 0) or 0)
+
+            if dd_day <= -self._daily_dd_cutoff * 100.0:  # ledger uses percent?
+                logger.warning("Daily drawdown limit hit; disabling trades.")
+                return np.zeros((len(X), 3)), {"components": components}
+            if dd_total <= -self._total_dd_cutoff * 100.0:
+                logger.warning("Total drawdown limit hit; disabling trades.")
+                return np.zeros((len(X), 3)), {"components": components}
+            if monthly_pnl >= self._profit_target * 100.0:
+                # Lock in profits; no new trades
+                logger.info("Monthly profit target reached; disabling trades to protect gains.")
+                return np.zeros((len(X), 3)), {"components": components}
+            if trades_today >= self._max_trades_per_day:
+                logger.warning("Daily trade cap reached; disabling trades for today.")
+                return np.zeros((len(X), 3)), {"components": components}
+        except Exception as e:
+            logger.warning(f"Risk gate check failed: {e}", exc_info=True)
+
         reg_val = np.abs(X["ema_fast"] - X["ema_slow"]).values
         reg_thresh = np.percentile(reg_val, 60) if len(reg_val) > 0 else 0
         regimes = np.where(reg_val > reg_thresh, "trend", "neutral")
