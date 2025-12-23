@@ -5,6 +5,10 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 from .base import ExpertModel, dataframe_to_float32_numpy
 
