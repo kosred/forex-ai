@@ -63,6 +63,7 @@ class _NFClsWrapper(ExpertModel):
         self._nf = None
         self.model = None
         self.calibrator = None
+        self.head: nn.Module | None = None
 
     def _build_nf_model(self, input_dim: int):
         if not NF_AVAILABLE:
