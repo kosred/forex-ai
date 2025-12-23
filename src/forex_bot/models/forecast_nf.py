@@ -108,34 +108,48 @@ class _NFClsWrapper(ExpertModel):
         self._nf = NeuralForecast(models=[nf_model], freq="D")
         self._nf.fit(df=df)
         self.model = nf_model
+        # Train classifier head on NF scalar output
+        try:
+            fcst = self._nf.predict(df=df)
+            col = self.model.__class__.__name__
+            if col not in fcst.columns:
+                col = fcst.columns[-1]
+            z = fcst[col].to_numpy(dtype=np.float32)
 
-        # Optional calibration using a holdout split on predicted scalar
-        if SKLEARN_AVAILABLE and LogisticRegression is not None:
-            try:
-                val_size = max(200, int(0.15 * len(df)))
-                if val_size < 50:
-                    return
-                train_df = df.iloc[:-val_size].copy()
-                val_df = df.iloc[-val_size:].copy()
-                val_y = y.iloc[-val_size:].to_numpy(dtype=int)
+            uniq = list(dict.fromkeys(int(v) for v in y.to_numpy(dtype=int)))
+            mapping = {lab: i for i, lab in enumerate(uniq)}
+            y_contig = np.array([mapping[int(v)] for v in y.to_numpy(dtype=int)], dtype=int)
 
-                # Predict on holdout
-                fcst = self._nf.predict(df=val_df)
-                col = self.model.__class__.__name__
-                if col not in fcst.columns:
-                    col = fcst.columns[-1]
-                z = fcst[col].to_numpy(dtype=float)
+            z_t = torch.as_tensor(z.reshape(-1, 1), dtype=torch.float32)
+            y_t = torch.as_tensor(y_contig, dtype=torch.long)
+            dataset = TensorDataset(z_t, y_t)
+            loader = DataLoader(dataset, batch_size=max(64, int(self.batch_size)), shuffle=True)
 
-                # Map labels to contiguous {0,1,2}
-                uniq = list(dict.fromkeys(int(v) for v in val_y))
-                mapping = {lab: i for i, lab in enumerate(uniq)}
-                y_contig = np.array([mapping[int(v)] for v in val_y], dtype=int)
+            self.head = nn.Sequential(
+                nn.Linear(1, 32),
+                nn.ReLU(),
+                nn.Linear(32, 32),
+                nn.ReLU(),
+                nn.Linear(32, max(3, len(uniq))),
+            )
+            self.head.to(torch.device(self.device))
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.Adam(self.head.parameters(), lr=1e-3)
 
-                clf = LogisticRegression(max_iter=1000, multi_class="multinomial")
-                clf.fit(z.reshape(-1, 1), y_contig)
-                self.calibrator = (clf, mapping)
-            except Exception as exc:
-                logger.debug(f"Calibration skipped: {exc}")
+            self.head.train()
+            for _ in range(50):
+                for zx, zy in loader:
+                    zx = zx.to(self.head[0].weight.device)
+                    zy = zy.to(self.head[0].weight.device)
+                    optimizer.zero_grad()
+                    out = self.head(zx)
+                    loss = criterion(out, zy)
+                    loss.backward()
+                    optimizer.step()
+
+            self.calibrator = (self.head, mapping)
+        except Exception as exc:
+            logger.warning(f"Classifier head training failed; falling back to tanh mapping: {exc}")
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
         if self._nf is None or self.model is None:
@@ -150,18 +164,20 @@ class _NFClsWrapper(ExpertModel):
             col = fcst.columns[-1]
         val = fcst[col].to_numpy(dtype=float)
         if self.calibrator:
-            clf, mapping = self.calibrator
-            # Inverse mapping to project back to {-1,0,1} order
+            head, mapping = self.calibrator
             inv = {v: k for k, v in mapping.items()}
-            proba = clf.predict_proba(val.reshape(-1, 1))
+            head.eval()
+            with torch.no_grad():
+                zx = torch.as_tensor(val.reshape(-1, 1), dtype=torch.float32, device=head[0].weight.device)
+                logits = head(zx).cpu().numpy()
+            proba = np.exp(logits - logits.max(axis=1, keepdims=True))
+            proba = proba / (proba.sum(axis=1, keepdims=True) + 1e-12)
             classes = [inv.get(i, i) for i in range(proba.shape[1])]
-            # Pad/reorder to [neutral(0), buy(1), sell(-1)]
             return self._pad_probs(proba, classes)
-        else:
-            val_clipped = np.tanh(val)  # map to [-1,1]
-            logits = np.stack([0.0 * val_clipped, val_clipped, -val_clipped], axis=1)
-            logits = logits - logits.max(axis=1, keepdims=True)
-            exp = np.exp(logits)
+        val_clipped = np.tanh(val)  # map to [-1,1]
+        logits = np.stack([0.0 * val_clipped, val_clipped, -val_clipped], axis=1)
+        logits = logits - logits.max(axis=1, keepdims=True)
+        exp = np.exp(logits)
         probs = exp / (exp.sum(axis=1, keepdims=True) + 1e-12)
         return probs.astype(float, copy=False)
 
@@ -211,7 +227,12 @@ class _NFClsWrapper(ExpertModel):
             }
             joblib.dump(meta, out_dir / "meta.pkl")
             if self.calibrator is not None:
-                joblib.dump(self.calibrator, out_dir / "calibrator.pkl")
+                try:
+                    head, mapping = self.calibrator
+                    torch.save(head.state_dict(), out_dir / "clf_head.pt")
+                    joblib.dump(mapping, out_dir / "calib_mapping.pkl")
+                except Exception as exc:
+                    logger.warning(f"Failed to save classifier head: {exc}")
         except Exception as e:
             logger.warning(f"Failed to save neuralforecast model {self.model_name}: {e}")
 
@@ -237,12 +258,22 @@ class _NFClsWrapper(ExpertModel):
             self._nf = NeuralForecast(models=[nf_model], freq="D")
             self._nf.load(out_dir)
             self.model = nf_model
-            cal_path = out_dir / "calibrator.pkl"
-            if cal_path.exists():
-                try:
-                    self.calibrator = joblib.load(cal_path)
-                except Exception:
-                    self.calibrator = None
+            try:
+                head_path = out_dir / "clf_head.pt"
+                map_path = out_dir / "calib_mapping.pkl"
+                if head_path.exists() and map_path.exists():
+                    head = nn.Sequential(
+                        nn.Linear(1, 32),
+                        nn.ReLU(),
+                        nn.Linear(32, 32),
+                        nn.ReLU(),
+                        nn.Linear(32, 3),
+                    )
+                    head.load_state_dict(torch.load(head_path, map_location="cpu"))
+                    mapping = joblib.load(map_path)
+                    self.calibrator = (head, mapping)
+            except Exception:
+                self.calibrator = None
         except Exception as e:
             logger.warning(f"Failed to load neuralforecast model {self.model_name}: {e}")
 
