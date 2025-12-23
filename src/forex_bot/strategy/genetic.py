@@ -44,6 +44,7 @@ class GeneticGene:
     sl_pips: float = 20.0
     doctor_params: dict[str, float] = field(default_factory=dict)
     risk_params: dict[str, float] = field(default_factory=dict)
+    slice_pass_rate: float = 0.0  # fraction of slices where gene met gates
 
     def __post_init__(self) -> None:
         if not self.strategy_id:
@@ -97,7 +98,21 @@ class GeneticStrategyEvolution:
 
         from .gauntlet import StrategyGauntlet
 
-        gauntlet = StrategyGauntlet(self.mixer, validation_data) if validation_data is not None else None
+        # If validation_data is a mapping of symbol/timeframe -> df, pick the first for gauntlet
+        vdf_for_gauntlet = None
+        if isinstance(validation_data, dict):
+            for _k, v in validation_data.items():
+                if isinstance(v, dict):
+                    if v:
+                        vdf_for_gauntlet = next(iter(v.values()))
+                        break
+                else:
+                    vdf_for_gauntlet = v
+                    break
+        else:
+            vdf_for_gauntlet = validation_data
+
+        gauntlet = StrategyGauntlet(self.mixer, vdf_for_gauntlet) if vdf_for_gauntlet is not None else None
 
         try:
             from .genes.genesis import GenesisLibrary
@@ -123,6 +138,12 @@ class GeneticStrategyEvolution:
             else:
                 talib_gene = self.mixer.generate_random_strategy(regime=regime)
                 gene = GeneticGene(**asdict(talib_gene), generation=self.generation)
+            # Enforce a minimum of 4 confluences (indicators)
+            if len(gene.indicators) < 4:
+                missing = 4 - len(gene.indicators)
+                available_inds = [ind for ind in ALL_INDICATORS if ind not in gene.indicators]
+                if available_inds:
+                    gene.indicators.extend(random.sample(available_inds, k=min(missing, len(available_inds))))
 
             if gauntlet:
                 if gauntlet.run(gene):
@@ -157,77 +178,127 @@ class GeneticStrategyEvolution:
             month_indices = np.zeros(len(df), dtype=np.int64)
         return month_indices
 
-    def _evaluate_population(self, df: pd.DataFrame, genes: list[GeneticGene]) -> None:
-        if not genes or self.mixer is None:
+    def _evaluate_population(self, validation_data: Any, genes: list[GeneticGene]) -> None:
+        """
+        Evaluate genes across one or many slices.
+        validation_data can be:
+          - single DataFrame
+          - dict[str, DataFrame]
+          - dict[str, dict[str, DataFrame]] (e.g., symbol -> timeframe -> df)
+        A gene is accepted only if it passes gates on enough slices; one-off failures are penalized,
+        but do not necessarily kill the gene unless failures dominate.
+        """
+        if not genes or self.mixer is None or validation_data is None:
             return
 
-        if not {"close", "high", "low"}.issubset(set(df.columns)):
-            logger.warning("Cannot evaluate genes: validation_data missing OHLC columns.")
-            for g in genes:
-                if not getattr(g, "evaluated", False):
-                    g.fitness = -1e9
-                    g.evaluated = True
+        # Flatten validation_data into a list of (name, df)
+        slices: list[tuple[str, pd.DataFrame]] = []
+        if isinstance(validation_data, pd.DataFrame):
+            slices.append(("default", validation_data))
+        elif isinstance(validation_data, dict):
+            for sym, val in validation_data.items():
+                if isinstance(val, dict):
+                    for tf, df in val.items():
+                        slices.append((f"{sym}_{tf}", df))
+                else:
+                    slices.append((str(sym), val))
+
+        if not slices:
             return
 
         from .fast_backtest import fast_evaluate_strategy, infer_pip_metrics
 
-        close = df["close"].to_numpy(dtype=np.float64)
-        high = df["high"].to_numpy(dtype=np.float64)
-        low = df["low"].to_numpy(dtype=np.float64)
-        month_idx = self._month_indices(df)
-        pip_size, pip_value_per_lot = infer_pip_metrics("")
+        for name, df in slices:
+            if not {"close", "high", "low"}.issubset(set(df.columns)):
+                logger.warning("Cannot evaluate genes: validation slice %s missing OHLC columns.", name)
+                for g in genes:
+                    if not getattr(g, "evaluated", False):
+                        g.fitness = -1e9
+                        g.evaluated = True
+                return
+            if isinstance(df.index, pd.DatetimeIndex) and not df.index.is_monotonic_increasing:
+                df = df.sort_index(kind="mergesort")
 
         for gene in genes:
             if getattr(gene, "evaluated", False):
                 continue
+            pass_fits: list[float] = []
+            fail_count = 0
+            slice_metrics: list[tuple[float, float, float, float, float, float, int]] = []
             try:
-                sig = self.mixer.compute_signals(df, gene).to_numpy(dtype=np.int8)
-                arr = fast_evaluate_strategy(
-                    close_prices=close,
-                    high_prices=high,
-                    low_prices=low,
-                    signals=sig,
-                    month_indices=month_idx,
-                    sl_pips=float(getattr(gene, "sl_pips", 20.0)),
-                    tp_pips=float(getattr(gene, "tp_pips", 40.0)),
-                    pip_value=float(pip_size),
-                    spread_pips=1.5,
-                    commission_per_trade=0.0,
-                    pip_value_per_lot=float(pip_value_per_lot),
-                )
+                for sname, df in slices:
+                    close = df["close"].to_numpy(dtype=np.float64)
+                    high = df["high"].to_numpy(dtype=np.float64)
+                    low = df["low"].to_numpy(dtype=np.float64)
+                    month_idx = self._month_indices(df)
+                    pip_size, pip_value_per_lot = infer_pip_metrics("")
 
-                net_profit = float(arr[0])
-                sharpe = float(arr[1])
-                max_dd = float(arr[3])
-                win_rate = float(arr[4])
-                profit_factor = float(arr[5])
-                expectancy = float(arr[6])
-                trades = int(arr[8]) if len(arr) > 8 else 0
+                    sig = self.mixer.compute_signals(df, gene).to_numpy(dtype=np.int8)
+                    arr = fast_evaluate_strategy(
+                        close_prices=close,
+                        high_prices=high,
+                        low_prices=low,
+                        signals=sig,
+                        month_indices=month_idx,
+                        sl_pips=float(getattr(gene, "sl_pips", 20.0)),
+                        tp_pips=float(getattr(gene, "tp_pips", 40.0)),
+                        pip_value=float(pip_size),
+                        spread_pips=1.5,
+                        commission_per_trade=0.0,
+                        pip_value_per_lot=float(pip_value_per_lot),
+                    )
 
-                # Fitness: prioritize risk-adjusted return and robustness.
-                # Hard filters for unusable strategies.
-                min_trades = 30
-                dd_cap = 0.10
-                pfloor = 1.0
+                    net_profit = float(arr[0])
+                    sharpe = float(arr[1])
+                    max_dd = float(arr[3])
+                    win_rate = float(arr[4])
+                    profit_factor = float(arr[5])
+                    expectancy = float(arr[6])
+                    trades = int(arr[8]) if len(arr) > 8 else 0
+                    slice_metrics.append((net_profit, sharpe, max_dd, win_rate, profit_factor, expectancy, trades))
 
-                if trades < min_trades:
-                    fitness = -1e9
-                elif max_dd >= dd_cap:
-                    fitness = -1e9
-                elif profit_factor <= pfloor:
+                    # Slice-level gates
+                    min_trades = 30
+                    dd_cap = 0.10
+                    pfloor = 1.0
+
+                    if trades < min_trades or max_dd >= dd_cap or profit_factor <= pfloor:
+                        fail_count += 1
+                        continue
+                    dd_penalty = 10.0 * max(0.0, max_dd - 0.05)
+                    pass_fits.append(sharpe + (net_profit / 10_000.0) - dd_penalty)
+
+                total_slices = len(slices)
+                max_fail_allowed = max(1, total_slices // 3 + 1)
+
+                if not pass_fits or fail_count >= max_fail_allowed:
                     fitness = -1e9
                 else:
-                    # Reward Sharpe and absolute profit, penalize drawdown above a soft threshold.
-                    dd_penalty = 10.0 * max(0.0, max_dd - 0.05)
-                    fitness = sharpe + (net_profit / 10_000.0) - dd_penalty
+                    fitness = float(np.mean(pass_fits) - 0.5 * fail_count)
 
-                gene.fitness = float(fitness)
-                gene.sharpe_ratio = sharpe
-                gene.win_rate = win_rate
-                gene.max_drawdown = max_dd
-                gene.profit_factor = profit_factor
-                gene.expectancy = expectancy
-                gene.trades_count = trades
+                # Aggregate metrics over passed slices (or all if none passed)
+                if pass_fits:
+                    passed = [m for m in slice_metrics if m[6] >= 30 and m[2] < 0.10 and m[4] > 1.0]
+                else:
+                    passed = slice_metrics
+                if passed:
+                    avg_net = float(np.mean([m[0] for m in passed]))
+                    avg_sharpe = float(np.mean([m[1] for m in passed]))
+                    avg_dd = float(np.mean([m[2] for m in passed]))
+                    avg_pf = float(np.mean([m[4] for m in passed]))
+                    avg_trades = int(np.mean([m[6] for m in passed]))
+                else:
+                    avg_net = avg_sharpe = avg_dd = avg_pf = 0.0
+                    avg_trades = 0
+
+                gene.fitness = fitness
+                gene.sharpe_ratio = avg_sharpe
+                gene.win_rate = 0.0
+                gene.max_drawdown = avg_dd
+                gene.profit_factor = avg_pf
+                gene.expectancy = 0.0
+                gene.trades_count = avg_trades
+                gene.slice_pass_rate = float(len(pass_fits) / total_slices)
                 gene.evaluated = True
             except Exception as exc:
                 logger.debug(f"Gene evaluation failed for {gene.strategy_id}: {exc}", exc_info=True)
@@ -304,6 +375,13 @@ class GeneticStrategyEvolution:
         child_dict["parent_ids"] = [p1.strategy_id, p2.strategy_id]
         child_dict["strategy_id"] = f"gene_{random.randint(0, 1_000_000)}_{self.generation}"
 
+        # Ensure minimum confluences after crossover
+        if len(child_dict["indicators"]) < 4:
+            missing = 4 - len(child_dict["indicators"])
+            available_inds = [ind for ind in ALL_INDICATORS if ind not in child_dict["indicators"]]
+            if available_inds:
+                child_dict["indicators"].extend(random.sample(available_inds, k=min(missing, len(available_inds))))
+
         return GeneticGene(**child_dict)
 
     def _mutate(self, gene: GeneticGene) -> GeneticGene:
@@ -355,6 +433,12 @@ class GeneticStrategyEvolution:
                     mutated_gene.indicators.append(random.choice(available_inds))
             if not mutated_gene.indicators:
                 mutated_gene.indicators.append(random.choice(ALL_INDICATORS))
+            # Enforce minimum confluences
+            if len(mutated_gene.indicators) < 4:
+                missing = 4 - len(mutated_gene.indicators)
+                available_inds = [ind for ind in ALL_INDICATORS if ind not in mutated_gene.indicators]
+                if available_inds:
+                    mutated_gene.indicators.extend(random.sample(available_inds, k=min(missing, len(available_inds))))
 
         elif mutation_type == "params" and gene.indicators:
             target_ind = random.choice(gene.indicators)
