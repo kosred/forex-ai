@@ -49,7 +49,39 @@ PY
     ;;
   medium)
     # Up to 8 GPUs: run parallel single-GPU jobs (edit model list as needed)
-    MODELS=("transformer" "patchtst" "timesnet" "tide_nf" "nbeatsx_nf" "kan" "tabnet" "rl_ppo")
+    # Auto-derive models from config (ml_models + common deep models); fallback to a short list
+    read -r MODELS_STR <<'EOF'
+$(python - <<'PY'
+import os, sys, yaml
+cfg = os.environ.get("CONFIG_FILE", "config.yaml")
+try:
+    data = yaml.safe_load(open(cfg)) or {}
+    mcfg = data.get("models", {}) or {}
+    ml = mcfg.get("ml_models", []) or []
+    deep = [
+        "transformer",
+        "patchtst",
+        "timesnet",
+        "tide_nf",
+        "nbeatsx_nf",
+        "kan",
+        "tabnet",
+        "rl_ppo",
+        "rl_sac",
+    ]
+    seen = set()
+    out = []
+    for m in ml + deep:
+        if m not in seen:
+            out.append(m)
+            seen.add(m)
+    print(" ".join(out))
+except Exception:
+    print("transformer kan")
+PY
+)
+EOF
+    read -a MODELS <<< "$MODELS_STR"
     GPU=0
     for M in "${MODELS[@]}"; do
       CUDA_VISIBLE_DEVICES="$GPU" forex-ai.py --config config.yaml --models "$M" &
