@@ -57,6 +57,22 @@ class ModelFactory:
             if cfg_bs and int(cfg_bs) > 0:
                 params["batch_size"] = int(cfg_bs)
 
+        # 2b. Size presets (approx ~3M-class defaults) if not already set by HPO/config
+        if model_name == "transformer":
+            params.setdefault("d_model", int(getattr(self.settings.models, "transformer_d_model", 256) or 256))
+            params.setdefault("n_heads", int(getattr(self.settings.models, "transformer_n_heads", 8) or 8))
+            params.setdefault("n_layers", int(getattr(self.settings.models, "transformer_n_layers", 4) or 4))
+        if model_name in {"patchtst", "timesnet"}:
+            params.setdefault("hidden_dim", int(getattr(self.settings.models, "nf_hidden_dim", 256) or 256))
+        if model_name in {"tide", "tide_nf"}:
+            params.setdefault("hidden_dim", int(getattr(self.settings.models, "tide_hidden_dim", 256) or 256))
+        if model_name in {"nbeatsx_nf"}:
+            params.setdefault("hidden_dim", int(getattr(self.settings.models, "nbeats_hidden_dim", 256) or 256))
+        if model_name == "kan":
+            params.setdefault("hidden_dim", int(getattr(self.settings.models, "kan_hidden_dim", 256) or 256))
+        if model_name == "tabnet":
+            params.setdefault("hidden_dim", int(getattr(self.settings.models, "tabnet_hidden_dim", 64) or 64))
+
         # 4. Filter Init Kwargs based on Signature
         init_kwargs = params.copy()
 

@@ -86,8 +86,8 @@ models:
   rl_eval_episodes: 15
   rl_network_arch: [256, 256]
   rl_parallel_envs: 1
-  rl_train_seconds: 3600
-  evo_train_seconds: 3600
+  rl_train_seconds: 36000
+  evo_train_seconds: 36000
   evo_optuna_train_seconds: 900  # per Optuna trial (keeps Evo_Opt from running for hours)
   evo_hidden_size: 64
   evo_population: 32
@@ -100,11 +100,11 @@ models:
   transformer_hidden_dim: 256
   transformer_dropout: 0.10
   transformer_seq_len: 64
-  transformer_train_seconds: 3600
-  nbeats_train_seconds: 1800
-  tide_train_seconds: 1800
-  tabnet_train_seconds: 1800
-  kan_train_seconds: 1800
+  transformer_train_seconds: 36000
+  nbeats_train_seconds: 36000
+  tide_train_seconds: 36000
+  tabnet_train_seconds: 36000
+  kan_train_seconds: 36000
   num_transformers: 2
   optuna_trials: 20
   optuna_reuse_study: true
@@ -113,7 +113,7 @@ models:
   prop_accuracy_weight: 0.1
   prop_min_trades: 30
   prop_conf_threshold: 0.55
-  walkforward_splits: 0  # DISABLED - No walk-forward waste during training
+  walkforward_splits: 0  # leave at 0 if you want to skip walk-forward; set >0 to re-enable
   embargo_minutes: 120
   # CPCV (Combinatorial Purged Cross-Validation) settings
   enable_cpcv: true

@@ -170,8 +170,8 @@ class ModelsConfig(BaseModel):
     rl_eval_episodes: int = 15
     rl_network_arch: list[int] = Field(default_factory=lambda: [4096, 4096, 4096, 2048, 1024])
     rl_parallel_envs: int = 1
-    rl_train_seconds: int = 14400
-    evo_train_seconds: int = 14400
+    rl_train_seconds: int = 36000
+    evo_train_seconds: int = 36000
     # Shorter per-trial budget for Optuna HPO; keeps Evo_Opt from running for hours per trial.
     evo_optuna_train_seconds: int = 900
     evo_hidden_size: int = 64
@@ -185,11 +185,11 @@ class ModelsConfig(BaseModel):
     transformer_hidden_dim: int = 1200
     transformer_dropout: float = 0.20
     transformer_seq_len: int = 64
-    transformer_train_seconds: int = 7200
-    nbeats_train_seconds: int = 3600
-    tide_train_seconds: int = 1800
-    tabnet_train_seconds: int = 3600  # Increased for deeper training
-    kan_train_seconds: int = 3600  # Increased for deeper training
+    transformer_train_seconds: int = 36000
+    nbeats_train_seconds: int = 36000
+    tide_train_seconds: int = 36000
+    tabnet_train_seconds: int = 36000  # Increased for deeper training
+    kan_train_seconds: int = 36000  # Increased for deeper training
     num_transformers: int = 2
     optuna_trials: int = 25
     optuna_reuse_study: bool = False
@@ -217,6 +217,19 @@ class ModelsConfig(BaseModel):
     cpcv_min_phi: float = 0.80
     # Guardrail: CPCV is memory-heavy (sklearn casts to float64). Cap rows to keep local runs stable.
     cpcv_max_rows: int = 0  # 0 = no cap; use full data
+    # Distributed training flags (default off)
+    enable_ddp: bool = False
+    enable_fsdp: bool = False
+    ddp_world_size: int = 1
+    # Model size presets (approximate, per-model overrides)
+    transformer_d_model: int = 256  # aim ~3M params with n_heads=8, n_layers=4
+    transformer_n_heads: int = 8
+    transformer_n_layers: int = 4
+    nf_hidden_dim: int = 256  # PatchTST/TimesNet hidden size
+    tide_hidden_dim: int = 256  # TiDE/TiDE-NF
+    nbeats_hidden_dim: int = 256  # NBEATS/NBEATSx NF
+    kan_hidden_dim: int = 256  # KAN
+    tabnet_hidden_dim: int = 64  # TabNet (smaller footprint)
 
 
 class NewsConfig(BaseModel):

@@ -253,8 +253,21 @@ class RLExpertPPO(ExpertModel):
         # Create environment with sequential stepping (no random resets during training)
         self.env = DummyVecEnv([lambda: PropFirmTradingEnv(metadata, X.values)])
 
-        self.model = PPO("MlpPolicy", self.env, verbose=0, device="auto")
-        self.model.learn(total_timesteps=10000)
+        # Larger policy on GPU; smaller on CPU
+        policy_kwargs = {}
+        try:
+            import torch
+
+            is_cuda = torch.cuda.is_available()
+        except Exception:
+            is_cuda = False
+        if is_cuda:
+            policy_kwargs["net_arch"] = [512, 512, 512]
+        else:
+            policy_kwargs["net_arch"] = [256, 256]
+
+        self.model = PPO("MlpPolicy", self.env, verbose=0, device="auto", policy_kwargs=policy_kwargs)
+        self.model.learn(total_timesteps=1000000 if is_cuda else 100000)
 
     def predict_proba(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
         if self.model is None:
@@ -302,8 +315,21 @@ class RLExpertSAC(RLExpertPPO):
 
         # Create environment with sequential stepping (no random resets during training)
         self.env = DummyVecEnv([lambda: PropFirmTradingEnv(metadata, X.values)])
-        self.model = SAC("MlpPolicy", self.env, verbose=0, device="auto")
-        self.model.learn(total_timesteps=10000)
+        # Larger policy on GPU; smaller on CPU
+        policy_kwargs = {}
+        try:
+            import torch
+
+            is_cuda = torch.cuda.is_available()
+        except Exception:
+            is_cuda = False
+        if is_cuda:
+            policy_kwargs["net_arch"] = [512, 512, 512]
+        else:
+            policy_kwargs["net_arch"] = [256, 256]
+
+        self.model = SAC("MlpPolicy", self.env, verbose=0, device="auto", policy_kwargs=policy_kwargs)
+        self.model.learn(total_timesteps=1000000 if is_cuda else 100000)
 
     def save(self, path):
         if self.model:

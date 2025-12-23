@@ -138,11 +138,11 @@ class TransformerExpertTorch(ExpertModel):
 
     def __init__(
         self,
-        d_model: int = 128,
-        n_heads: int = 4,
-        n_layers: int = 2,
+        d_model: int = 256,
+        n_heads: int = 8,
+        n_layers: int = 4,
         lr: float = 1e-4,
-        max_time_sec: int = 1800,
+        max_time_sec: int = 36000,
         device: str = "cpu",
         batch_size: int = 64,
         **kwargs: Any,
@@ -275,6 +275,15 @@ class TransformerExpertTorch(ExpertModel):
             x = x.copy()
             x.columns = [str(c) for c in x.columns]
 
+        # Align device to local rank if distributed is initialized
+        if dist.is_available() and dist.is_initialized() and torch.cuda.is_available():
+            try:
+                local_rank = dist.get_rank() % torch.cuda.device_count()
+                torch.cuda.set_device(local_rank)
+                self.device = torch.device(f"cuda:{local_rank}")
+            except Exception:
+                pass
+
         # Robust Normalization (Critical for Transformer Stability)
         x_vals = x.select_dtypes(include=np.number).to_numpy(dtype=np.float32)
         self.mean_ = np.mean(x_vals, axis=0)
@@ -382,6 +391,16 @@ class TransformerExpertTorch(ExpertModel):
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp, init_scale=1024.0)
 
         self.model.train()
+        train_model = self.model
+        # Wrap with DDP if distributed is initialized
+        if dist.is_available() and dist.is_initialized() and world_size > 1 and is_cuda:
+            try:
+                local_rank = torch.cuda.current_device()
+                train_model = torch.nn.parallel.DistributedDataParallel(
+                    self.model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+                )
+            except Exception as e:
+                logger.warning(f"DDP wrap failed, continuing without DDP: {e}")
         import time
 
         start = time.time()
@@ -396,7 +415,7 @@ class TransformerExpertTorch(ExpertModel):
             )
             optimizer.zero_grad(set_to_none=True)
             with cm:
-                out = self.model(batch_x)
+                out = train_model(batch_x)
                 loss = criterion(out, batch_y)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -456,7 +475,7 @@ class TransformerExpertTorch(ExpertModel):
                 tensorboard_writer.add_scalar("Loss/train_Transformer", avg_train_loss, epoch)
 
             if len(val_ds) > 0:
-                self.model.eval()
+                train_model.eval()
                 val_loss = 0.0
                 val_steps = 0
                 with torch.no_grad():
@@ -467,11 +486,11 @@ class TransformerExpertTorch(ExpertModel):
                         else:
                             vx = vx.to(self.device)
                             vy = vy.to(self.device)
-                        val_out = self.model(vx)
+                        val_out = train_model(vx)
                         val_loss += criterion(val_out, vy).item()
                         val_steps += 1
                 val_loss = val_loss / max(1, val_steps)
-                self.model.train()
+                train_model.train()
 
                 if tensorboard_writer:
                     tensorboard_writer.add_scalar("Loss/val_Transformer", val_loss, epoch)

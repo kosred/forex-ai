@@ -6,12 +6,14 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..core.system import thread_limits
 from .base import EarlyStopper, ExpertModel, dataframe_to_float32_numpy
+from .device import select_device
 
 TabNetClassifier = None  # type: ignore
 
@@ -94,7 +96,7 @@ class TabNetExpert(ExpertModel):
         hidden_dim: int = 64,
         n_steps: int = 3,
         lr: float = 2e-3,
-        max_time_sec: int = 1800,
+        max_time_sec: int = 36000,
         device: str = "cpu",
         **kwargs: Any,
     ) -> None:
@@ -107,7 +109,7 @@ class TabNetExpert(ExpertModel):
         except Exception:
             self.batch_size = 64
         self.max_time_sec = max_time_sec
-        self.device = torch.device("cpu")
+        self.device = select_device(device)
         self.input_dim = 0
         self._lib_model: Any | None = None
 
@@ -145,6 +147,15 @@ class TabNetExpert(ExpertModel):
 
         import multiprocessing
 
+        # Align device to local rank if distributed
+        if dist.is_available() and dist.is_initialized() and torch.cuda.is_available():
+            try:
+                local_rank = dist.get_rank() % torch.cuda.device_count()
+                torch.cuda.set_device(local_rank)
+                self.device = torch.device(f"cuda:{local_rank}")
+            except Exception:
+                pass
+
         split = int(len(X) * 0.85)
         X_train, X_val = X.iloc[:split], X.iloc[split:]
         y_train, y_val = y.iloc[:split], y.iloc[split:]
@@ -155,9 +166,27 @@ class TabNetExpert(ExpertModel):
         y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device=self.device)
 
         dataset = TensorDataset(X_t, y_t)
-        loader = DataLoader(dataset, batch_size=max(8, int(self.batch_size)), shuffle=True)
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset) if world_size > 1 else None
+        loader = DataLoader(
+            dataset,
+            batch_size=max(8, int(self.batch_size)),
+            shuffle=(sampler is None),
+            sampler=sampler,
+            pin_memory=str(self.device).startswith("cuda"),
+        )
 
-        optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        train_model = self.model
+        if dist.is_available() and dist.is_initialized() and world_size > 1 and str(self.device).startswith("cuda"):
+            try:
+                local_rank = torch.cuda.current_device()
+                train_model = torch.nn.parallel.DistributedDataParallel(
+                    self.model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+                )
+            except Exception as e:
+                logger.warning(f"DDP wrap failed for TabNet, continuing without: {e}")
+
+        optimizer = optim.Adam(train_model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss()
         early_stopper = EarlyStopper(patience=20, min_delta=0.001)
 
@@ -171,19 +200,22 @@ class TabNetExpert(ExpertModel):
                 if time.time() - start > self.max_time_sec:
                     break
 
+                if sampler is not None:
+                    sampler.set_epoch(_epoch)
+
                 for bx, by in loader:
                     optimizer.zero_grad()
-                    out = self.model(bx)
+                    out = train_model(bx)
                     loss = criterion(out, by)
                     loss.backward()
                     optimizer.step()
 
                 if len(X_val) > 0:
-                    self.model.eval()
+                    train_model.eval()
                     with torch.no_grad():
-                        val_out = self.model(X_v)
+                        val_out = train_model(X_v)
                         val_loss = criterion(val_out, y_v).item()
-                    self.model.train()
+                    train_model.train()
                     if early_stopper(val_loss):
                         break
 

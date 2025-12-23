@@ -6,6 +6,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
@@ -59,7 +60,7 @@ class KANExpert(ExpertModel):
         hidden_dim: int = 256,
         lr: float = 1e-3,
         batch_size: int = 64,
-        max_time_sec: int = 1800,
+        max_time_sec: int = 36000,
         device: str = "cpu",
         **kwargs: Any,
     ) -> None:
@@ -106,6 +107,15 @@ class KANExpert(ExpertModel):
         self.scale_ = np.maximum(np.std(x_np, axis=0), 1e-3)
         x_norm = (x_np - self.mean_) / self.scale_
 
+        # Align device to local rank if distributed
+        if dist.is_available() and dist.is_initialized() and torch.cuda.is_available():
+            try:
+                local_rank = dist.get_rank() % torch.cuda.device_count()
+                torch.cuda.set_device(local_rank)
+                self.device = torch.device(f"cuda:{local_rank}")
+            except Exception:
+                pass
+
         self.input_dim = x_norm.shape[1]
         self.model = self._build_model()
 
@@ -122,53 +132,73 @@ class KANExpert(ExpertModel):
         y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device=self.device)
 
         dataset = TensorDataset(X_t, y_t)
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset) if world_size > 1 else None
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            pin_memory=str(self.device).startswith("cuda"),
+        )
 
-        optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        train_model = self.model
+        if dist.is_available() and dist.is_initialized() and world_size > 1 and str(self.device).startswith("cuda"):
+            try:
+                local_rank = torch.cuda.current_device()
+                train_model = torch.nn.parallel.DistributedDataParallel(
+                    self.model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+                )
+            except Exception as e:
+                logger.warning(f"DDP wrap failed for KAN, continuing without: {e}")
+
+        optimizer = optim.Adam(train_model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss()
         early_stopper = EarlyStopper(patience=20, min_delta=0.001)
 
         import time
 
         start = time.time()
-        self.model.train()
+        train_model.train()
 
         if str(self.device) == "cpu":
             with thread_limits(blas_threads=max(1, multiprocessing.cpu_count() - 1)):
-                self._train_loop(loader, optimizer, criterion, start, early_stopper, X_val_norm, X_v, y_v)
+                self._train_loop(loader, optimizer, criterion, start, early_stopper, X_val_norm, X_v, y_v, sampler, train_model)
         else:
-            self._train_loop(loader, optimizer, criterion, start, early_stopper, X_val_norm, X_v, y_v)
+            self._train_loop(loader, optimizer, criterion, start, early_stopper, X_val_norm, X_v, y_v, sampler, train_model)
 
         if str(self.device) == "cpu" and not _KAN_AVAILABLE:
             # JIT not applied to efficient-kan (not TorchScript friendly)
             self._optimize_for_cpu_inference()
 
-    def _train_loop(self, loader, optimizer, criterion, start, early_stopper, X_val, X_v, y_v):
+    def _train_loop(self, loader, optimizer, criterion, start, early_stopper, X_val, X_v, y_v, sampler, train_model):
         import time
 
         for _epoch in range(100):
             if time.time() - start > self.max_time_sec:
                 break
+            if sampler is not None:
+                sampler.set_epoch(_epoch)
 
             for bx, by in loader:
                 optimizer.zero_grad()
                 if self._use_amp:
                     with torch.autocast(device_type=str(self.device), dtype=torch.float16):
-                        out = self.model(bx)
+                        out = train_model(bx)
                         loss = criterion(out, by)
                     loss.backward()
                 else:
-                    out = self.model(bx)
+                    out = train_model(bx)
                     loss = criterion(out, by)
                     loss.backward()
                 optimizer.step()
 
             if len(X_val) > 0:
-                self.model.eval()
+                train_model.eval()
                 with torch.no_grad():
-                    val_out = self.model(X_v)
+                    val_out = train_model(X_v)
                     val_loss = criterion(val_out, y_v).item()
-                self.model.train()
+                train_model.train()
                 if early_stopper(val_loss):
                     break
 

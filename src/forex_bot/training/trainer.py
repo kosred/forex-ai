@@ -97,6 +97,44 @@ class ModelTrainer:
         self._historical_samples = self.run_summary.get("train_samples", None)
         self._historical_hardware = self.run_summary.get("train_hardware", {})
         self.incremental_stats = self.persistence.load_incremental_stats()
+        # Distributed state
+        self.distributed_enabled = False
+        self.rank = 0
+        self.world_size = 1
+
+        self._maybe_init_distributed()
+
+    def _maybe_init_distributed(self) -> None:
+        """
+        Initialize torch.distributed if enabled via settings.models.enable_ddp/fsdp and world_size > 1.
+        Safe no-op if torch or distributed backend is unavailable.
+        """
+        try:
+            use_dist = bool(
+                getattr(self.settings.models, "enable_ddp", False) or getattr(self.settings.models, "enable_fsdp", False)
+            )
+            self.world_size = int(getattr(self.settings.models, "ddp_world_size", 1) or 1)
+            if not use_dist or self.world_size <= 1:
+                return
+            if not dist.is_available():
+                logger.warning("torch.distributed not available; running single-process.")
+                return
+            if dist.is_initialized():
+                self.distributed_enabled = True
+                self.rank = dist.get_rank()
+                self.world_size = dist.get_world_size()
+                return
+            # Default to env:// init (expect MASTER_ADDR/PORT set by launcher)
+            dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+            self.distributed_enabled = True
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            logger.info(f"Distributed initialized: rank {self.rank}/{self.world_size - 1}")
+        except Exception as exc:
+            logger.warning(f"Failed to initialize distributed; falling back to single process: {exc}")
+            self.distributed_enabled = False
+            self.rank = 0
+            self.world_size = 1
 
     def estimate_time_for_dataset(
         self,
@@ -944,14 +982,26 @@ class ModelTrainer:
             "num_gpus": int(getattr(self.settings.system, "num_gpus", 1)),
             "device": str(getattr(self.settings.system, "device", "cpu")),
         }
-        self.persistence.save_run_summary(self.run_summary)
-        self.persistence.save_active_models_list(self.models)
-        self.persistence.save_models_bundle(self.models)
+        if not self.distributed_enabled or self.rank == 0:
+            self.persistence.save_run_summary(self.run_summary)
+            self.persistence.save_active_models_list(self.models)
+            self.persistence.save_models_bundle(self.models)
+        if self.distributed_enabled:
+            try:
+                dist.barrier()
+            except Exception:
+                pass
 
         # 10. Export
         sample = X.iloc[:1] if len(X) > 0 else None
         if sample is not None and bool(getattr(self.settings.models, "export_onnx", False)):
-            self.persistence.export_onnx(self.models, self.meta_blender, sample)
+            if not self.distributed_enabled or self.rank == 0:
+                self.persistence.export_onnx(self.models, self.meta_blender, sample)
+            if self.distributed_enabled:
+                try:
+                    dist.barrier()
+                except Exception:
+                    pass
 
         if writer:
             writer.close()
