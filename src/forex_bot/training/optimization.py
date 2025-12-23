@@ -43,7 +43,7 @@ from ..models.device import get_available_gpus, select_device
 from ..models.evolution import EvoExpertCMA
 from ..models.rl import RLExpertPPO, RLExpertSAC, _build_continuous_env
 from ..models.transformers import TransformerExpertTorch
-from ..models.trees import ElasticNetExpert, LightGBMExpert, RandomForestExpert
+from ..models.trees import ExtraTreesExpert, LightGBMExpert, RandomForestExpert
 from ..strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
 
 # Dynamic GPU/CPU model selection - use GPU versions when available for Optuna
@@ -232,7 +232,7 @@ class HyperparameterOptimizer:
             logger.info("Stop requested; skipping remaining optimization studies.")
             return best_params
 
-        best_params["ElasticNet"] = self._optimize_elasticnet(X_train, y_train, X_val, y_val, meta_val)
+        best_params["ExtraTrees"] = self._optimize_extra_trees(X_train, y_train, X_val, y_val, meta_val)
 
         if self._should_stop():
             logger.info("Stop requested; skipping remaining optimization studies.")
@@ -892,7 +892,7 @@ class HyperparameterOptimizer:
         logger.info(f"Optuna RandomForest completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
         return study.best_params
 
-    def _optimize_elasticnet(
+    def _optimize_extra_trees(
         self,
         x_train: pd.DataFrame,
         y_train: pd.Series,
@@ -905,26 +905,23 @@ class HyperparameterOptimizer:
         def objective(trial: Trial) -> float:
             if self._should_stop():
                 raise optuna.TrialPruned("stop requested")
-            penalty = trial.suggest_categorical("penalty", ["l1", "l2", "elasticnet"])
-            l1_ratio = trial.suggest_float("l1_ratio", 0.0, 1.0) if penalty == "elasticnet" else 0.0
-
             params = {
-                "loss": "log_loss",  # Logistic regression part
-                "penalty": penalty,
-                "alpha": trial.suggest_float("alpha", 1e-5, 1e-2, log=True),
-                "l1_ratio": l1_ratio,
-                "max_iter": 1000,
-                "tol": 1e-3,
+                "n_estimators": trial.suggest_int("n_estimators", 200, 800),
+                "max_depth": trial.suggest_int("max_depth", 10, 24),
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 6),
+                "max_features": trial.suggest_float("max_features", 0.4, 0.9),
+                "bootstrap": trial.suggest_categorical("bootstrap", [False, True]),
                 "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
                 "random_state": 42,
             }
-            model = ElasticNetExpert(params=params)
+            model = ExtraTreesExpert(params=params)
             model.fit(x_train, y_train)
             preds = model.predict_proba(x_val)
             return self._objective_base(y_val, preds, meta_val)
 
-        study = self._run_study("ElasticNet_Opt", objective, self.n_trials)
-        logger.info(f"Optuna ElasticNet completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
+        study = self._run_study("ExtraTrees_Opt", objective, self.n_trials)
+        logger.info(f"Optuna ExtraTrees completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
         return study.best_params
 
     def _optimize_tabnet(

@@ -43,6 +43,7 @@ class ModelFactory:
             "kan": "KAN",
             "transformer": "Transformer",
             "evolution": "Neuroevolution",
+            "extra_trees": "ExtraTrees",
         }
         opt_key = opt_key_map.get(model_name)
         if opt_key and opt_key in best_params:

@@ -19,7 +19,7 @@ except Exception:
     LGBM_AVAILABLE = False
 
 try:
-    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
     from sklearn.linear_model import SGDClassifier
     from sklearn.model_selection import train_test_split
     from sklearn.pipeline import make_pipeline
@@ -27,6 +27,7 @@ try:
 
     SKLEARN_AVAILABLE = True
 except Exception:
+    ExtraTreesClassifier = None
     RandomForestClassifier = None
     SGDClassifier = None
     train_test_split = None
@@ -338,14 +339,26 @@ class RandomForestExpert(ExpertModel):
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
         self.params = params or {
-            "n_estimators": 200,
-            "max_depth": 10,
-            "min_samples_split": 10,
+            "n_estimators": 400,
+            "max_depth": 16,
+            "min_samples_split": 4,
+            "min_samples_leaf": 2,
+            "max_features": 0.7,
+            "bootstrap": True,
             "n_jobs": -1,
             "random_state": 42,
         }
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+        # Ensure chronological order to reduce look-ahead bias in bootstrap samples
+        try:
+            if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
+                order = np.argsort(x.index.view("int64"))
+                x = x.iloc[order]
+                y = y.iloc[order]
+        except Exception:
+            pass
+
         # Try CuML first for GPU acceleration
         try:
             import cudf
@@ -356,13 +369,17 @@ class RandomForestExpert(ExpertModel):
             y_gpu = cudf.Series.from_pandas(y)
 
             logger.info(f"Training RandomForest using RAPIDS (GPU) on {len(x)} samples...")
-            self.model = CuRF(
-                n_estimators=self.params.get("n_estimators", 200),
-                max_depth=self.params.get("max_depth", 10),
-                min_samples_split=self.params.get("min_samples_split", 10),
-                n_streams=1,  # Sync
-                verbose=False,
-            )
+            gpu_params = {
+                "n_estimators": self.params.get("n_estimators", 400),
+                "max_depth": self.params.get("max_depth", 16),
+                "min_samples_split": self.params.get("min_samples_split", 2),
+                "min_samples_leaf": self.params.get("min_samples_leaf", 1),
+                "max_features": self.params.get("max_features", 1.0),
+                "bootstrap": bool(self.params.get("bootstrap", True)),
+                "n_streams": 1,  # Sync
+                "verbose": False,
+            }
+            self.model = CuRF(**gpu_params)
             self.model.fit(x_gpu, y_gpu)
             return
         except ImportError:
@@ -378,7 +395,7 @@ class RandomForestExpert(ExpertModel):
                 int(cls): float(len(y) / (len(uniq) * cnt)) for cls, cnt in zip(uniq, counts, strict=False) if cnt > 0
             }
             params = self.params.copy()
-            params["class_weight"] = class_weight if class_weight else None
+            params["class_weight"] = class_weight if class_weight else "balanced_subsample"
 
             self.model = RandomForestClassifier(**params)
             self.model.fit(x, y)
@@ -398,6 +415,64 @@ class RandomForestExpert(ExpertModel):
 
     def load(self, path: str) -> None:
         p = Path(path) / "rf.joblib"
+        if p.exists():
+            self.model = joblib.load(p)
+
+
+class ExtraTreesExpert(ExpertModel):
+    """
+    Extremely Randomized Trees (Geurts et al., 2006).
+    Uses heavy randomization of split thresholds to reduce variance and overfitting,
+    while staying fast on CPU and producing calibrated class probabilities.
+    """
+
+    def __init__(self, params: dict[str, Any] = None) -> None:
+        self.model = None
+        self.params = params or {
+            "n_estimators": 500,
+            "max_depth": 18,
+            "min_samples_split": 2,
+            "min_samples_leaf": 2,
+            "max_features": 0.6,
+            "bootstrap": False,
+            "n_jobs": -1,
+            "random_state": 42,
+        }
+
+    def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+        if not SKLEARN_AVAILABLE or ExtraTreesClassifier is None:
+            return
+        try:
+            if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
+                order = np.argsort(x.index.view("int64"))
+                x = x.iloc[order]
+                y = y.iloc[order]
+
+            uniq, counts = np.unique(y, return_counts=True)
+            class_weight = {
+                int(cls): float(len(y) / (len(uniq) * cnt)) for cls, cnt in zip(uniq, counts, strict=False) if cnt > 0
+            }
+
+            params = self.params.copy()
+            params["class_weight"] = class_weight if class_weight else "balanced_subsample"
+            self.model = ExtraTreesClassifier(**params)
+            self.model.fit(x, y)
+        except Exception as e:
+            logger.error(f"ExtraTrees training failed: {e}")
+
+    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+        if self.model is None:
+            return np.zeros((len(x), 3))
+        probs = self.model.predict_proba(x)
+        classes = _get_model_classes(self.model)
+        return _reorder_to_neutral_buy_sell(probs, classes)
+
+    def save(self, path: str) -> None:
+        if self.model:
+            joblib.dump(self.model, Path(path) / "extratrees.joblib")
+
+    def load(self, path: str) -> None:
+        p = Path(path) / "extratrees.joblib"
         if p.exists():
             self.model = joblib.load(p)
 

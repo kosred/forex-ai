@@ -35,7 +35,7 @@ risk:
   max_risk_per_trade: 0.030
   risk_per_trade: 0.015
   daily_drawdown_limit: 0.045
-  total_drawdown_limit: 0.08
+  total_drawdown_limit: 0.07
   min_risk_reward: 2.0
   spread_guard_multiplier: 2.5
   slippage_guard_multiplier: 2.0
@@ -77,7 +77,7 @@ risk:
   meta_label_min_prob_threshold: 0.55
 
 models:
-  ml_models: [lightgbm, random_forest, elasticnet, xgboost, catboost]
+  ml_models: [lightgbm, xgboost, catboost, random_forest, extra_trees]
   use_rl_agent: true
   use_sac_agent: true
   use_neuroevolution: true

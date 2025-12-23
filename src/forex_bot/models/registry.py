@@ -23,13 +23,13 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> type[ExpertModel]:
 
 # Tree/linear models (CPU only)
 try:
-    from .trees import CatBoostExpert, ElasticNetExpert, LightGBMExpert, RandomForestExpert, XGBoostExpert
+    from .trees import CatBoostExpert, ExtraTreesExpert, LightGBMExpert, RandomForestExpert, XGBoostExpert
 
     register_model("lightgbm", LightGBMExpert)
     register_model("xgboost", XGBoostExpert)
     register_model("catboost", CatBoostExpert)
     register_model("random_forest", RandomForestExpert)
-    register_model("elasticnet", ElasticNetExpert)
+    register_model("extra_trees", ExtraTreesExpert)
 except ImportError as e:
     logger.warning(f"Tree models not fully available: {e}")
 

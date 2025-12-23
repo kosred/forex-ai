@@ -105,7 +105,7 @@ class RiskConfig(BaseModel):
     max_risk_per_trade: float = 0.030
     risk_per_trade: float = 0.015
     daily_drawdown_limit: float = 0.045
-    total_drawdown_limit: float = 0.08
+    total_drawdown_limit: float = 0.07
     min_risk_reward: float = 2.0
     spread_guard_multiplier: float = 2.5
     slippage_guard_multiplier: float = 2.0
@@ -153,10 +153,10 @@ class ModelsConfig(BaseModel):
     ml_models: list[str] = Field(
         default_factory=lambda: [
             "lightgbm",
-            "random_forest",
             "xgboost",
             "catboost",
-            "logistic",
+            "random_forest",
+            "extra_trees",
         ]
     )
     use_rl_agent: bool = True

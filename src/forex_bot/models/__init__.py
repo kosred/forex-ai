@@ -4,7 +4,7 @@ from .evolution import EvoExpertCMA
 from .registry import get_model_class, register_model
 from .rl import RLExpertPPO, RLExpertSAC
 from .transformers import TransformerExpertTorch
-from .trees import ElasticNetExpert, LightGBMExpert, RandomForestExpert
+from .trees import ExtraTreesExpert, LightGBMExpert, RandomForestExpert
 
 __all__ = [
     "ExpertModel",
@@ -16,7 +16,7 @@ __all__ = [
     "RLExpertPPO",
     "RLExpertSAC",
     "EvoExpertCMA",
-    "ElasticNetExpert",
+    "ExtraTreesExpert",
     "LightGBMExpert",
     "RandomForestExpert",
     "get_model_class",

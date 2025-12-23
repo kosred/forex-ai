@@ -231,7 +231,7 @@ class ModelTrainer:
         # Rough weights to reduce wall-time skew (heavy models first).
         base = dict(getattr(self.benchmarker, "COMPLEXITY_MAP", {}) or {})
         base.setdefault("random_forest", 0.0015)
-        base.setdefault("elasticnet", 0.0005)
+        base.setdefault("extra_trees", 0.0012)
         base.setdefault("genetic", 0.002)
         base.setdefault("rllib_ppo", base.get("rl_ppo", 0.005))
         base.setdefault("rllib_sac", base.get("rl_sac", 0.008))
