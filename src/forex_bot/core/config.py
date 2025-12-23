@@ -193,7 +193,7 @@ class ModelsConfig(BaseModel):
     num_transformers: int = 2
     optuna_trials: int = 25
     optuna_reuse_study: bool = False
-    optuna_max_rows: int = 200_000  # cap rows per trial to avoid multi-hour Optuna runs on huge datasets
+    optuna_max_rows: int = 0  # 0 = no cap; allow full-row trials
     optuna_storage_url: str = (
         "redis://localhost:6379/0"  # default Redis for speed; override for your Redis/RDB endpoint
     )
@@ -216,7 +216,7 @@ class ModelsConfig(BaseModel):
     cpcv_purge_pct: float = 0.02
     cpcv_min_phi: float = 0.80
     # Guardrail: CPCV is memory-heavy (sklearn casts to float64). Cap rows to keep local runs stable.
-    cpcv_max_rows: int = 250_000
+    cpcv_max_rows: int = 0  # 0 = no cap; use full data
 
 
 class NewsConfig(BaseModel):

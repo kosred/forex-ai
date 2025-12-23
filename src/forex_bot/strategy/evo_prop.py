@@ -44,8 +44,8 @@ class PropAwareStrategySearch:
         self,
         settings: Settings,
         df: pd.DataFrame,
-        population: int = 64,
-        mutation_rate: float = 0.15,
+        population: int = 1000,
+        mutation_rate: float = 0.20,
         checkpoint_path: Path = Path("models") / "strategy_evo_checkpoint.json",
         max_time_hours: float = 120.0,  # allow multi-day runs
         max_workers: int | None = None,

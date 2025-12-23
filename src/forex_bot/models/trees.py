@@ -173,6 +173,31 @@ def _reorder_to_neutral_buy_sell(probs: np.ndarray, classes: list[int] | None) -
     return out
 
 
+def _augment_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add lightweight lag/volatility features for tree models when raw close is available.
+    If 'close' is absent, returns the input unchanged.
+    """
+    if "close" not in df.columns:
+        return df
+    try:
+        out = df.copy()
+        close = pd.to_numeric(out["close"], errors="coerce")
+        ret1 = close.pct_change().fillna(0.0)
+        out["ret1"] = ret1
+        out["ret1_lag1"] = ret1.shift(1).fillna(0.0)
+        out["ret1_lag2"] = ret1.shift(2).fillna(0.0)
+        out["ret1_lag5"] = ret1.shift(5).fillna(0.0)
+        out["ret1_lag8"] = ret1.shift(8).fillna(0.0)
+        out["vol14"] = ret1.rolling(14).std().fillna(0.0)
+        out["vol50"] = ret1.rolling(50).std().fillna(0.0)
+        out["mom5"] = close.diff(5).fillna(0.0)
+        out["mom15"] = close.diff(15).fillna(0.0)
+        return out
+    except Exception:
+        return df
+
+
 def _remap_labels_to_contiguous(y: pd.Series | np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
     """
     Map {-1,0,1} style labels to contiguous {0,1,2} expected by some tree libs.
@@ -215,6 +240,7 @@ class LightGBMExpert(ExpertModel):
             return
 
         try:
+            x = _augment_time_features(x)
             # Enforce time ordering if index is datetime and not monotonic
             if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
                 order = np.argsort(x.index.view("int64"))
@@ -330,6 +356,7 @@ class LightGBMExpert(ExpertModel):
         if self.model is None:
             raise RuntimeError("LightGBM model not loaded")
         try:
+            x = _augment_time_features(x)
             probs = self.model.predict_proba(x)
             classes = _get_model_classes(self.model)
             return _reorder_to_neutral_buy_sell(probs, classes)
@@ -370,6 +397,8 @@ class RandomForestExpert(ExpertModel):
                 y = y.iloc[order]
         except Exception:
             pass
+
+        x = _augment_time_features(x)
 
         # Try CuML first for GPU acceleration
         try:
@@ -455,6 +484,7 @@ class ExtraTreesExpert(ExpertModel):
         if not SKLEARN_AVAILABLE or ExtraTreesClassifier is None:
             return
         try:
+            x = _augment_time_features(x)
             if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
                 order = np.argsort(x.index.view("int64"))
                 x = x.iloc[order]
@@ -475,7 +505,8 @@ class ExtraTreesExpert(ExpertModel):
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
         if self.model is None:
             return np.zeros((len(x), 3))
-        probs = self.model.predict_proba(x)
+        x_aug = _augment_time_features(x)
+        probs = self.model.predict_proba(x_aug)
         classes = _get_model_classes(self.model)
         return _reorder_to_neutral_buy_sell(probs, classes)
 

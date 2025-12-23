@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import TimeSeriesSplit
 
 try:
     import redis  # type: ignore
@@ -101,6 +102,25 @@ class HyperparameterOptimizer:
             logger.warning("Optuna not available. Skipping optimization.")
 
         self._study_suffix = None
+
+    def _time_series_holdout(
+        self, X: pd.DataFrame, y: pd.Series, n_splits: int = 3, embargo: int = 100
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        """
+        Create a simple time-series aware train/val split with an embargo gap.
+        Falls back to the original split if data is too short.
+        """
+        try:
+            if len(X) < max(embargo * 2, 200):
+                return X, pd.DataFrame(index=X.index), y, pd.Series(dtype=y.dtype)
+            tscv = TimeSeriesSplit(n_splits=n_splits, gap=embargo)
+            splits = list(tscv.split(X))
+            if not splits:
+                return X, pd.DataFrame(index=X.index), y, pd.Series(dtype=y.dtype)
+            train_idx, val_idx = splits[-1]
+            return X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
+        except Exception:
+            return X, pd.DataFrame(index=X.index), y, pd.Series(dtype=y.dtype)
 
     def _dataset_signature(self, X: pd.DataFrame, y: pd.Series) -> str:  # noqa: N803
         """Generate a short hash to distinguish datasets/configs for studies."""
@@ -853,9 +873,12 @@ class HyperparameterOptimizer:
             else:
                 params["device_type"] = "cpu"
             model = LightGBMExpert(params=params)
-            model.fit(x_train, y_train)
-            preds = model.predict_proba(x_val)
-            return self._objective_base(y_val, preds, meta_val)
+            x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
+            model.fit(x_tr, y_tr)
+            if len(x_va) == 0:
+                return 0.0
+            preds = model.predict_proba(x_va)
+            return self._objective_base(y_va, preds, None)
 
         study = self._run_study("LightGBM_Opt", objective, self.n_trials)
         logger.info(f"Optuna LightGBM completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
@@ -884,9 +907,12 @@ class HyperparameterOptimizer:
                 "random_state": 42,
             }
             model = RandomForestExpert(params=params)
-            model.fit(x_train, y_train)
-            preds = model.predict_proba(x_val)
-            return self._objective_base(y_val, preds, meta_val)
+            x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
+            model.fit(x_tr, y_tr)
+            if len(x_va) == 0:
+                return 0.0
+            preds = model.predict_proba(x_va)
+            return self._objective_base(y_va, preds, None)
 
         study = self._run_study("RandomForest_Opt", objective, self.n_trials)
         logger.info(f"Optuna RandomForest completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
@@ -916,9 +942,12 @@ class HyperparameterOptimizer:
                 "random_state": 42,
             }
             model = ExtraTreesExpert(params=params)
-            model.fit(x_train, y_train)
-            preds = model.predict_proba(x_val)
-            return self._objective_base(y_val, preds, meta_val)
+            x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
+            model.fit(x_tr, y_tr)
+            if len(x_va) == 0:
+                return 0.0
+            preds = model.predict_proba(x_va)
+            return self._objective_base(y_va, preds, None)
 
         study = self._run_study("ExtraTrees_Opt", objective, self.n_trials)
         logger.info(f"Optuna ExtraTrees completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")

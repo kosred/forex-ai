@@ -80,8 +80,8 @@ class GeneticStrategyEvolution:
 
     def __init__(
         self,
-        population_size: int = 50,
-        mutation_rate: float = 0.15,
+        population_size: int = 1000,
+        mutation_rate: float = 0.20,
         mixer: TALibStrategyMixer | None = None,
     ) -> None:
         self.population_size = population_size
@@ -108,7 +108,7 @@ class GeneticStrategyEvolution:
 
         self.population = []
         attempts = 0
-        max_attempts = self.population_size * 20
+        max_attempts = self.population_size * 40
         candidate_queue = deque(candidates)
 
         # Sort validation_data by time if provided
@@ -204,11 +204,22 @@ class GeneticStrategyEvolution:
                 expectancy = float(arr[6])
                 trades = int(arr[8]) if len(arr) > 8 else 0
 
-                # Fitness: prioritize risk-adjusted return; heavily penalize "no trade" strategies.
-                if trades <= 0:
+                # Fitness: prioritize risk-adjusted return and robustness.
+                # Hard filters for unusable strategies.
+                min_trades = 30
+                dd_cap = 0.10
+                pfloor = 1.0
+
+                if trades < min_trades:
+                    fitness = -1e9
+                elif max_dd >= dd_cap:
+                    fitness = -1e9
+                elif profit_factor <= pfloor:
                     fitness = -1e9
                 else:
-                    fitness = sharpe + (net_profit / 10_000.0) - (5.0 * max_dd)
+                    # Reward Sharpe and absolute profit, penalize drawdown above a soft threshold.
+                    dd_penalty = 10.0 * max(0.0, max_dd - 0.05)
+                    fitness = sharpe + (net_profit / 10_000.0) - dd_penalty
 
                 gene.fitness = float(fitness)
                 gene.sharpe_ratio = sharpe
