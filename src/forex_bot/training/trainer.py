@@ -484,6 +484,12 @@ class ModelTrainer:
         # IMPORTANT: For pooled multi-symbol datasets, row-order is often NOT time-ordered
         # (e.g., concatenated by symbol). A positional split would leak "future" rows into
         # the fit set and invalidate evaluation. Prefer a timestamp-based split when possible.
+        if isinstance(X.index, pd.DatetimeIndex) and not X.index.is_monotonic_increasing:
+            order = np.argsort(X.index.view("int64"))
+            X = X.iloc[order]
+            y = y.iloc[order]
+            if meta_subset is not None:
+                meta_subset = meta_subset.iloc[order]
         n = len(y)
         holdout_pct = float(getattr(self.settings.models, "train_holdout_pct", 0.2) or 0.2)
         holdout_pct = float(min(0.5, max(0.0, holdout_pct)))

@@ -111,6 +111,11 @@ class GeneticStrategyEvolution:
         max_attempts = self.population_size * 20
         candidate_queue = deque(candidates)
 
+        # Sort validation_data by time if provided
+        if validation_data is not None and isinstance(validation_data.index, pd.DatetimeIndex):
+            if not validation_data.index.is_monotonic_increasing:
+                validation_data = validation_data.sort_index(kind="mergesort")
+
         while len(self.population) < self.population_size and attempts < max_attempts:
             attempts += 1
             if candidate_queue:
@@ -224,6 +229,8 @@ class GeneticStrategyEvolution:
             raise RuntimeError("Population not initialized. Call initialize_population() first.")
 
         if validation_data is not None and self.mixer is not None:
+            if isinstance(validation_data.index, pd.DatetimeIndex) and not validation_data.index.is_monotonic_increasing:
+                validation_data = validation_data.sort_index(kind="mergesort")
             self._evaluate_population(validation_data, self.population)
 
         self.population.sort(key=lambda x: x.fitness, reverse=True)

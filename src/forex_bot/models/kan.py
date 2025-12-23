@@ -56,7 +56,7 @@ class KANExpert(ExpertModel):
 
     def __init__(
         self,
-        hidden_dim: int = 32,
+        hidden_dim: int = 256,
         lr: float = 1e-3,
         batch_size: int = 64,
         max_time_sec: int = 1800,
@@ -70,14 +70,16 @@ class KANExpert(ExpertModel):
         self.max_time_sec = max_time_sec
         self.device = select_device(device)
         self.input_dim = 0
+        # Mixed precision on CUDA for faster training
+        self._use_amp = str(self.device).startswith("cuda")
 
     def _build_model(self) -> nn.Module:
         if _KAN_AVAILABLE:
             try:
                 # Full KAN with spline activations (efficient-kan)
                 return EfficientKAN(
-                    layer_sizes=[self.input_dim, self.hidden_dim, self.hidden_dim, 3],
-                    grid_size=8,
+                    layer_sizes=[self.input_dim, max(self.hidden_dim, 256), max(self.hidden_dim, 256), 3],
+                    grid_size=16,
                     spline_order=3,
                 ).to(self.device)
             except Exception as exc:
@@ -150,9 +152,15 @@ class KANExpert(ExpertModel):
 
             for bx, by in loader:
                 optimizer.zero_grad()
-                out = self.model(bx)
-                loss = criterion(out, by)
-                loss.backward()
+                if self._use_amp:
+                    with torch.autocast(device_type=str(self.device), dtype=torch.float16):
+                        out = self.model(bx)
+                        loss = criterion(out, by)
+                    loss.backward()
+                else:
+                    out = self.model(bx)
+                    loss = criterion(out, by)
+                    loss.backward()
                 optimizer.step()
 
             if len(X_val) > 0:

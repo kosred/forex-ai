@@ -97,6 +97,11 @@ class _NFClsWrapper(ExpertModel):
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
         if not NF_AVAILABLE:
             raise RuntimeError("neuralforecast not installed")
+        # Enforce time ordering if index is datetime and not monotonic
+        if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
+            order = np.argsort(x.index.view("int64"))
+            x = x.iloc[order]
+            y = y.iloc[order]
         x_np = dataframe_to_float32_numpy(x)
         self.feature_columns = list(x.columns)
         df = pd.DataFrame(x_np, columns=self.feature_columns)
