@@ -51,6 +51,32 @@ if __name__ == "__main__":
     except Exception as dep_err:
         print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
 
+    # Auto-launch DDP when multiple GPUs are present (Linux only) and not already launched.
+    if os.name != "nt" and os.environ.get("FOREX_BOT_DDP_LAUNCHED") != "1":
+        try:
+            import torch
+        except Exception:
+            torch = None
+        if torch is not None and torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            if gpu_count and gpu_count > 1:
+                import subprocess
+
+                env = os.environ.copy()
+                env["FOREX_BOT_DDP_LAUNCHED"] = "1"
+                # torchrun will spawn one process per GPU.
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "torch.distributed.run",
+                    f"--nproc_per_node={gpu_count}",
+                    __file__,
+                    *sys.argv[1:],
+                ]
+                print(f"[INIT] Detected {gpu_count} GPUs. Relaunching under torchrun for DDP...", flush=True)
+                subprocess.check_call(cmd, env=env)
+                sys.exit(0)
+
     from forex_bot.main import _global_models_exist, main
 
     has_models = _global_models_exist()
