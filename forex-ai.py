@@ -58,9 +58,21 @@ if __name__ == "__main__":
 
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
+            cpu_cores = os.cpu_count() or 1
+            # Use all visible GPUs unless user overrides.
             os.environ.setdefault("FOREX_BOT_MAX_GPUS", str(gpu_count))
             os.environ.setdefault("SYSTEM__NUM_GPUS", str(gpu_count))
             os.environ.setdefault("SYSTEM__ENABLE_GPU_PREFERENCE", "gpu")
+            # Cap threads per worker to avoid CPU thrash; scale with cores/gpus.
+            threads_per_worker = max(2, min(16, cpu_cores // max(1, gpu_count)))
+            os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(threads_per_worker))
+            # Keep parallel models enabled by default when multi-GPU present.
+            if gpu_count > 1:
+                os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", "1")
+            # Keep feature workers modest to avoid pool crashes; at most 4 or gpu_count.
+            fw = str(os.environ.get("FEATURE_WORKERS", "")).strip()
+            if not fw:
+                os.environ["FEATURE_WORKERS"] = str(max(1, min(4, gpu_count)))
     except Exception:
         pass
 
