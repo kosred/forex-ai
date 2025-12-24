@@ -62,8 +62,8 @@ if __name__ == "__main__":
             # Use all visible GPUs unless user overrides.
             os.environ.setdefault("FOREX_BOT_MAX_GPUS", str(gpu_count))
             os.environ.setdefault("SYSTEM__NUM_GPUS", str(gpu_count))
-            os.environ.setdefault("SYSTEM__ENABLE_GPU_PREFERENCE", "gpu")
-            os.environ.setdefault("FOREX_BOT_TREE_DEVICE", "gpu")
+            os.environ.setdefault("SYSTEM__ENABLE_GPU_PREFERENCE", "auto")
+            os.environ.setdefault("FOREX_BOT_TREE_DEVICE", "auto")
             # Cap threads per worker to avoid CPU thrash; scale with cores/gpus.
             threads_per_worker = max(2, min(16, cpu_cores // max(1, gpu_count)))
             os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(threads_per_worker))

@@ -68,9 +68,9 @@ def _tree_device_preference() -> str:
     Controls whether tree models should run on GPU or CPU.
 
     Env:
-      - FOREX_BOT_TREE_DEVICE=auto|gpu|cpu  (default: cpu)
+      - FOREX_BOT_TREE_DEVICE=auto|gpu|cpu  (default: auto)
     """
-    raw = str(os.environ.get("FOREX_BOT_TREE_DEVICE", "cpu")).strip().lower()
+    raw = str(os.environ.get("FOREX_BOT_TREE_DEVICE", "auto")).strip().lower()
     if raw in {"cpu", "gpu", "auto"}:
         return raw
     if raw in {"0", "false", "no", "off"}:
