@@ -197,14 +197,16 @@ def ensure_dependencies() -> None:
         # Also exclude known internal module names that might be picked up
         if mod in {"forex_bot", "src", "tests"}:
             continue
-            
-        # Map module -> package
-        pkg = IMPORT_TO_PYPI.get(mod, mod) 
-        
+
+        # Map only known modules to packages; skip unknowns to avoid false positives.
+        pkg = IMPORT_TO_PYPI.get(mod)
+        if not pkg:
+            continue
+
         # Filter exclusions
         if system != "windows" and pkg.lower() == "metatrader5":
             continue
-        
+
         required_packages.add(pkg)
 
     # 4. Check what's missing
