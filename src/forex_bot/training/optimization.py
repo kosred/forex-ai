@@ -968,6 +968,14 @@ class HyperparameterOptimizer:
         def objective(trial: Trial) -> float:
             if self._should_stop():
                 raise optuna.TrialPruned("stop requested")
+            # Get assigned GPU from _pick_device (uses thread-local if set)
+            device = self._pick_device(trial.number)
+            gpu_id = 0
+            if isinstance(device, str) and device.startswith("cuda:"):
+                try:
+                    gpu_id = int(device.split(":")[1])
+                except Exception:
+                    gpu_id = 0
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 100, 300),
                 "max_depth": trial.suggest_int("max_depth", 8, 16),
@@ -976,6 +984,7 @@ class HyperparameterOptimizer:
                 "max_features": trial.suggest_float("max_features", 0.5, 1.0),
                 "bootstrap": True,
                 "random_state": 42,
+                "gpu_device_id": gpu_id,  # Pass GPU ID to cuML
             }
             model = RandomForestExpert(params=params)
             x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
