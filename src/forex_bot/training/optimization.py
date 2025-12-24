@@ -919,12 +919,12 @@ class HyperparameterOptimizer:
             if self._should_stop():
                 raise optuna.TrialPruned("stop requested")
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 300),  # Reduced range for speed
-                "max_depth": trial.suggest_int("max_depth", 8, 16),  # Tighter range
+                "n_estimators": trial.suggest_int("n_estimators", 100, 300),
+                "max_depth": trial.suggest_int("max_depth", 8, 16),
                 "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
                 "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 5),
-                "criterion": "gini",  # Fixed to gini (faster, nearly identical performance)
-                "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
+                "max_features": trial.suggest_float("max_features", 0.5, 1.0),
+                "bootstrap": True,
                 "random_state": 42,
             }
             model = RandomForestExpert(params=params)
@@ -935,13 +935,30 @@ class HyperparameterOptimizer:
                 return 0.0
             try:
                 preds = model.predict_proba(x_va)
-            except Exception as exc:  # pragma: no cover - defensive for Optuna
+            except Exception as exc:
                 raise optuna.TrialPruned(f"RandomForest predict failed: {exc}")
             return self._objective_base(y_va, preds, None)
 
-        study = self._run_study("RandomForest_Opt", objective, self.n_trials)
+        # Run RF sequentially (n_jobs=1) to ensure cuML GPU works without multi-process conflicts
+        study = self._get_study("RandomForest_Opt")
+        completed = sum(1 for t in study.trials if t.state == TrialState.COMPLETE)
+        remaining = max(0, self.n_trials - completed)
+        if remaining > 0:
+            logger.info(f"Optuna study RandomForest_Opt: running {remaining} GPU trials sequentially (cuML)")
+            study.optimize(
+                objective,
+                n_trials=remaining,
+                n_jobs=1,  # Sequential for GPU - cuML doesn't support multi-process
+                callbacks=[lambda study, trial: study.stop() if self._should_stop() else None],
+                catch=(KeyboardInterrupt, MemoryError),
+            )
+        else:
+            logger.info(f"Optuna study RandomForest_Opt: using existing {completed} trials")
         logger.info(f"Optuna RandomForest completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        return study.best_params
+        try:
+            return study.best_params
+        except ValueError:
+            return {}
 
     def _optimize_extra_trees(
         self,
