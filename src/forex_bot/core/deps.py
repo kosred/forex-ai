@@ -59,6 +59,7 @@ IMPORT_TO_PYPI = {
     "seaborn": "seaborn",
     "plotly": "plotly",
     "sqlalchemy": "sqlalchemy",
+    "redis": "redis",
     "duckdb": "duckdb",
     "duckdb_engine": "duckdb-engine",
     "alembic": "alembic",
