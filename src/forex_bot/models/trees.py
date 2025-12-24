@@ -420,26 +420,30 @@ class RandomForestExpert(ExpertModel):
 
         # Try CuML first for GPU acceleration
         try:
+            import cupy as cp
             import cudf
             from cuml.ensemble import RandomForestClassifier as CuRF
 
-            # Convert to cudf/cupy for best performance
-            x_gpu = cudf.DataFrame.from_pandas(x)
-            y_gpu = cudf.Series.from_pandas(y)
+            # Select specific GPU if specified in params
+            gpu_id = self.params.get("gpu_device_id", 0)
+            with cp.cuda.Device(gpu_id):
+                # Convert to cudf/cupy for best performance
+                x_gpu = cudf.DataFrame.from_pandas(x)
+                y_gpu = cudf.Series.from_pandas(y)
 
-            logger.info(f"Training RandomForest using RAPIDS (GPU) on {len(x)} samples...")
-            gpu_params = {
-                "n_estimators": self.params.get("n_estimators", 400),
-                "max_depth": self.params.get("max_depth", 16),
-                "min_samples_split": self.params.get("min_samples_split", 2),
-                "min_samples_leaf": self.params.get("min_samples_leaf", 1),
-                "max_features": self.params.get("max_features", 1.0),
-                "bootstrap": bool(self.params.get("bootstrap", True)),
-                "n_streams": 1,  # Sync
-                "verbose": False,
-            }
-            self.model = CuRF(**gpu_params)
-            self.model.fit(x_gpu, y_gpu)
+                logger.info(f"Training RandomForest using RAPIDS (GPU {gpu_id}) on {len(x)} samples...")
+                gpu_params = {
+                    "n_estimators": self.params.get("n_estimators", 400),
+                    "max_depth": self.params.get("max_depth", 16),
+                    "min_samples_split": self.params.get("min_samples_split", 2),
+                    "min_samples_leaf": self.params.get("min_samples_leaf", 1),
+                    "max_features": self.params.get("max_features", 1.0),
+                    "bootstrap": bool(self.params.get("bootstrap", True)),
+                    "n_streams": 1,  # Sync
+                    "verbose": False,
+                }
+                self.model = CuRF(**gpu_params)
+                self.model.fit(x_gpu, y_gpu)
             return True
         except ImportError:
             pass  # Fallthrough to sklearn
