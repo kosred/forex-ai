@@ -386,6 +386,10 @@ def _install(packages: list[str], index_url: str | None = None, upgrade: bool = 
         return
 
     cmd = [sys.executable, "-m", "pip", "install", "--timeout", "60"]
+    
+    # Allow installing to system/global environment (PEP 668 override)
+    cmd.append("--break-system-packages")
+    
     if upgrade:
         cmd.append("--upgrade")
     if pre:
