@@ -872,6 +872,11 @@ class HyperparameterOptimizer:
                 "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
                 "verbosity": -1,
             }
+            # Explicitly pass GPU settings when device is CUDA
+            if device_id is not None:
+                params["device_type"] = "gpu"
+                params["gpu_device_id"] = device_id
+                params["max_bin"] = 63  # critical for LightGBM GPU speed
             model = LightGBMExpert(params=params)
             x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
             if not model.fit(x_tr, y_tr):
