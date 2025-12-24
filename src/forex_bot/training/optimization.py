@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -239,63 +240,103 @@ class HyperparameterOptimizer:
             logger.info("Stop requested before optimization; skipping all Optuna studies.")
             return best_params
 
+        # Build list of models to optimize with their GPU assignments
+        # Group models into parallel batches - each batch runs on all GPUs simultaneously
+        n_gpus = len(self.device_pool) if self.device_pool else 1
+
+        def run_optimization(name: str, func: Callable, gpu_id: int) -> tuple[str, dict]:
+            """Run a single model optimization on assigned GPU."""
+            if self._should_stop():
+                return name, {}
+            # Set CUDA_VISIBLE_DEVICES for this thread to force GPU assignment
+            old_env = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if self.device_pool and gpu_id < len(self.device_pool):
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            try:
+                result = func(X_train, y_train, X_val, y_val, meta_val)
+                return name, result
+            except Exception as e:
+                logger.error(f"Optimization for {name} failed: {e}")
+                return name, {}
+            finally:
+                if old_env is not None:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = old_env
+                elif "CUDA_VISIBLE_DEVICES" in os.environ:
+                    del os.environ["CUDA_VISIBLE_DEVICES"]
+
+        # Batch 1: Tree-based models (GPU-accelerated) - run in parallel across GPUs
+        batch1_models = []
         if LGBM_AVAILABLE:
-            best_params["LightGBM"] = self._optimize_lgbm(X_train, y_train, X_val, y_val, meta_val)
+            batch1_models.append(("LightGBM", self._optimize_lgbm, 0))
+        batch1_models.append(("RandomForest", self._optimize_random_forest, 1 % n_gpus))
+        batch1_models.append(("ExtraTrees", self._optimize_extra_trees, 2 % n_gpus))
+
+        if n_gpus > 1 and len(batch1_models) > 1:
+            logger.info(f"Running {len(batch1_models)} tree models in PARALLEL across {n_gpus} GPUs")
+            with ThreadPoolExecutor(max_workers=min(len(batch1_models), n_gpus)) as executor:
+                futures = {executor.submit(run_optimization, n, f, g): n for n, f, g in batch1_models}
+                for future in as_completed(futures):
+                    name, result = future.result()
+                    best_params[name] = result
+                    logger.info(f"Completed parallel optimization: {name}")
+        else:
+            for name, func, _ in batch1_models:
+                if self._should_stop():
+                    break
+                best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
 
         if self._should_stop():
             logger.info("Stop requested; skipping remaining optimization studies.")
             return best_params
 
-        best_params["RandomForest"] = self._optimize_random_forest(X_train, y_train, X_val, y_val, meta_val)
+        # Batch 2: Neural network models - run in parallel across GPUs
+        batch2_models = [
+            ("TabNet", self._optimize_tabnet, 0),
+            ("N-BEATS", self._optimize_nbeats, 1 % n_gpus),
+            ("TiDE", self._optimize_tide, 2 % n_gpus),
+            ("KAN", self._optimize_kan, 3 % n_gpus),
+        ]
+
+        if n_gpus > 1:
+            logger.info(f"Running {len(batch2_models)} neural models in PARALLEL across {n_gpus} GPUs")
+            with ThreadPoolExecutor(max_workers=min(len(batch2_models), n_gpus)) as executor:
+                futures = {executor.submit(run_optimization, n, f, g): n for n, f, g in batch2_models}
+                for future in as_completed(futures):
+                    name, result = future.result()
+                    best_params[name] = result
+                    logger.info(f"Completed parallel optimization: {name}")
+        else:
+            for name, func, _ in batch2_models:
+                if self._should_stop():
+                    break
+                best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
 
         if self._should_stop():
             logger.info("Stop requested; skipping remaining optimization studies.")
             return best_params
 
-        best_params["ExtraTrees"] = self._optimize_extra_trees(X_train, y_train, X_val, y_val, meta_val)
+        # Batch 3: Transformer + RL models - run in parallel
+        batch3_models = [("Transformer", self._optimize_transformer, 0)]
+        if hasattr(RLExpertPPO, "__init__") and "rl_ppo" in self.settings.models.ml_models:
+            batch3_models.append(("RL_PPO", self._optimize_rl_ppo, 1 % n_gpus))
+        if hasattr(RLExpertSAC, "__init__") and "rl_sac" in self.settings.models.ml_models:
+            batch3_models.append(("RL_SAC", self._optimize_rl_sac, 2 % n_gpus))
+        if EvoExpertCMA:
+            batch3_models.append(("Neuroevolution", self._optimize_neuroevolution, 3 % n_gpus))
 
-        if self._should_stop():
-            logger.info("Stop requested; skipping remaining optimization studies.")
-            return best_params
-
-        best_params["TabNet"] = self._optimize_tabnet(X_train, y_train, X_val, y_val, meta_val)
-        if self._should_stop():
-            logger.info("Stop requested; skipping remaining optimization studies.")
-            return best_params
-
-        best_params["N-BEATS"] = self._optimize_nbeats(X_train, y_train, X_val, y_val, meta_val)
-        if self._should_stop():
-            logger.info("Stop requested; skipping remaining optimization studies.")
-            return best_params
-
-        best_params["TiDE"] = self._optimize_tide(X_train, y_train, X_val, y_val, meta_val)
-        if self._should_stop():
-            logger.info("Stop requested; skipping remaining optimization studies.")
-            return best_params
-
-        best_params["KAN"] = self._optimize_kan(X_train, y_train, X_val, y_val, meta_val)
-        if self._should_stop():
-            logger.info("Stop requested; skipping remaining optimization studies.")
-            return best_params
-
-        best_params["Transformer"] = self._optimize_transformer(X_train, y_train, X_val, y_val, meta_val)
-
-        if hasattr(RLExpertPPO, "__init__") and "rl_ppo" in self.settings.models.ml_models:  # Check if PPO is enabled
-            best_params["RL_PPO"] = self._optimize_rl_ppo(X_train, y_train, X_val, y_val, meta_val)
-
-        if self._should_stop():
-            logger.info("Stop requested; skipping remaining optimization studies.")
-            return best_params
-
-        if hasattr(RLExpertSAC, "__init__") and "rl_sac" in self.settings.models.ml_models:  # Check if SAC is enabled
-            best_params["RL_SAC"] = self._optimize_rl_sac(X_train, y_train, X_val, y_val, meta_val)
-
-        if self._should_stop():
-            logger.info("Stop requested; skipping remaining optimization studies.")
-            return best_params
-
-        if EvoExpertCMA:  # Check for import success
-            best_params["Neuroevolution"] = self._optimize_neuroevolution(X_train, y_train, X_val, y_val, meta_val)
+        if n_gpus > 1 and len(batch3_models) > 1:
+            logger.info(f"Running {len(batch3_models)} advanced models in PARALLEL across {n_gpus} GPUs")
+            with ThreadPoolExecutor(max_workers=min(len(batch3_models), n_gpus)) as executor:
+                futures = {executor.submit(run_optimization, n, f, g): n for n, f, g in batch3_models}
+                for future in as_completed(futures):
+                    name, result = future.result()
+                    best_params[name] = result
+                    logger.info(f"Completed parallel optimization: {name}")
+        else:
+            for name, func, _ in batch3_models:
+                if self._should_stop():
+                    break
+                best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
 
         self._save_params(best_params)
         return best_params
