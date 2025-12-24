@@ -280,16 +280,6 @@ class LightGBMExpert(ExpertModel):
                 # max_bin=255 for better accuracy on CPU
                 params.setdefault("max_bin", 255)
 
-            binary = len(uniq) <= 2
-            if binary:
-                params["objective"] = "binary"
-                params.pop("num_class", None)
-                eval_metric = "binary_logloss"
-            else:
-                params["objective"] = "multiclass"
-                params["num_class"] = params.get("num_class", len(uniq))
-                eval_metric = "multi_logloss"
-
             # Use time-series aware split to prevent look-ahead bias
             if len(y) > 500:
                 try:
@@ -324,6 +314,17 @@ class LightGBMExpert(ExpertModel):
                 if cnt > 0
             }
             params["class_weight"] = class_weight if class_weight else None
+
+            # Decide binary vs multiclass based on remapped labels
+            binary = len(uniq) <= 2
+            if binary:
+                params["objective"] = "binary"
+                params.pop("num_class", None)
+                eval_metric = "binary_logloss"
+            else:
+                params["objective"] = "multiclass"
+                params["num_class"] = params.get("num_class", len(uniq))
+                eval_metric = "multi_logloss"
 
             # Decide binary vs multiclass based on remapped labels
             binary = len(uniq) <= 2
