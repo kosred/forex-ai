@@ -520,6 +520,11 @@ class HyperparameterOptimizer:
         # Use shared cache and read-write-create to reduce locking issues.
         return f"sqlite:///{db_path}?cache=shared&mode=rwc"
 
+    # Backward compat for callers expecting _duckdb_url
+    def _duckdb_url(self) -> str:
+        # Redirect to SQLite to avoid DuckDB dialect issues.
+        return self._sqlite_url()
+
     def _run_study(self, study_name: str, objective: Callable[[Trial], float], target_trials: int) -> optuna.Study:
         """
         Warm-start aware study runner. Resumes existing study and only runs remaining trials.
