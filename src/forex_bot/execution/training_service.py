@@ -118,10 +118,10 @@ class TrainingService:
             return None
 
         try:
-            mem_frac = float(os.environ.get("FOREX_BOT_GLOBAL_POOL_MEM_FRAC", "0.25") or 0.25)
+            mem_frac = float(os.environ.get("FOREX_BOT_GLOBAL_POOL_MEM_FRAC", "0.10") or 0.10)
         except Exception:
-            mem_frac = 0.25
-        mem_frac = float(min(0.80, max(0.05, mem_frac)))
+            mem_frac = 0.10
+        mem_frac = float(min(0.40, max(0.05, mem_frac)))
 
         try:
             overhead = float(os.environ.get("FOREX_BOT_GLOBAL_POOL_OVERHEAD", "3.0") or 3.0)
