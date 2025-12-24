@@ -500,23 +500,25 @@ class HyperparameterOptimizer:
                 logger.info("Redis storage unavailable; falling back to DuckDB.")
                 return self._duckdb_url()
 
-        # DuckDB path
+        # DuckDB path (keep for backward compat), but prefer SQLite to avoid dialect issues (SERIAL not supported).
         if url.startswith("duckdb://"):
-            return url
+            logger.info("DuckDB storage requested; switching to SQLite to avoid DuckDB dialect errors.")
+            return self._sqlite_url()
 
         # Any other URL (Postgres/MySQL) – trust user
         if "://" in url:
             return url
 
-        # Default fallback to DuckDB
+        # Default fallback to SQLite (portable and stable)
         if os.name == "nt":
             return _JOURNAL_STORAGE_SENTINEL
-        return self._duckdb_url()
+        return self._sqlite_url()
 
-    def _duckdb_url(self) -> str:
-        db_path = Path(self.cache_dir) / "optuna.duckdb"
+    def _sqlite_url(self) -> str:
+        db_path = Path(self.cache_dir) / "optuna.sqlite"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        return f"duckdb:///{db_path}"
+        # Use shared cache and read-write-create to reduce locking issues.
+        return f"sqlite:///{db_path}?cache=shared&mode=rwc"
 
     def _run_study(self, study_name: str, objective: Callable[[Trial], float], target_trials: int) -> optuna.Study:
         """
