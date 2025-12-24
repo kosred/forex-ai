@@ -247,13 +247,7 @@ class LightGBMExpert(ExpertModel):
                 x = x.iloc[order]
                 y = y.iloc[order]
 
-            uniq, counts = np.unique(y, return_counts=True)
-            class_weight = {
-                int(cls): float(len(y) / (len(uniq) * cnt)) for cls, cnt in zip(uniq, counts, strict=False) if cnt > 0
-            }
-
             params = self.params.copy()
-            params["class_weight"] = class_weight if class_weight else None
 
             # Respect worker thread partitioning when set (prevents oversubscription on large CPUs).
             cpu_threads = _cpu_threads_hint()
@@ -321,6 +315,15 @@ class LightGBMExpert(ExpertModel):
                 y_arr, mapping = _remap_labels_to_contiguous(y)
                 x_train, y_train = x, y_arr
                 eval_set = [(x, y_arr)]
+
+            # Build class weights on remapped labels so keys align with LightGBM class map.
+            uniq, counts = np.unique(y_train, return_counts=True)
+            class_weight = {
+                int(cls): float(len(y_train) / (len(uniq) * cnt))
+                for cls, cnt in zip(uniq, counts, strict=False)
+                if cnt > 0
+            }
+            params["class_weight"] = class_weight if class_weight else None
 
             self.model = lgb.LGBMClassifier(**params)
             try:
