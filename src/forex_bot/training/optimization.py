@@ -919,11 +919,11 @@ class HyperparameterOptimizer:
             if self._should_stop():
                 raise optuna.TrialPruned("stop requested")
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 500),
-                "max_depth": trial.suggest_int("max_depth", 5, 15),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
-                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
-                "criterion": trial.suggest_categorical("criterion", ["gini", "entropy"]),
+                "n_estimators": trial.suggest_int("n_estimators", 100, 300),  # Reduced range for speed
+                "max_depth": trial.suggest_int("max_depth", 8, 16),  # Tighter range
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 5),
+                "criterion": "gini",  # Fixed to gini (faster, nearly identical performance)
                 "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
                 "random_state": 42,
             }
