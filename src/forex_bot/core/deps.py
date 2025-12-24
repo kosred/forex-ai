@@ -18,10 +18,9 @@ logger = logging.getLogger(__name__)
 _DEPS_CHECKED = False
 _APT_REFRESHED = False
 
-# Target torch baseline (latest supported on CUDA runtime; override if needed)
-TORCH_VERSION = "2.5.1"
-VISION_VERSION = "0.20.1"
-AUDIO_VERSION = "2.5.1"
+# Target torch baseline
+# For Python 3.13, we accept newer versions via --pre
+TORCH_MIN_VERSION = "2.4.0"
 
 
 def _get_cuda_version() -> str | None:
@@ -61,35 +60,62 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
     system = platform.system().lower()
     cuda_version = _get_cuda_version()
     has_gpu = cuda_version is not None
+    
+    # Python 3.13 Support: Enable pre-releases automatically
+    py_ver = sys.version_info
+    is_py313_plus = py_ver >= (3, 13)
+    # Always allow pre-releases on 3.13 to catch alpha builds (like SB3 2.8.0a2)
+    use_pre = is_py313_plus
 
     logger.info(f"Dependency Check: OS={system}, GPU={has_gpu} (CUDA {cuda_version or 'N/A'})")
-    logger.info(f"Python Version: {platform.python_version()}")
+    logger.info(f"Python Version: {platform.python_version()} (Pre-releases: {use_pre})")
 
     installed_any = False
 
-    # 1. PyTorch (Hardware-Aware Dynamic Install - latest stable)
+    # 1. PyTorch (Hardware-Aware Dynamic Install)
     try:
-        importlib_metadata.version("torch")
+        installed_ver = importlib_metadata.version("torch")
+        # Simple check: if installed version is too old and we aren't on bleeding edge 3.13, complain
+        if installed_ver < TORCH_MIN_VERSION and not is_py313_plus:
+             raise importlib_metadata.PackageNotFoundError
     except importlib_metadata.PackageNotFoundError:
-        logger.info("PyTorch not found. Searching for compatible version...")
-        torch_pkgs = [
-            f"torch=={TORCH_VERSION}",
-            f"torchvision=={VISION_VERSION}",
-            f"torchaudio=={AUDIO_VERSION}",
-        ]
+        logger.info("PyTorch not found or too old. Searching for compatible version...")
+        
+        torch_pkgs = ["torch", "torchvision", "torchaudio"]
+        
+        # Determine Index URL
+        # Default to standard PyPI (CPU) or specific CUDA index
+        index_url = None
         if has_gpu and cuda_version:
-            cu_index = _select_torch_index(cuda_version)
-            logger.info(f"Attempting PyTorch {TORCH_VERSION} for CUDA {cuda_version} via {cu_index} ...")
-            try:
-                _install(torch_pkgs, index_url=cu_index)
-                installed_any = True
-            except Exception as e:
-                logger.warning(f"CUDA wheel install failed ({e}); falling back to CPU torch.")
-                _install(torch_pkgs, index_url="https://download.pytorch.org/whl/cpu")
-                installed_any = True
-        else:
-            _install(torch_pkgs, index_url="https://download.pytorch.org/whl/cpu")
+             # Try to find a specific stable CUDA index first
+             index_url = _select_torch_index(cuda_version, is_nightly=False)
+        
+        logger.info(f"Attempting PyTorch install (Index: {index_url or 'Default'})...")
+        try:
+            # Try standard/stable install first (with --pre if on Py3.13)
+            _install(torch_pkgs, index_url=index_url, pre=use_pre)
             installed_any = True
+        except Exception as e:
+            logger.warning(f"Standard PyTorch install failed ({e}).")
+            
+            # Fallback to Nightly (critical for early Python 3.13 support)
+            if has_gpu and cuda_version:
+                nightly_index = _select_torch_index(cuda_version, is_nightly=True)
+            else:
+                nightly_index = "https://download.pytorch.org/whl/nightly/cpu"
+            
+            logger.info(f"Attempting Nightly PyTorch install from {nightly_index}...")
+            try:
+                _install(torch_pkgs, index_url=nightly_index, pre=True)
+                installed_any = True
+            except Exception as e2:
+                logger.error(f"Nightly PyTorch install also failed: {e2}")
+                # Last resort: CPU only stable/pre
+                if has_gpu:
+                     logger.info("Falling back to CPU-only PyTorch...")
+                     _install(torch_pkgs, index_url="https://download.pytorch.org/whl/cpu", pre=use_pre)
+                     installed_any = True
+
 
     # 2. CuPy (Dynamic Match to Torch CUDA)
     if has_gpu:
@@ -99,73 +125,79 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
             logger.info("Matching CuPy version to installed PyTorch...")
             try:
                 import torch
-
                 torch_cuda = torch.version.cuda
                 if torch_cuda:
                     major_minor = torch_cuda.replace(".", "")[:3]
+                    # Try specific cupy-cudaXX
                     pkg_name = f"cupy-cuda{major_minor}"
                     try:
-                        _install([pkg_name])
+                        _install([pkg_name], pre=use_pre)
                         installed_any = True
                     except Exception:
-                        logger.info(f"Wheel {pkg_name} not found. Trying generic cupy-cuda12x...")
+                        # Try generic cupy-cuda12x
+                        generic = "cupy-cuda12x" if "12" in torch_cuda else "cupy-cuda11x"
+                        logger.info(f"Wheel {pkg_name} not found. Trying {generic}...")
                         try:
-                            _install(["cupy-cuda12x"])
+                            _install([generic], pre=use_pre)
                             installed_any = True
                         except Exception:
-                            logger.info("Falling back to source build for CuPy (may be slow).")
-                            _install(["cupy"])
-                            installed_any = True
+                             logger.info("Falling back to source build for CuPy.")
+                             _install(["cupy"], pre=use_pre)
+                             installed_any = True
             except Exception as e:
                 logger.warning(f"Failed to auto-install CuPy: {e}")
-
-    # 2b. numba-cuda (best effort; wheels are scarce on py3.13, so default to numba CPU)
-    if has_gpu:
-        try:
-            import numba.cuda  # type: ignore
-        except Exception:
-            logger.info("numba-cuda not available; continuing with CPU numba for GPU kernels fallback.")
 
     # 3. TA-Lib (OS Specific)
     try:
         importlib_metadata.version("ta-lib")
     except importlib_metadata.PackageNotFoundError:
-        if system == "windows":
-            logger.info("Installing TA-Lib binary for Windows...")
-            try:
-                _install(["ta-lib-binary"])
-                installed_any = True
-            except Exception:
-                logger.warning("Failed to install ta-lib-binary.")
-        else:
-            try:
-                _install(["ta-lib"])
-                installed_any = True
-            except Exception:
+        # Try official TA-Lib wheel first (now exists for Py3.13)
+        try:
+            logger.info("Installing TA-Lib (Official)...")
+            _install(["TA-Lib"], pre=use_pre)
+            installed_any = True
+        except Exception:
+            if system == "windows":
+                logger.info("Official TA-Lib failed. Trying ta-lib-binary...")
+                try:
+                    _install(["ta-lib-binary"], pre=use_pre)
+                    installed_any = True
+                except Exception:
+                    logger.warning("Failed to install ta-lib-binary.")
+            else:
                 logger.warning("ta-lib wheel install failed. Trying apt-get libta-lib0-dev ...")
-                if not _apt_install(["libta-lib0", "libta-lib0-dev", "ta-lib"]):
-                    logger.error("Failed to install ta-lib. On Linux, install libta-lib0-dev and retry.")
+                if _apt_install(["libta-lib0", "libta-lib0-dev", "ta-lib"]):
+                     try:
+                         _install(["TA-Lib"], pre=use_pre)
+                         installed_any = True
+                     except:
+                         pass
 
-    # 4. Essential Packages (Dynamic List - No requirements.txt)
+    # 4. Essential Packages (Dynamic List)
+    # Updated constraints for 2025/Python 3.13
     essentials = [
-        "numpy>=2.1,<3",
-        "pandas>=2.2",
-        "scikit-learn>=1.5",
+        "numpy>=2.1.0",
+        "pandas>=2.2.3",
+        "scikit-learn>=1.5.0",
         "joblib",
         "psutil",
-        "numba>=0.60",
-        "llvmlite>=0.43",
+        "numba>=0.60.0",
+        "llvmlite>=0.43.0",
         "matplotlib",
         "PyYAML",
         "tqdm",
         "colorama",
-        "pydantic>=2.6",
+        "pydantic>=2.10",
         "pydantic-settings",
-        "redis>=5.0",  # for Optuna Redis storage
+        "redis>=5.0",
         "duckdb>=1.0.0",
-        "duckdb-engine>=0.12.0",
         "optuna>=4.0.0",
+        "requests",
+        "feedparser"
     ]
+    
+    if system == "windows":
+        essentials.append("MetaTrader5>=5.0.45")
 
     logger.info("Verifying essential packages...")
     missing_essentials = []
@@ -178,123 +210,75 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
 
     if missing_essentials:
         logger.info(f"Installing missing essentials: {missing_essentials}")
-        _install(missing_essentials)
-        installed_any = True
-
-    # 5. Specialized Model Libraries (Required for full feature set on Linux; best effort on Windows)
-    optional_libs = [
-        "efficient-kan",
-        "pytorch-tabnet",
-        "ray[rllib]",
-        "gymnasium[box2d,atari]",
-        # Prefer stable SB3; fall back to git main if wheel unavailable.
-        "stable-baselines3[extra]",
-        # Full TiDE and other SOTA models
-        "neuralforecast",
-        # Time-Series Library (TSL) for PatchTST/TimesNet variants and others
-        "tslib",
-    ]
-    for lib in optional_libs:
-        base_name = lib.split("[")[0]
         try:
-            importlib_metadata.version(base_name)
-        except importlib_metadata.PackageNotFoundError:
-            # Skip ray[rllib] on Windows + Python 3.13+
-            if "ray" in lib and system == "windows":
-                logger.info("Skipping RLlib on Windows (unsupported). Install on Linux/WSL for RLlib.")
-                continue
-            if "stable-baselines3" in lib and system == "windows":
-                logger.info("Skipping Stable-Baselines3 on Windows for RL usage; install on Linux/WSL.")
-                continue
-            if "neuralforecast" in lib and system == "windows":
-                logger.info("Skipping neuralforecast on Windows; install on Linux/WSL for full TiDE.")
-                continue
-            if "tslib" in lib and system == "windows":
-                logger.info("Skipping tslib on Windows; install on Linux/WSL for TS transformers.")
-                continue
-
-            logger.info(f"Installing {lib} (Best Effort)...")
-            try:
-                _install([lib])
-                installed_any = True
-            except Exception as e:
-                if "stable-baselines3" in lib:
-                    logger.info("stable-baselines3 wheel unavailable; trying bleeding-edge from GitHub...")
-                    try:
-                        subprocess.check_call(
-                            [
-                                sys.executable,
-                                "-m",
-                                "pip",
-                                "install",
-                                "git+https://github.com/DLR-RM/stable-baselines3.git#egg=stable-baselines3[extra]",
-                            ]
-                        )
-                        installed_any = True
-                        continue
-                    except Exception:
-                        logger.warning("Failed to install stable-baselines3 from git; RL (SB3) will be unavailable.")
-
-                if "efficient-kan" in lib:
-                    logger.info("Standard efficient-kan install failed. Trying bleeding-edge from GitHub...")
-                    try:
-                        subprocess.check_call(
-                            [
-                                sys.executable,
-                                "-m",
-                                "pip",
-                                "install",
-                                "git+https://github.com/Blealtan/efficient-kan.git",
-                            ]
-                        )
-                        logger.info("Successfully installed efficient-kan from git.")
-                        installed_any = True
-                        continue
-                    except Exception:
-                        pass
-
-                if "efficient-kan" in lib:
-                    logger.warning(f"{lib} unavailable. KAN model will run in CPU-Optimized Lite mode.")
-                elif "pytorch-tabnet" in lib:
-                    logger.warning(f"{lib} unavailable. TabNet model will run in CPU mode if possible.")
-                else:
-                    logger.warning(
-                        f"Library {lib} installation failed: {e}\n"
-                        "  -> If this is RLlib, RL Agents will be disabled but others will work."
-                    )
-
-    # 6. Transformer accelerators (best-effort, GPU only, avoid Py3.13 build failures)
-    if has_gpu:
-        py_major, py_minor = sys.version_info[:2]
-        if py_major == 3 and py_minor <= 12:
-            for pkg in ["xformers", "flash-attn"]:
-                try:
-                    importlib_metadata.version(pkg.replace("-", "_"))
-                except importlib_metadata.PackageNotFoundError:
-                    logger.info(f"Installing {pkg} (best effort, GPU accel)...")
-                    try:
-                        _install([pkg])
-                        installed_any = True
-                    except Exception as e:
-                        logger.warning(f"{pkg} install failed; continuing without it ({e})")
-        else:
-            logger.info("Skipping xformers/flash-attn on Python 3.13 (wheels not widely available yet).")
-
-    # 7. MetaTrader5 (Windows Only)
-    if system == "windows":
-        try:
-            importlib_metadata.version("MetaTrader5")
-        except importlib_metadata.PackageNotFoundError:
-            logger.info("Installing MetaTrader5 (Latest)...")
-            _install(["MetaTrader5"], upgrade=True)
+            _install(missing_essentials, pre=use_pre)
             installed_any = True
+        except Exception as e:
+            logger.warning(f"Batch install failed ({e}). Trying individually...")
+            for pkg in missing_essentials:
+                try:
+                    _install([pkg], pre=use_pre)
+                    installed_any = True
+                except Exception as e2:
+                    logger.error(f"Failed to install {pkg}: {e2}")
+
+    # 5. Specialized Model Libraries
+    # SB3 2.8.0a2+ supports Py3.13 natively now
+    specialized_libs = [
+        {"name": "pytorch-tabnet", "pip": "pytorch-tabnet"},
+        {"name": "ray", "pip": "ray[rllib]", "skip_win": True},
+        {"name": "gymnasium", "pip": "gymnasium[box2d,atari]"},
+        {"name": "stable_baselines3", "pip": "stable-baselines3[extra]>=2.4.0"},
+        {"name": "efficient_kan", "pip": "efficient-kan", "git": "git+https://github.com/Blealtan/efficient-kan.git"},
+        {"name": "neuralforecast", "pip": "neuralforecast", "skip_win": True},
+        {"name": "tslib", "pip": "tslib", "skip_win": True},
+        {"name": "xgboost", "pip": "xgboost>=2.1.0"},
+        {"name": "catboost", "pip": "catboost>=1.2.7"},
+        {"name": "lightgbm", "pip": "lightgbm>=4.5.0"},
+    ]
+
+    for lib_def in specialized_libs:
+        pkg_import_name = lib_def["name"]
+        pip_name = lib_def["pip"]
+        
+        if lib_def.get("skip_win") and system == "windows":
+            continue
+
+        try:
+            check_name = pkg_import_name.replace("-", "_")
+            importlib_metadata.version(check_name)
+        except importlib_metadata.PackageNotFoundError:
+            logger.info(f"Installing {pip_name}...")
+            try:
+                _install([pip_name], pre=use_pre)
+                installed_any = True
+            except Exception:
+                if "git" in lib_def:
+                    git_url = lib_def["git"]
+                    logger.info(f"Pip install failed. Trying source/git: {git_url}")
+                    try:
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", git_url])
+                        installed_any = True
+                    except Exception as e_git:
+                        logger.warning(f"Git install failed for {pkg_import_name}: {e_git}")
+
+    # 6. Transformer accelerators (GPU only)
+    if has_gpu and not is_py313_plus: 
+        # Skip on 3.13 for now unless we know for sure they exist to avoid noise
+        for pkg in ["xformers", "flash-attn"]:
+            try:
+                importlib_metadata.version(pkg.replace("-", "_"))
+            except importlib_metadata.PackageNotFoundError:
+                try:
+                    _install([pkg], pre=use_pre)
+                    installed_any = True
+                except:
+                    pass
 
     _patch_third_party_warnings()
 
     logger.info("Dependency bootstrap complete.")
 
-    # Installing packages into the running interpreter can leave it in a partially inconsistent state
-    # (especially on Windows after upgrading compiled wheels like NumPy/Pandas). Restart once.
     if installed_any and os.environ.get("FOREX_BOT_DEPS_REEXEC", "") != "1":
         os.environ["FOREX_BOT_DEPS_REEXEC"] = "1"
         try:
@@ -308,21 +292,13 @@ def ensure_dependencies(requirements_path: str = "requirements.txt") -> None:
 def _patch_third_party_warnings() -> None:
     """
     Apply small, local compatibility patches to installed third-party libraries.
-
-    Goal: keep runtime output clean and future-proof against upcoming deprecations.
     """
     _patch_pytorch_tabnet_scipy_import()
 
 
 def _patch_pytorch_tabnet_scipy_import() -> None:
-    """
-    pytorch-tabnet 4.1.0 imports `spmatrix` from `scipy.sparse.base`, which is deprecated and emits a warning.
-
-    SciPy's recommended import is `from scipy.sparse import spmatrix`.
-    """
     try:
         import importlib.util
-
         spec = importlib.util.find_spec("pytorch_tabnet")
         if spec is None or not spec.submodule_search_locations:
             return
@@ -349,27 +325,17 @@ def _patch_pytorch_tabnet_scipy_import() -> None:
 
 
 def _cleanup_pip_leftovers() -> None:
-    """
-    Remove pip's leftover `~...` folders from interrupted upgrades (common on Windows).
-
-    These folders can trigger noisy pip warnings like:
-      "Ignoring invalid distribution ~umpy"
-    """
     try:
         import site
-
         user_site = site.getusersitepackages()
     except Exception:
         return
-
     try:
         root = Path(user_site)
     except Exception:
         return
-
     if not root.exists() or not root.is_dir():
         return
-
     targets = {"~~mpy", "~-mpy"}
     try:
         for item in root.iterdir():
@@ -388,10 +354,9 @@ def _cleanup_pip_leftovers() -> None:
         return
 
 
-def _select_torch_index(cuda_version: str) -> str:
+def _select_torch_index(cuda_version: str, is_nightly: bool = False) -> str:
     """
     Map CUDA version to the nearest supported PyTorch wheel index.
-    Prefers the highest compatible bucket supported by PyTorch 2.9.x.
     """
     try:
         parts = cuda_version.split(".")
@@ -400,17 +365,18 @@ def _select_torch_index(cuda_version: str) -> str:
     except Exception:
         return "https://download.pytorch.org/whl/cpu"
 
-    # PyTorch 2.9 provides cu128 and cu130 wheels; fall back to cu126 then cu124
-    if major >= 13 or (major == 12 and minor >= 10):
-        return "https://download.pytorch.org/whl/cu130"
-    if major == 12 and minor >= 8:
-        return "https://download.pytorch.org/whl/cu128"
-    if major == 12 and minor >= 6:
-        return "https://download.pytorch.org/whl/cu126"
-    if major == 12 and minor >= 4:
+    # Nightly handling
+    if is_nightly:
+        if major == 12:
+            return "https://download.pytorch.org/whl/nightly/cu124"
+        return "https://download.pytorch.org/whl/nightly/cpu"
+
+    # Stable handling
+    if major >= 13 or (major == 12 and minor >= 4):
         return "https://download.pytorch.org/whl/cu124"
     if major == 12 and minor >= 1:
         return "https://download.pytorch.org/whl/cu121"
+    
     return "https://download.pytorch.org/whl/cpu"
 
 
@@ -442,13 +408,11 @@ def _apt_install(packages: list[str]) -> bool:
             subprocess.check_call(
                 ["sudo", "-n", "apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            # Light upgrade to pull security fixes on older base images
             subprocess.check_call(
                 ["sudo", "-n", "apt-get", "upgrade", "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             _APT_REFRESHED = True
         except Exception:
-            # If sudo or update fails, continue without blocking
             _APT_REFRESHED = True
     try:
         subprocess.check_call(["sudo", "-n", "apt-get", "install", "-y", *packages])
