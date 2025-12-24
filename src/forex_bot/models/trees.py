@@ -234,10 +234,10 @@ class LightGBMExpert(ExpertModel):
             "linear_tree": True,
         }
 
-    def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, x: pd.DataFrame, y: pd.Series) -> bool:
         if not LGBM_AVAILABLE:
             logger.warning("LightGBM not available.")
-            return
+            return False
 
         try:
             x = _augment_time_features(x)
@@ -333,7 +333,7 @@ class LightGBMExpert(ExpertModel):
                 )
             except Exception as e:
                 if params.get("device_type") == "gpu":
-                    logger.warning(f"LightGBM GPU training failed ({e}), falling back to CPU.")
+                    logger.warning(f"LightGBM GPU training failed ({e}), falling back to CPU.", exc_info=True)
                     params["device_type"] = "cpu"
                     params.pop("gpu_use_dp", None)
                     params.pop("gpu_device_id", None)
@@ -349,8 +349,11 @@ class LightGBMExpert(ExpertModel):
                     )
                 else:
                     raise e
+            return True
         except Exception as e:
-            logger.error(f"LightGBM training failed: {e}")
+            logger.error(f"LightGBM training failed: {e}", exc_info=True)
+            self.model = None
+            return False
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
         if self.model is None:
@@ -388,7 +391,7 @@ class RandomForestExpert(ExpertModel):
             "random_state": 42,
         }
 
-    def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, x: pd.DataFrame, y: pd.Series) -> bool:
         # Ensure chronological order to reduce look-ahead bias in bootstrap samples
         try:
             if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
@@ -422,14 +425,14 @@ class RandomForestExpert(ExpertModel):
             }
             self.model = CuRF(**gpu_params)
             self.model.fit(x_gpu, y_gpu)
-            return
+            return True
         except ImportError:
             pass  # Fallthrough to sklearn
         except Exception as e:
             logger.warning(f"RAPIDS RF failed ({e}), falling back to CPU.")
 
         if not SKLEARN_AVAILABLE:
-            return
+            return False
         try:
             uniq, counts = np.unique(y, return_counts=True)
             class_weight = {
@@ -440,8 +443,11 @@ class RandomForestExpert(ExpertModel):
 
             self.model = RandomForestClassifier(**params)
             self.model.fit(x, y)
+            return True
         except Exception as e:
             logger.error(f"RF training failed: {e}")
+            self.model = None
+            return False
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
         if self.model is None:
@@ -480,9 +486,9 @@ class ExtraTreesExpert(ExpertModel):
             "random_state": 42,
         }
 
-    def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, x: pd.DataFrame, y: pd.Series) -> bool:
         if not SKLEARN_AVAILABLE or ExtraTreesClassifier is None:
-            return
+            return False
         try:
             x = _augment_time_features(x)
             if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
@@ -499,8 +505,11 @@ class ExtraTreesExpert(ExpertModel):
             params["class_weight"] = class_weight if class_weight else "balanced_subsample"
             self.model = ExtraTreesClassifier(**params)
             self.model.fit(x, y)
+            return True
         except Exception as e:
             logger.error(f"ExtraTrees training failed: {e}")
+            self.model = None
+            return False
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
         if self.model is None:

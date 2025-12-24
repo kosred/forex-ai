@@ -32,8 +32,8 @@ if [ -n "${DATA_ARCHIVE}" ] && [ -f "$DATA_ARCHIVE" ]; then
 fi
 
 # 3) Install deps (adjust to your environment)
-python -m pip install --upgrade pip
-pip install -e .
+python3 -m pip install --upgrade pip
+python3 -m pip install -e .
 
 # 4) Launch training based on profile
 case "$PROFILE" in

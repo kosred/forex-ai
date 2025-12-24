@@ -3,34 +3,46 @@ Name: forex-bot
 Version: 0.1.0
 Summary: Forex Trading Bot with Refactored Architecture
 Author-email: Konstantin <konst@example.com>
-Requires-Python: >=3.10
-Requires-Dist: numpy>=2.0.0
+Requires-Python: >=3.12
+Requires-Dist: numpy<3.0.0,>=2.0.0
 Requires-Dist: pandas>=2.2.3
-Requires-Dist: pyarrow
+Requires-Dist: pyarrow>=18.0.0
 Requires-Dist: scipy>=1.14.0
-Requires-Dist: scikit-learn>=1.5.0
-Requires-Dist: joblib
-Requires-Dist: requests
-Requires-Dist: feedparser
-Requires-Dist: PyYAML
+Requires-Dist: scikit-learn>=1.7.0
+Requires-Dist: joblib>=1.4.0
+Requires-Dist: requests>=2.32.0
+Requires-Dist: feedparser>=6.0.11
+Requires-Dist: PyYAML>=6.0.2
 Requires-Dist: matplotlib>=3.9.0
-Requires-Dist: psutil
+Requires-Dist: psutil>=6.1.0
 Requires-Dist: numba>=0.61.0
-Requires-Dist: MetaTrader5>=5.0.5000
-Requires-Dist: TA-Lib>=0.4.28
-Requires-Dist: lightgbm>=4.5.0
+Requires-Dist: MetaTrader5>=5.0.5000; sys_platform == "win32"
+Requires-Dist: TA-Lib>=0.4.32
+Requires-Dist: lightgbm>=4.6.0
 Requires-Dist: xgboost>=2.1.0
 Requires-Dist: catboost>=1.2.7
-Requires-Dist: optuna>=4.0.0
+Requires-Dist: optuna>=4.5.0
 Requires-Dist: tianshou>=0.5.0
 Requires-Dist: gymnasium>=0.29.1
-Requires-Dist: stable-baselines3>=2.0.0
-Requires-Dist: cma
-Requires-Dist: torch>=2.6.0
-Requires-Dist: torchvision>=0.21.0
-Requires-Dist: torchaudio>=2.6.0
-Requires-Dist: onnxruntime>=1.20.0
-Requires-Dist: transformers>=4.30.0
-Requires-Dist: openai>=1.0.0
-Requires-Dist: pydantic>=2.0.0
-Requires-Dist: pydantic-settings>=2.0.0
+Requires-Dist: stable-baselines3>=2.7.0
+Requires-Dist: shimmy>=2.0.0
+Requires-Dist: tensorboard>=2.18.0
+Requires-Dist: cma>=4.0.0
+Requires-Dist: torch>=2.9.0
+Requires-Dist: torchvision>=0.24.0
+Requires-Dist: torchaudio>=2.9.0
+Requires-Dist: onnxruntime>=1.21.0
+Requires-Dist: transformers>=4.48.0
+Requires-Dist: openai>=1.59.0
+Requires-Dist: pytorch-tabnet>=4.1.0
+Requires-Dist: efficient-kan@ git+https://github.com/Blealtan/efficient-kan.git
+Requires-Dist: pydantic>=2.10.0
+Requires-Dist: pydantic-settings>=2.7.0
+Requires-Dist: numexpr>=2.8.0
+Requires-Dist: threadpoolctl>=3.0.0
+Requires-Dist: py-cpuinfo>=9.0.0
+Provides-Extra: dev
+Requires-Dist: black>=24.10.0; extra == "dev"
+Requires-Dist: ruff>=0.8.0; extra == "dev"
+Requires-Dist: mypy>=1.13.0; extra == "dev"
+Requires-Dist: memory-profiler>=0.61.0; extra == "dev"

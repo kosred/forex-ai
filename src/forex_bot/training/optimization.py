@@ -864,20 +864,21 @@ class HyperparameterOptimizer:
                 "num_class": y_train.nunique(),  # Adapt for Meta-Labeling
                 "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
                 "verbosity": -1,
+                # Force CPU path during tuning; GPU LightGBM wheels are brittle across envs.
+                "device_type": "cpu",
+                "max_bin": 255,
             }
-            tree_pref = normalize_device_preference(os.environ.get("FOREX_BOT_TREE_DEVICE", "cpu"))
-            if tree_pref == "gpu" and device_id is not None:
-                params["device_type"] = "gpu"
-                params["gpu_device_id"] = device_id
-                params.setdefault("max_bin", 63)
-            else:
-                params["device_type"] = "cpu"
             model = LightGBMExpert(params=params)
             x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
-            model.fit(x_tr, y_tr)
+            if not model.fit(x_tr, y_tr):
+                logger.error("LightGBM fit failed; model=None. See previous logs for the root cause.")
+                raise optuna.TrialPruned("LightGBM fit failed")
             if len(x_va) == 0:
                 return 0.0
-            preds = model.predict_proba(x_va)
+            try:
+                preds = model.predict_proba(x_va)
+            except Exception as exc:  # pragma: no cover - defensive for Optuna
+                raise optuna.TrialPruned(f"LightGBM predict failed: {exc}")
             return self._objective_base(y_va, preds, None)
 
         study = self._run_study("LightGBM_Opt", objective, self.n_trials)
@@ -908,10 +909,14 @@ class HyperparameterOptimizer:
             }
             model = RandomForestExpert(params=params)
             x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
-            model.fit(x_tr, y_tr)
+            if not model.fit(x_tr, y_tr):
+                raise optuna.TrialPruned("RandomForest fit failed")
             if len(x_va) == 0:
                 return 0.0
-            preds = model.predict_proba(x_va)
+            try:
+                preds = model.predict_proba(x_va)
+            except Exception as exc:  # pragma: no cover - defensive for Optuna
+                raise optuna.TrialPruned(f"RandomForest predict failed: {exc}")
             return self._objective_base(y_va, preds, None)
 
         study = self._run_study("RandomForest_Opt", objective, self.n_trials)
@@ -943,10 +948,14 @@ class HyperparameterOptimizer:
             }
             model = ExtraTreesExpert(params=params)
             x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
-            model.fit(x_tr, y_tr)
+            if not model.fit(x_tr, y_tr):
+                raise optuna.TrialPruned("ExtraTrees fit failed")
             if len(x_va) == 0:
                 return 0.0
-            preds = model.predict_proba(x_va)
+            try:
+                preds = model.predict_proba(x_va)
+            except Exception as exc:  # pragma: no cover - defensive for Optuna
+                raise optuna.TrialPruned(f"ExtraTrees predict failed: {exc}")
             return self._objective_base(y_va, preds, None)
 
         study = self._run_study("ExtraTrees_Opt", objective, self.n_trials)
