@@ -146,9 +146,14 @@ def scan_imports(root_dir: Path) -> set[str]:
 def ensure_dependencies() -> None:
     """
     Main entry point: Scans code, checks installed packages, installs missing ones.
+    Can be skipped by setting FOREX_BOT_SKIP_DEPS=1 (useful on locked-down systems).
     """
     global _DEPS_CHECKED
     if _DEPS_CHECKED:
+        return
+    if os.environ.get("FOREX_BOT_SKIP_DEPS") == "1":
+        logger.info("Dependency bootstrap skipped via FOREX_BOT_SKIP_DEPS=1.")
+        _DEPS_CHECKED = True
         return
     _DEPS_CHECKED = True
 
@@ -236,12 +241,13 @@ def ensure_dependencies() -> None:
         logger.info("Installing GPU dependencies...")
         index_url = "https://download.pytorch.org/whl/cpu"
         if shutil.which("nvidia-smi"):
-             if is_py313:
-                 index_url = "https://download.pytorch.org/whl/nightly/cu124"
-             else:
-                 index_url = "https://download.pytorch.org/whl/cu121"
-        
-        _install(gpu_libs, index_url=index_url, pre=True)
+            if is_py313:
+                # Official 3.13 wheels for CUDA live under cu128 (stable) or nightly for newer.
+                index_url = "https://download.pytorch.org/whl/cu128"
+            else:
+                index_url = "https://download.pytorch.org/whl/cu121"
+
+        _install(gpu_libs, index_url=index_url, pre=is_py313)
 
     if os.environ.get("FOREX_BOT_DEPS_REEXEC", "") != "1":
         os.environ["FOREX_BOT_DEPS_REEXEC"] = "1"
@@ -249,24 +255,21 @@ def ensure_dependencies() -> None:
         os.execv(sys.executable, [sys.executable, *sys.argv])
 
 def _install(packages: list[str], index_url: str | None = None, pre: bool = False) -> None:
-    if not packages: return
-    
-    cmd = [sys.executable, "-m", "pip", "install", "--timeout", "120"]
-    cmd.append("--break-system-packages") 
-    
+    if not packages:
+        return
+
+    cmd = [sys.executable, "-m", "pip", "install", "--timeout", "120", "--break-system-packages"]
     if pre:
         cmd.append("--pre")
     if index_url:
         cmd.extend(["--index-url", index_url])
-    
-    final_pkgs = []
+
+    final_pkgs: list[str] = []
     for p in packages:
         if p in SPECIAL_SOURCES:
             final_pkgs.append(SPECIAL_SOURCES[p])
-        elif p in SPECIAL_SOURCES:
-             final_pkgs.append(SPECIAL_SOURCES[p])
         else:
-             final_pkgs.append(p)
-             
-    logger.info(f"Running pip: {' '.join(cmd)}")
-    subprocess.check_call(cmd)
+            final_pkgs.append(p)
+
+    logger.info(f"Running pip: {' '.join(cmd + final_pkgs)}")
+    subprocess.check_call(cmd + final_pkgs)

@@ -831,7 +831,15 @@ class TrainingService:
 
         if rank == 0:
             # --- RANK 0: Heavy Lifting ---
-            max_workers = max(1, min(self.settings.system.n_jobs, os.cpu_count() or 1))
+            # Allow overriding feature-engineering worker count via env to avoid pool crashes/OOM.
+            env_workers = os.getenv("FEATURE_WORKERS")
+            if env_workers:
+                try:
+                    max_workers = max(1, int(env_workers))
+                except ValueError:
+                    max_workers = max(1, min(self.settings.system.n_jobs, os.cpu_count() or 1))
+            else:
+                max_workers = max(1, min(self.settings.system.n_jobs, os.cpu_count() or 1))
             max_workers = max(1, min(max_workers, len(symbols)))
 
             analyzer = None
@@ -875,6 +883,24 @@ class TrainingService:
                         datasets.append((sym, ds))
                     except Exception as e:
                         logger.error(f"HPC Feature Gen failed: {e}")
+
+            # If any symbols failed in the pool, fall back to sequential for the missing ones.
+            got_syms = {s for s, _ in datasets}
+            missing_syms = [s for s in symbols if s not in got_syms]
+            if missing_syms:
+                logger.warning(
+                    f"HPC feature generation missing {len(missing_syms)}/{len(symbols)} symbols; "
+                    "retrying sequentially for the missing symbols."
+                )
+                for sym in missing_syms:
+                    try:
+                        frames = raw_frames_map.get(sym)
+                        if not frames:
+                            continue
+                        ds = self.feature_engineer.prepare(frames, news_features=news_map.get(sym), symbol=sym)
+                        datasets.append((sym, ds))
+                    except Exception as e:
+                        logger.error(f"Sequential feature gen failed for {sym}: {e}", exc_info=True)
 
             # Save for other ranks
             if is_ddp:

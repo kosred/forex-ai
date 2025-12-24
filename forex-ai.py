@@ -41,10 +41,13 @@ if __name__ == "__main__":
 
     # Defer heavy imports (deps auto-install) to normal mode only.
     try:
-        print("[INIT] Checking and auto-installing dependencies (Hardware-Aware)...", flush=True)
-        from forex_bot.core.deps import ensure_dependencies
+        if os.environ.get("FOREX_BOT_SKIP_DEPS", "0") != "1":
+            print("[INIT] Checking and auto-installing dependencies (Hardware-Aware)...", flush=True)
+            from forex_bot.core.deps import ensure_dependencies
 
-        ensure_dependencies()
+            ensure_dependencies()
+        else:
+            print("[INIT] Skipping dependency bootstrap (FOREX_BOT_SKIP_DEPS=1).", flush=True)
     except Exception as dep_err:
         print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
 
