@@ -924,10 +924,11 @@ class TrainingService:
                     logger.error(f"Rank {rank} failed to load datasets: {e}")
                     return
 
-            # All ranks proceed to train; restrict heavy training to rank 0 if desired.
-            # For now, we keep only rank 0 training to avoid duplicate work.
+            # Allow distributed training for deep models only.
             if rank != 0:
-                logger.info(f"Rank {rank}: Skipping training to avoid duplicated work.")
+                # For non-deep models, skip training on non-zero ranks to avoid duplication.
+                # Deep models will handle DDP internally when enabled.
+                logger.info(f"Rank {rank}: Skipping non-deep training to avoid duplicated work.")
                 return
 
         if not datasets:
