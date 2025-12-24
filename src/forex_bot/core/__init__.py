@@ -1,14 +1,5 @@
-from .config import Settings
-from .logging import setup_logging
-from .storage import MetricsRecorder, RiskLedger, StrategyLedger
-from .system import AutoTuner, HardwareProbe
+# Core package initialization
+# Eager imports removed to allow dependency bootstrapping to run first.
+# Use submodules directly (e.g. from forex_bot.core.config import Settings)
 
-__all__ = [
-    "Settings",
-    "setup_logging",
-    "MetricsRecorder",
-    "RiskLedger",
-    "StrategyLedger",
-    "AutoTuner",
-    "HardwareProbe",
-]
+__all__ = []
