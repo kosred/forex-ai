@@ -76,7 +76,6 @@ IMPORT_TO_PYPI = {
     "efficient_kan": "efficient-kan",
     "neuralforecast": "neuralforecast",
     "tslib": "tslib",
-    "pytorch_tabnet": "pytorch-tabnet",
 }
 
 # Known Standard Library modules to exclude (Python 3.10+)
@@ -201,6 +200,10 @@ def ensure_dependencies() -> None:
         # Map only known modules to packages; skip unknowns to avoid false positives.
         pkg = IMPORT_TO_PYPI.get(mod)
         if not pkg:
+            continue
+
+        # Skip packages known to lack wheels for Py3.13 (e.g., pytorch-tabnet).
+        if is_py313 and pkg in {"pytorch-tabnet"}:
             continue
 
         # Filter exclusions
