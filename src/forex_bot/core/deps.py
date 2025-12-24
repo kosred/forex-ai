@@ -27,13 +27,13 @@ IMPORT_TO_PYPI = {
     "PIL": "Pillow",
     "bs4": "beautifulsoup4",
     "metatrader5": "MetaTrader5",
-    "ta": "ta-lib",  # ambiguous, usually ta-lib or ta
+    "ta": "ta-lib",
     "talib": "TA-Lib",
     "tensorboard": "tensorboard",
     "torch": "torch",
     "torchvision": "torchvision",
     "torchaudio": "torchaudio",
-    "gym": "gymnasium",  # modern preference
+    "gym": "gymnasium",
     "gymnasium": "gymnasium",
     "stable_baselines3": "stable-baselines3[extra]",
     "sb3_contrib": "sb3-contrib",
@@ -79,10 +79,42 @@ IMPORT_TO_PYPI = {
     "pytorch_tabnet": "pytorch-tabnet",
 }
 
+# Known Standard Library modules to exclude (Python 3.10+)
+STDLIB_MODULES = {
+    "__future__", "_thread", "abc", "aifc", "argparse", "array", "ast", "asyncio",
+    "base64", "bdb", "binascii", "bisect", "builtins", "bz2", "calendar", "cgi",
+    "cgitb", "chunk", "cmath", "cmd", "code", "codecs", "codeop", "collections",
+    "colorsys", "compileall", "concurrent", "configparser", "contextlib", "contextvars",
+    "copy", "copyreg", "cProfile", "crypt", "csv", "ctypes", "curses", "dataclasses",
+    "datetime", "dbm", "decimal", "difflib", "dis", "distutils", "doctest", "email",
+    "encodings", "ensurepip", "enum", "errno", "faulthandler", "fcntl", "filecmp",
+    "fileinput", "fnmatch", "formatter", "fractions", "ftplib", "functools", "gc",
+    "getopt", "getpass", "gettext", "glob", "graphlib", "grp", "gzip", "hashlib",
+    "heapq", "hmac", "html", "http", "imaplib", "imghdr", "imp", "importlib",
+    "inspect", "io", "ipaddress", "itertools", "json", "keyword", "lib2to3",
+    "linecache", "locale", "logging", "lzma", "mailbox", "mailcap", "marshal",
+    "math", "mimetypes", "mmap", "modulefinder", "msvcrt", "multiprocessing",
+    "netrc", "nntplib", "ntpath", "numbers", "operator", "optparse", "os",
+    "pathlib", "pdb", "pickle", "pickletools", "pipes", "pkgutil", "platform",
+    "plistlib", "poplib", "posix", "posixpath", "pprint", "profile", "pstats",
+    "pty", "pwd", "py_compile", "pyclbr", "pydoc", "queue", "quopri", "random",
+    "re", "readline", "reprlib", "resource", "rlcompleter", "runpy", "sched",
+    "secrets", "select", "selectors", "shelve", "shlex", "shutil", "signal",
+    "site", "smtpd", "smtplib", "sndhdr", "socket", "socketserver", "spwd",
+    "sqlite3", "ssl", "stat", "statistics", "string", "stringprep", "struct",
+    "subprocess", "sunau", "symbol", "symtable", "sys", "sysconfig", "syslog",
+    "tabnanny", "tarfile", "telnetlib", "tempfile", "termios", "textwrap",
+    "threading", "time", "timeit", "tkinter", "token", "tokenize", "trace",
+    "traceback", "tracemalloc", "tty", "turtle", "turtledemo", "types", "typing",
+    "unicodedata", "unittest", "urllib", "uu", "uuid", "venv", "warnings",
+    "wave", "weakref", "webbrowser", "winreg", "winsound", "wsgiref", "xdrlib",
+    "xml", "xmlrpc", "zipapp", "zipfile", "zipimport", "zlib", "zoneinfo"
+}
+
 # Special handling for git dependencies or non-standard sources
 SPECIAL_SOURCES = {
     "efficient-kan": "git+https://github.com/Blealtan/efficient-kan.git",
-    "stable-baselines3[extra]": "stable-baselines3[extra]>=2.4.0", # Allow pre-release
+    "stable-baselines3[extra]": "stable-baselines3[extra]>=2.4.0",
 }
 
 def scan_imports(root_dir: Path) -> set[str]:
@@ -129,15 +161,40 @@ def ensure_dependencies() -> None:
 
     # 2. Scan Imports
     src_root = Path(__file__).resolve().parent.parent.parent # src/forex_bot/core/.. -> src/forex_bot -> src
+    
+    # Identify local modules to exclude
+    local_modules = set()
+    if src_root.exists():
+        for item in src_root.iterdir():
+            if item.is_dir() and (item / "__init__.py").exists():
+                local_modules.add(item.name)
+            elif item.is_file() and item.suffix == ".py":
+                local_modules.add(item.stem)
+                
+    # Also exclude subpackages of forex_bot specifically if running from there
+    forex_bot_dir = src_root / "forex_bot"
+    if forex_bot_dir.exists():
+         for item in forex_bot_dir.iterdir():
+            if item.is_dir() and (item / "__init__.py").exists():
+                local_modules.add(item.name)
+
     imported_modules = scan_imports(src_root)
     
     # 3. Resolve to PyPI packages
     required_packages = set()
     for mod in imported_modules:
+        if mod in STDLIB_MODULES:
+            continue
         if mod in sys.builtin_module_names:
             continue
+        if mod in local_modules:
+            continue
+        # Also exclude known internal module names that might be picked up
+        if mod in {"forex_bot", "src", "tests"}:
+            continue
+            
         # Map module -> package
-        pkg = IMPORT_TO_PYPI.get(mod, mod) # Default to module name if not in map
+        pkg = IMPORT_TO_PYPI.get(mod, mod) 
         
         # Filter exclusions
         if system != "windows" and pkg.lower() == "metatrader5":
@@ -162,7 +219,6 @@ def ensure_dependencies() -> None:
     logger.info(f"Found {len(missing)} missing dependencies: {missing}")
 
     # 5. Install Logic
-    # Separate PyTorch/GPU libs for special handling
     gpu_libs = []
     standard_libs = []
     
@@ -172,20 +228,14 @@ def ensure_dependencies() -> None:
         else:
             standard_libs.append(pkg)
 
-    # Install Standard Libs
     if standard_libs:
         logger.info("Installing standard dependencies...")
         _install(standard_libs, pre=is_py313)
 
-    # Install GPU Libs (Special Index Handling)
     if gpu_libs:
         logger.info("Installing GPU dependencies...")
-        # Simple heuristic for CUDA index
         index_url = "https://download.pytorch.org/whl/cpu"
-        # Check nvidia-smi
         if shutil.which("nvidia-smi"):
-             # For Py3.13 + GPU we might need nightly or specific index. 
-             # Defaulting to nightly for 3.13 compatibility if needed.
              if is_py313:
                  index_url = "https://download.pytorch.org/whl/nightly/cu124"
              else:
@@ -193,7 +243,6 @@ def ensure_dependencies() -> None:
         
         _install(gpu_libs, index_url=index_url, pre=True)
 
-    # Restart
     if os.environ.get("FOREX_BOT_DEPS_REEXEC", "") != "1":
         os.environ["FOREX_BOT_DEPS_REEXEC"] = "1"
         logger.info("Restarting process to load new dependencies...")
@@ -203,26 +252,21 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
     if not packages: return
     
     cmd = [sys.executable, "-m", "pip", "install", "--timeout", "120"]
-    cmd.append("--break-system-packages") # Modern Linux support
+    cmd.append("--break-system-packages") 
     
     if pre:
         cmd.append("--pre")
     if index_url:
         cmd.extend(["--index-url", index_url])
     
-    # Process packages to swap in special sources (git urls)
     final_pkgs = []
     for p in packages:
-        # Check EXACT match in special sources
         if p in SPECIAL_SOURCES:
             final_pkgs.append(SPECIAL_SOURCES[p])
-        # Check base name match (e.g. efficient-kan in IMPORT_TO_PYPI maps to efficient-kan, which is in SPECIAL)
         elif p in SPECIAL_SOURCES:
              final_pkgs.append(SPECIAL_SOURCES[p])
         else:
              final_pkgs.append(p)
              
-    cmd.extend(final_pkgs)
-    
     logger.info(f"Running pip: {' '.join(cmd)}")
     subprocess.check_call(cmd)
