@@ -51,8 +51,25 @@ if __name__ == "__main__":
     except Exception as dep_err:
         print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
 
-    # Auto-launch DDP when multiple GPUs are present (Linux only) and not already launched.
-    if os.name != "nt" and os.environ.get("FOREX_BOT_DDP_LAUNCHED") != "1":
+    # Auto-set GPU-related env hints for parallel model training (non-DDP).
+    # Uses all visible GPUs unless user overrides FOREX_BOT_MAX_GPUS.
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            os.environ.setdefault("FOREX_BOT_MAX_GPUS", str(gpu_count))
+            os.environ.setdefault("SYSTEM__NUM_GPUS", str(gpu_count))
+            os.environ.setdefault("SYSTEM__ENABLE_GPU_PREFERENCE", "gpu")
+    except Exception:
+        pass
+
+    # NOTE: Auto-DDP launch is opt-in via FOREX_BOT_ENABLE_DDP=1.
+    if (
+        os.name != "nt"
+        and os.environ.get("FOREX_BOT_DDP_LAUNCHED") != "1"
+        and os.environ.get("FOREX_BOT_ENABLE_DDP") == "1"
+    ):
         try:
             import torch
         except Exception:
@@ -64,7 +81,6 @@ if __name__ == "__main__":
 
                 env = os.environ.copy()
                 env["FOREX_BOT_DDP_LAUNCHED"] = "1"
-                # torchrun will spawn one process per GPU.
                 cmd = [
                     sys.executable,
                     "-m",

@@ -823,6 +823,7 @@ class TrainingService:
         # DDP Synchronization
         is_ddp = dist.is_available() and dist.is_initialized()
         rank = dist.get_rank() if is_ddp else 0
+        world_size = dist.get_world_size() if is_ddp else 1
 
         # Cache path for sharing data between ranks
         cache_path = Path(self.settings.system.cache_dir) / "hpc_datasets.pkl"
@@ -922,6 +923,12 @@ class TrainingService:
                 except Exception as e:
                     logger.error(f"Rank {rank} failed to load datasets: {e}")
                     return
+
+            # All ranks proceed to train; restrict heavy training to rank 0 if desired.
+            # For now, we keep only rank 0 training to avoid duplicate work.
+            if rank != 0:
+                logger.info(f"Rank {rank}: Skipping training to avoid duplicated work.")
+                return
 
         if not datasets:
             logger.error("HPC: No datasets generated.")
