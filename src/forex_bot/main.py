@@ -500,10 +500,10 @@ async def main_async():
         base_settings.system.mt5_required = True
         logger.info("[MODE] Operating System: WINDOWS -> Selected 'mt5_local' backend for Trading/Inference.")
     else:
-        # Default to simulated/paper for non-Windows unless configured otherwise
+        # Default to pure training mode for non-Windows when mt5_local is not available.
         if base_settings.system.broker_backend == "mt5_local":
-            logger.info("[MODE] Operating System: LINUX/OTHER -> 'mt5_local' not supported. Switching to 'simulated'.")
-            base_settings.system.broker_backend = "simulated"
+            logger.info("[MODE] Operating System: LINUX/OTHER -> 'mt5_local' not supported. Switching to 'training'.")
+            base_settings.system.broker_backend = "training"
         else:
             logger.info(
                 "[MODE] Operating System: LINUX/OTHER -> Keeping configured backend "

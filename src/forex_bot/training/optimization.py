@@ -883,7 +883,23 @@ class HyperparameterOptimizer:
 
         study = self._run_study("LightGBM_Opt", objective, self.n_trials)
         logger.info(f"Optuna LightGBM completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        return study.best_params
+        try:
+            return study.best_params
+        except ValueError:
+            # No completed trials; fall back to a safe default to keep pipeline running.
+            logger.error("LightGBM tuning produced no completed trials; using default params fallback.")
+            return {
+                "n_estimators": 200,
+                "num_leaves": 64,
+                "learning_rate": 0.05,
+                "feature_fraction": 0.8,
+                "bagging_fraction": 0.8,
+                "min_child_samples": 20,
+                "objective": "multiclass",
+                "num_class": y_train.nunique(),
+                "device_type": "cpu",
+                "max_bin": 255,
+            }
 
     def _optimize_random_forest(
         self,

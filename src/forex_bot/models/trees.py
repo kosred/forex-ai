@@ -325,6 +325,17 @@ class LightGBMExpert(ExpertModel):
             }
             params["class_weight"] = class_weight if class_weight else None
 
+            # Decide binary vs multiclass based on remapped labels
+            binary = len(uniq) <= 2
+            if binary:
+                params["objective"] = "binary"
+                params.pop("num_class", None)
+                eval_metric = "binary_logloss"
+            else:
+                params["objective"] = "multiclass"
+                params["num_class"] = params.get("num_class", len(uniq))
+                eval_metric = "multi_logloss"
+
             self.model = lgb.LGBMClassifier(**params)
             try:
                 self.model.fit(
