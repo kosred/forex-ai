@@ -864,9 +864,6 @@ class HyperparameterOptimizer:
                 "num_class": y_train.nunique(),  # Adapt for Meta-Labeling
                 "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
                 "verbosity": -1,
-                # Force CPU path during tuning; GPU LightGBM wheels are brittle across envs.
-                "device_type": "cpu",
-                "max_bin": 255,
             }
             model = LightGBMExpert(params=params)
             x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
