@@ -4,11 +4,15 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+
+# Thread-local storage for GPU assignment in parallel optimization
+_thread_local = threading.local()
 
 import numpy as np
 import pandas as pd
@@ -248,21 +252,17 @@ class HyperparameterOptimizer:
             """Run a single model optimization on assigned GPU."""
             if self._should_stop():
                 return name, {}
-            # Set CUDA_VISIBLE_DEVICES for this thread to force GPU assignment
-            old_env = os.environ.get("CUDA_VISIBLE_DEVICES")
-            if self.device_pool and gpu_id < len(self.device_pool):
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            # Set thread-local GPU assignment for _pick_device to use
+            _thread_local.forced_gpu = gpu_id if self.device_pool else None
             try:
+                logger.info(f"Starting {name} optimization on GPU {gpu_id}")
                 result = func(X_train, y_train, X_val, y_val, meta_val)
                 return name, result
             except Exception as e:
                 logger.error(f"Optimization for {name} failed: {e}")
                 return name, {}
             finally:
-                if old_env is not None:
-                    os.environ["CUDA_VISIBLE_DEVICES"] = old_env
-                elif "CUDA_VISIBLE_DEVICES" in os.environ:
-                    del os.environ["CUDA_VISIBLE_DEVICES"]
+                _thread_local.forced_gpu = None
 
         # Batch 1: Tree-based models (GPU-accelerated) - run in parallel across GPUs
         batch1_models = []
@@ -349,6 +349,10 @@ class HyperparameterOptimizer:
         return base
 
     def _pick_device(self, trial_index: int) -> str:
+        # Check thread-local forced GPU first (set by parallel model optimization)
+        forced_gpu = getattr(_thread_local, "forced_gpu", None)
+        if forced_gpu is not None and self.device_pool:
+            return f"cuda:{forced_gpu}"
         if self.device_pool:
             return self.device_pool[trial_index % len(self.device_pool)]
         return self.default_device or "cpu"
