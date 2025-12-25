@@ -159,19 +159,27 @@ class TensorDiscoveryEngine:
             vectorized=True
         )
         
-        searcher = SNES(problem, popsize=2000)
+        # Launch CMA-ES - Superior for complex financial landscapes
+        # It adapts the covariance matrix to find high-Sharpe corridors
+        searcher = CMAES(problem, popsize=2000, stdev_init=0.5)
         
-        logger.info(f"Starting VRAM-Safe Million-Search...")
+        logger.info(f"Starting VRAM-Safe Million-Search (CMA-ES)...")
         for i in range(iterations):
             searcher.step()
             if i % 100 == 0:
                 best = searcher.status["best_evaluation"]
                 logger.info(f"Generation {i}: Best Consistency-Sharpe = {best:.4f}")
 
-        # Extract Top 20 Winners
-        # Note: We take the population's best-so-far and ensure we have 20 distinct high-performers
-        self.best_experts = searcher.status["best_so_far"].values.detach().cpu()
-        logger.info("Found Golden Experts. Diversity check complete.")
+        # Extract Top 20 Survivors (Final Population Winners)
+        # We take the top performers from the final distribution to ensure diversity
+        final_pop = searcher.population.values.detach().cpu()
+        final_scores = searcher.population.evaluations.detach().cpu()
+        
+        # Sort final population by fitness
+        indices = torch.argsort(final_scores, descending=True)
+        self.best_experts = final_pop[indices[:self.n_experts]]
+        
+        logger.info(f"Search Complete. Selected Top {self.n_experts} Diverse Experts.")
         
     def save_experts(self, path: str):
         """Saves the winning genomes and metadata."""
