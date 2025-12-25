@@ -31,7 +31,7 @@ from .gpu.indicators import CUPY_AVAILABLE, atr_wicks_cupy, rsi_cupy, talib_gpu
 from .prep_utils import have_cudf
 from .smc import NUMBA_AVAILABLE
 from .specialized import add_smc_features, compute_obi_features, compute_volume_profile_features
-from .talib_mixer import TALIB_AVAILABLE, talib
+from .talib_mixer import TALIB_AVAILABLE, talib, ALL_INDICATORS, abstract
 
 if CUPY_AVAILABLE:
     import cupy as cp
@@ -247,20 +247,24 @@ class FeatureEngineer:
             df = df.to_pandas()
 
         # 2. Advanced Indicators (ADX, Stoch, CCI, MFI)
-        # We explicitly avoid talib_gpu here because it triggers the buggy CUDA FP8 headers
-        # and its results are 'not close to original'. Numba is 100% accurate and fast.
+        # Numba is preferred for speed/safety, but we also now inject full TA-Lib suite 
+        # to ensure the Deep Learning models have maximum information.
         df["adx"] = self._compute_adx_safe(df)
         df["stoch_k"], df["stoch_d"] = self._compute_stochastic_safe(df)
         df["cci"] = self._compute_cci_safe(df)
         
-        # MFI calculation (Numba or safe TA-Lib)
+        # Comprehensive TA-Lib Injection (Deep Learning Fuel)
         if TALIB_AVAILABLE:
+            df = self._compute_comprehensive_talib_features(df)
+        else:
+            # Fallback for minimal viable features if TA-Lib missing
             try:
-                df["mfi14"] = talib.MFI(df["high"], df["low"], df["close"], df["volume"], timeperiod=14)
+                if TALIB_AVAILABLE:
+                    df["mfi14"] = talib.MFI(df["high"], df["low"], df["close"], df["volume"], timeperiod=14)
+                else:
+                    df["mfi14"] = 50.0
             except Exception:
                 df["mfi14"] = 50.0
-        else:
-            df["mfi14"] = 50.0
 
         df = self._merge_indices(df)
 
@@ -492,6 +496,57 @@ class FeatureEngineer:
             metadata=meta,
             labels=labels,
         )
+
+    def _compute_comprehensive_talib_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Dynamically injects the massive TA-Lib indicator set (Unsupervised Mode).
+        Generates 150+ indicators and lets the models/genes decide what works.
+        """
+        if not TALIB_AVAILABLE:
+            return df
+            
+        try:
+            # Prepare inputs dictionary (standard TA-Lib abstract API format)
+            # Use float64 for calculation precision, but we'll cast results to float32
+            inputs = {
+                'open': df["open"].values.astype(np.float64),
+                'high': df["high"].values.astype(np.float64),
+                'low': df["low"].values.astype(np.float64),
+                'close': df["close"].values.astype(np.float64),
+                'volume': df["volume"].values.astype(np.float64) if "volume" in df.columns else np.random.random(len(df))
+            }
+
+            # Memory Guard: If dataset is huge, random sampling or specific prioritization might be needed.
+            # For now, we trust the VPS 30GB RAM to handle ~200 cols * 5M rows (~4GB).
+            
+            # Iterate through EVERYTHING
+            for ind_name in ALL_INDICATORS:
+                try:
+                    # abstract.Function is the magic key to "mix and match" without hardcoding
+                    func = abstract.Function(ind_name)
+                    
+                    # Compute
+                    res = func(inputs)
+                    
+                    # Handle Multi-Output Indicators (e.g. BBANDS -> upper, middle, lower)
+                    if isinstance(res, (list, tuple)):
+                        for i, arr in enumerate(res):
+                            # Prefix to avoid collisions with our manual features
+                            col_name = f"ta_{ind_name.lower()}_{i}"
+                            df[col_name] = arr.astype(np.float32)
+                    # Handle Single-Output Indicators (Series or Array)
+                    elif isinstance(res, (pd.Series, np.ndarray)):
+                        col_name = f"ta_{ind_name.lower()}"
+                        df[col_name] = res.astype(np.float32) if isinstance(res, np.ndarray) else res.values.astype(np.float32)
+                        
+                except Exception:
+                    # Some indicators might fail due to data length or missing inputs (e.g. MAVP)
+                    continue
+
+        except Exception as e:
+            logger.warning(f"TA-Lib comprehensive dynamic injection failed: {e}")
+        
+        return df.fillna(0.0)
 
     def _compute_atr_wicks_cpu(self, df):
         high, low, close = df["high"].values, df["low"].values, df["close"].values
