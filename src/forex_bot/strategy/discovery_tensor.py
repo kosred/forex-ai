@@ -112,17 +112,15 @@ class TensorDiscoveryEngine:
                 end_idx = min(start_idx + batch_size, n_samples)
                 data_slice = self.data_cube[:, start_idx:end_idx, :] # (TFs, Batch, Feats)
                 
-                # Logic accumulation (Avoid in-place += for EvoTorch ReadOnlyTensors)
-                slice_signals_list = []
+                # Running sum consensus (Avoids massive stack OOM)
+                combined_slice_signals = torch.zeros((pop_size, end_idx - start_idx), device=self.device)
+                
                 for tf_idx in range(self.data_cube.shape[0]):
                     # (Batch, Feats) @ (Pop, Feats).T -> (Batch, Pop)
                     tf_sig = torch.matmul(data_slice[tf_idx], logic_weights.t()) # (Batch, Pop)
-                    # Weighted: (Pop, 1) * (Pop, Batch)
-                    slice_signals_list.append(tf_weights[:, tf_idx].unsqueeze(1) * tf_sig.t())
+                    # Add weighted contribution directly
+                    combined_slice_signals += tf_weights[:, tf_idx].unsqueeze(1) * tf_sig.t()
                     del tf_sig
-                
-                # Sum the list to get final consensus for this slice
-                combined_slice_signals = torch.stack(slice_signals_list).sum(dim=0)
                 
                 # Trade Actions (Use torch.where to avoid modifying ReadOnlyTensors)
                 # actions: 1 for buy, -1 for sell, 0 for neutral
@@ -134,6 +132,15 @@ class TensorDiscoveryEngine:
                                       actions)
                 
                 # Returns
+                m1_close = self.ohlc_cube[0, start_idx:end_idx, 3]
+                rets = torch.zeros_like(m1_close)
+                rets[1:] = (m1_close[1:] - m1_close[:-1]) / (m1_close[:-1] + 1e-9)
+                
+                all_strategy_returns.append(actions * rets.unsqueeze(0))
+                
+                # Explicit cleanup
+                del combined_slice_signals, actions, rets
+                torch.cuda.empty_cache()
                 m1_close = self.ohlc_cube[0, start_idx:end_idx, 3]
                 rets = torch.zeros_like(m1_close)
                 rets[1:] = (m1_close[1:] - m1_close[:-1]) / (m1_close[:-1] + 1e-9)
