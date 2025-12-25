@@ -689,6 +689,17 @@ class TrainingService:
         if symbols:
             self.settings.system.symbol = symbols[0]
 
+        # Launch GPU-Native Expert Discovery BEFORE model training
+        logger.info("Launching GPU-Native Expert Discovery (Pooled Dataset)...")
+        from ..strategy.discovery_tensor import TensorDiscoveryEngine
+        discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=20)
+        
+        # We use the pooled datasets for discovery to find universal winners
+        # Note: we need to pass a dict of frames to discovery_tensor
+        # Since we already have the aligned 'datasets' list, we can pass that or convert
+        discovery_tensor.run_unsupervised_search(dict(datasets), iterations=1000)
+        discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
+
         logger.info(
             f"GLOBAL: Training pooled dataset (symbols={len(train_parts)}, rows={len(full_ds.X):,}, "
             f"features={len(full_ds.feature_names)})"
