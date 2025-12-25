@@ -165,7 +165,7 @@ class TensorDiscoveryEngine:
         for i in range(iterations):
             searcher.step()
             if i % 50 == 0:
-                best_val = getattr(searcher.best_so_far, "evaluation", 0.0)
+                best_val = searcher.status.get("best_eval", 0.0)
                 logger.info(f"Generation {i}: Global Best Fitness = {float(best_val):.4f}")
 
         # Final survivor extraction
