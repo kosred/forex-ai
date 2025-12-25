@@ -112,17 +112,17 @@ class TensorDiscoveryEngine:
                 end_idx = min(start_idx + batch_size, n_samples)
                 data_slice = self.data_cube[:, start_idx:end_idx, :] # (TFs, Batch, Feats)
                 
-                # Use sub-batches for logic weights to further reduce peak allocation
-                # (Batch, Feats) @ (Pop, Feats).T -> (Batch, Pop)
-                # We do this per TF
-                combined_slice_signals = torch.zeros((pop_size, end_idx - start_idx), device=self.device)
-                
+                # Logic accumulation (Avoid in-place += for EvoTorch ReadOnlyTensors)
+                slice_signals_list = []
                 for tf_idx in range(self.data_cube.shape[0]):
                     # (Batch, Feats) @ (Pop, Feats).T -> (Batch, Pop)
                     tf_sig = torch.matmul(data_slice[tf_idx], logic_weights.t()) # (Batch, Pop)
-                    # Apply TF weight: (Pop, 1) * (Pop, Batch) -> (Pop, Batch)
-                    combined_slice_signals += tf_weights[:, tf_idx].unsqueeze(1) * tf_sig.t()
+                    # Weighted: (Pop, 1) * (Pop, Batch)
+                    slice_signals_list.append(tf_weights[:, tf_idx].unsqueeze(1) * tf_sig.t())
                     del tf_sig
+                
+                # Sum the list to get final consensus for this slice
+                combined_slice_signals = torch.stack(slice_signals_list).sum(dim=0)
                 
                 # Trade Actions
                 actions = torch.zeros_like(combined_slice_signals)
