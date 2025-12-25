@@ -427,6 +427,51 @@ class FeatureEngineer:
                 sym[:, bucket] = 1.0
             symbol_df = pd.DataFrame(sym, index=df.index, columns=symbol_cols)
 
+        base_cols = [
+            "returns",
+            "ema_fast",
+            "ema_slow",
+            "rsi",
+            "realized_vol",
+            "ewma_vol",
+            "boll_width",
+            "zscore_close",
+            "upper_wick",
+            "lower_wick",
+            "session_asia",
+            "session_london",
+            "session_ny",
+            "fvg_direction",
+            "fvg_size",
+            "market_structure_trend",
+            "bos_event",
+            "choch_event",
+            "liquidity_sweep",
+            "order_block",
+            "smc_confluence",
+            "dist_liquidity",
+            "dist_fvg",
+            "premium_discount",
+            "inducement",
+            "adx",
+            "stoch_k",
+            "stoch_d",
+            "cci",
+            "dist_to_vwap",
+            "dist_to_poc",
+            "in_value_area",
+            "vol_imbalance",
+            "adl_slope",
+            "news_sentiment",
+            "news_confidence",
+            "news_count",
+            "news_recency_minutes",
+            "idx_dxy_ret",
+            "idx_eur_ret",
+            "mtf_confluence",
+            "base_signal",
+        ]
+
         # Dynamically collect all generated features (Base + TA-Lib + SMC + HTF)
         # This ensures our 'Unsupervised' approach actually passes all data to the models.
         all_numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
