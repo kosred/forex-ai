@@ -45,6 +45,35 @@ FEATURE_CACHE_VERSION = 5
 _compute_adx_numba = compute_adx_numba
 
 
+def to_numpy_safe(data: Any) -> np.ndarray:
+    """
+    Safely convert CuPy/CuDF/Pandas data to a NumPy array.
+    Prevents 'Implicit conversion to a NumPy array is not allowed' errors.
+    """
+    if data is None:
+        return np.array([])
+    
+    # 1. Handle CuPy
+    if cp is not None and isinstance(data, cp.ndarray):
+        return cp.asnumpy(data)
+    
+    # 2. Handle cuDF Series/DataFrame
+    if hasattr(data, "to_numpy"):
+        try:
+            return data.to_numpy()
+        except Exception:
+            pass
+            
+    if hasattr(data, "get"):
+        try:
+            return data.get()
+        except Exception:
+            pass
+            
+    # 3. Fallback to standard NumPy conversion
+    return np.asarray(data)
+
+
 class FeatureEngineer:
     """Feature engineering pipeline with autotuned optimization."""
 
@@ -474,9 +503,9 @@ class FeatureEngineer:
 
     def _compute_adx_safe(self, df: DataFrame, period: int = 14) -> Series:
         if NUMBA_AVAILABLE:
-            high = np.asarray(df["high"].values, dtype=np.float64)
-            low = np.asarray(df["low"].values, dtype=np.float64)
-            close = np.asarray(df["close"].values, dtype=np.float64)
+            high = to_numpy_safe(df["high"].values).astype(np.float64)
+            low = to_numpy_safe(df["low"].values).astype(np.float64)
+            close = to_numpy_safe(df["close"].values).astype(np.float64)
             return pd.Series(
                 compute_adx_numba(high, low, close, period), index=df.index
             )
@@ -484,18 +513,18 @@ class FeatureEngineer:
 
     def _compute_stochastic_safe(self, df: DataFrame, period: int = 14) -> tuple[Series, Series]:
         if NUMBA_AVAILABLE:
-            high = np.asarray(df["high"].values, dtype=np.float64)
-            low = np.asarray(df["low"].values, dtype=np.float64)
-            close = np.asarray(df["close"].values, dtype=np.float64)
+            high = to_numpy_safe(df["high"].values).astype(np.float64)
+            low = to_numpy_safe(df["low"].values).astype(np.float64)
+            close = to_numpy_safe(df["close"].values).astype(np.float64)
             k, d = compute_stochastic_numba(high, low, close, period)
             return pd.Series(k, index=df.index), pd.Series(d, index=df.index)
         return pd.Series(50.0, index=df.index), pd.Series(50.0, index=df.index)
 
     def _compute_cci_safe(self, df: DataFrame, period: int = 20) -> Series:
         if NUMBA_AVAILABLE:
-            high = np.asarray(df["high"].values, dtype=np.float64)
-            low = np.asarray(df["low"].values, dtype=np.float64)
-            close = np.asarray(df["close"].values, dtype=np.float64)
+            high = to_numpy_safe(df["high"].values).astype(np.float64)
+            low = to_numpy_safe(df["low"].values).astype(np.float64)
+            close = to_numpy_safe(df["close"].values).astype(np.float64)
             return pd.Series(
                 compute_cci_numba(high, low, close, period), index=df.index
             )
@@ -514,10 +543,10 @@ class FeatureEngineer:
                 idx = idx.tz_convert("UTC").tz_localize(None)
             dates_arr = idx.to_numpy(dtype="datetime64[D]").astype(np.int64)
             
-            high = np.asarray(df["high"].values, dtype=np.float64)
-            low = np.asarray(df["low"].values, dtype=np.float64)
-            close = np.asarray(df["close"].values, dtype=np.float64)
-            vol = np.asarray(df["volume"].values, dtype=np.float64)
+            high = to_numpy_safe(df["high"].values).astype(np.float64)
+            low = to_numpy_safe(df["low"].values).astype(np.float64)
+            close = to_numpy_safe(df["close"].values).astype(np.float64)
+            vol = to_numpy_safe(df["volume"].values).astype(np.float64)
             
             return pd.Series(
                 compute_vwap_numba(
@@ -542,14 +571,14 @@ class FeatureEngineer:
                     vals = rsi_cupy(cp.asarray(df["close"].values), period=14)
                     df["rsi"] = pd.Series(cp.asnumpy(vals), index=df.index)
                 except Exception:
-                    close_np = np.asarray(df["close"].values, dtype=np.float64)
+                    close_np = to_numpy_safe(df["close"].values).astype(np.float64)
                     df["rsi"] = (
                         rsi_vectorized_numba(close_np, period=14)
                         if NUMBA_AVAILABLE
                         else rsi_pandas(df["close"], period=14)
                     )
             elif NUMBA_AVAILABLE:
-                close_np = np.asarray(df["close"].values, dtype=np.float64)
+                close_np = to_numpy_safe(df["close"].values).astype(np.float64)
                 df["rsi"] = rsi_vectorized_numba(close_np, period=14)
             else:
                 df["rsi"] = rsi_pandas(df["close"], period=14)
@@ -661,11 +690,11 @@ class FeatureEngineer:
         return freshness, atr_disp, max_levels
 
     def _meta_label_outcomes(self, df: DataFrame, base_signals: Series) -> Series:
-        close = np.asarray(df["close"].values, dtype=np.float64)
-        high = np.asarray(df["high"].values, dtype=np.float64)
-        low = np.asarray(df["low"].values, dtype=np.float64)
-        atr = np.asarray(df["atr"].values, dtype=np.float64)
-        sigs = np.asarray(base_signals.values, dtype=np.int8)
+        close = to_numpy_safe(df["close"].values).astype(np.float64)
+        high = to_numpy_safe(df["high"].values).astype(np.float64)
+        low = to_numpy_safe(df["low"].values).astype(np.float64)
+        atr = to_numpy_safe(df["atr"].values).astype(np.float64)
+        sigs = to_numpy_safe(base_signals.values).astype(np.int8)
         
         labels_arr = compute_meta_labels_atr_numba(
             close,
