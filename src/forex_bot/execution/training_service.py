@@ -689,17 +689,6 @@ class TrainingService:
         if symbols:
             self.settings.system.symbol = symbols[0]
 
-        # Launch GPU-Native Expert Discovery BEFORE model training
-        logger.info("Launching GPU-Native Expert Discovery (Pooled Dataset)...")
-        from ..strategy.discovery_tensor import TensorDiscoveryEngine
-        discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=20)
-        
-        # We use the pooled datasets for discovery to find universal winners
-        # Note: we need to pass a dict of frames to discovery_tensor
-        # Since we already have the aligned 'datasets' list, we can pass that or convert
-        discovery_tensor.run_unsupervised_search(dict(datasets), iterations=1000)
-        discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
-
         logger.info(
             f"GLOBAL: Training pooled dataset (symbols={len(train_parts)}, rows={len(full_ds.X):,}, "
             f"features={len(full_ds.feature_names)})"
@@ -919,6 +908,9 @@ class TrainingService:
                     except Exception as e:
                         logger.error(f"Sequential feature gen failed for {sym}: {e}", exc_info=True)
 
+        if rank == 0:
+            # ... (Existing feature gen code)
+            
             # Save for other ranks
             if is_ddp:
                 try:
@@ -926,6 +918,17 @@ class TrainingService:
                     joblib.dump(datasets, cache_path)
                 except Exception as e:
                     logger.error(f"Failed to save HPC datasets: {e}")
+
+            # --- EXPERT DISCOVERY (Rank 0 only) ---
+            # Now that all symbols are loaded in raw_frames_map, find global experts
+            logger.info("Launching GPU-Native Expert Discovery (Multi-Symbol)...")
+            from ..strategy.discovery_tensor import TensorDiscoveryEngine
+            discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=20)
+            
+            # We pick the largest symbol's timeframe set as the candidate for multi-TF discovery
+            # (In Global mode, we look for experts that work universally)
+            discovery_tensor.run_unsupervised_search(raw_frames_map["EURUSD"] if "EURUSD" in raw_frames_map else next(iter(raw_frames_map.values())), iterations=1000)
+            discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
         # --- BARRIER ---
         if is_ddp:

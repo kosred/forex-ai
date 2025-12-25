@@ -29,46 +29,54 @@ class TensorDiscoveryEngine:
     def _prepare_tensor_cube(self, frames: Dict[str, pd.DataFrame]):
         """
         Aligns all timeframes into a single GPU Tensor Cube.
+        Uses M1 as the master index to avoid empty intersections.
         """
         logger.info("Aligning Multi-Timeframe Data into GPU Tensor Cube...")
         
-        # Find common index (the most recent data available across all)
-        common_idx = None
-        for tf in self.timeframes:
-            if tf in frames:
-                if common_idx is None:
-                    common_idx = frames[tf].index
-                else:
-                    common_idx = common_idx.intersection(frames[tf].index)
+        # 1. Determine Master Index (Prefer M1)
+        master_tf = "M1"
+        if master_tf not in frames:
+            # Fallback to the first available timeframe
+            master_tf = next(iter(frames.keys()))
+            logger.warning(f"M1 not found, using {master_tf} as master index for discovery.")
+            
+        master_df = frames[master_tf]
+        master_idx = master_df.index
         
-        if common_idx is None:
-            raise ValueError("No overlapping data found for timeframes.")
-
-        # Subset and normalize
         cube_list = []
         ohlc_list = []
         
+        # 2. Reindex all target timeframes to the master index
         for tf in self.timeframes:
-            df = frames[tf].reindex(common_idx).ffill().fillna(0.0)
-            
-            # Extract features (normalized)
-            features = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
-            f_mean = features.mean(axis=0)
-            f_std = features.std(axis=0) + 1e-6
-            norm_features = (features - f_mean) / f_std
-            
-            # OHLC for backtesting
-            ohlc = df[['open', 'high', 'low', 'close']].to_numpy(dtype=np.float32)
-            
-            cube_list.append(torch.from_tensor(norm_features))
-            ohlc_list.append(torch.from_tensor(ohlc))
+            if tf in frames:
+                # Align to master M1 timeline with forward-fill
+                df = frames[tf].reindex(master_idx, method='ffill').fillna(method='bfill').fillna(0.0)
+                
+                # Extract features (numeric only)
+                features = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+                
+                # Robust Normalization
+                f_mean = features.mean(axis=0)
+                f_std = np.maximum(features.std(axis=0), 1e-6)
+                norm_features = (features - f_mean) / f_std
+                
+                # OHLC for backtesting (standardized columns)
+                ohlc = df[['open', 'high', 'low', 'close']].to_numpy(dtype=np.float32)
+                
+                cube_list.append(torch.from_numpy(norm_features))
+                ohlc_list.append(torch.from_numpy(ohlc))
+            else:
+                logger.debug(f"Timeframe {tf} missing from discovery input; skipping.")
 
-        # Shape: (Num_TFs, Samples, Features)
+        if not cube_list:
+            raise ValueError(f"No valid timeframes could be aligned for discovery. Available: {list(frames.keys())}")
+
+        # Final Tensor Stack: (Found_TFs, Samples, Features)
         self.data_cube = torch.stack(cube_list).to(self.device)
         self.ohlc_cube = torch.stack(ohlc_list).to(self.device)
         self.n_features = self.data_cube.shape[2]
         
-        logger.info(f"Tensor Cube Ready: {self.data_cube.shape}")
+        logger.info(f"Tensor Cube Ready: {self.data_cube.shape} (Master: {master_tf})")
 
     def run_unsupervised_search(self, frames: Dict[str, pd.DataFrame], iterations: int = 1000):
         """
