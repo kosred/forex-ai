@@ -427,54 +427,21 @@ class FeatureEngineer:
                 sym[:, bucket] = 1.0
             symbol_df = pd.DataFrame(sym, index=df.index, columns=symbol_cols)
 
-        base_cols = [
-            "returns",
-            "ema_fast",
-            "ema_slow",
-            "rsi",
-            "realized_vol",
-            "ewma_vol",
-            "boll_width",
-            "zscore_close",
-            "upper_wick",
-            "lower_wick",
-            "session_asia",
-            "session_london",
-            "session_ny",
-            "fvg_direction",
-            "fvg_size",
-            "market_structure_trend",
-            "bos_event",
-            "choch_event",
-            "liquidity_sweep",
-            "order_block",
-            "smc_confluence",
-            "dist_liquidity",
-            "dist_fvg",
-            "premium_discount",
-            "inducement",
-            "adx",
-            "stoch_k",
-            "stoch_d",
-            "cci",
-            "dist_to_vwap",
-            "dist_to_poc",
-            "in_value_area",
-            "vol_imbalance",
-            "adl_slope",
-            "news_sentiment",
-            "news_confidence",
-            "news_count",
-            "news_recency_minutes",
-            "idx_dxy_ret",
-            "idx_eur_ret",
-            "mtf_confluence",
-            "base_signal",
-        ]
-        cols = base_cols + htf_cols + symbol_cols
+        # Dynamically collect all generated features (Base + TA-Lib + SMC + HTF)
+        # This ensures our 'Unsupervised' approach actually passes all data to the models.
+        all_numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        
+        # We prioritize our core columns but include everything starting with ta_ or smc_
+        dynamic_features = [c for c in all_numeric_cols if c.startswith("ta_") or c.startswith("smc_") or c.startswith("idx_")]
+        
+        cols = base_cols + htf_cols + dynamic_features
+        # Deduplicate while preserving order
+        cols = list(dict.fromkeys(cols))
+        # Ensure symbol_hash columns are added last
+        cols = [c for c in cols if not c.startswith("symbol_hash_")] + symbol_cols
 
-        # Build X without mutating df column-by-column (faster, avoids fragmentation).
-        X = df.reindex(columns=(base_cols + htf_cols), fill_value=0.0)
+        # Build X using the complete dynamic column set
+        X = df.reindex(columns=[c for c in cols if c in df.columns], fill_value=0.0)
         X["base_signal"] = base_signals.to_numpy(dtype=np.float32, copy=False)
         if symbol_df is not None:
             X = pd.concat([X, symbol_df], axis=1)
