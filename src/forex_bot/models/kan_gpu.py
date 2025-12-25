@@ -66,9 +66,9 @@ class KANExpert(ExpertModel):
 
         self.input_dim = X.shape[1]
 
-        # Convert to tensors
-        X_t = torch.as_tensor(dataframe_to_float32_numpy(X), dtype=torch.float32, device=self.device)
-        y_t = torch.as_tensor(y.values + 1, dtype=torch.long, device=self.device)  # -1,0,1 -> 0,1,2
+        # Convert to tensors on CPU to avoid VRAM OOM
+        X_t = torch.as_tensor(dataframe_to_float32_numpy(X), dtype=torch.float32, device="cpu")
+        y_t = torch.as_tensor(y.values + 1, dtype=torch.long, device="cpu")  # -1,0,1 -> 0,1,2
 
         # KAN library expects [Input -> Hidden -> Output] layers list
         # We construct a simple 2-layer KAN: Input -> Hidden -> 3 (Classes)
@@ -125,6 +125,10 @@ class KANExpert(ExpertModel):
 
             total_loss = 0
             for bx, by in loader:
+                # Move batch to device
+                bx = bx.to(self.device, non_blocking=is_cuda)
+                by = by.to(self.device, non_blocking=is_cuda)
+
                 optimizer.zero_grad()
                 logits = self.model(bx)
                 loss = criterion(logits, by)

@@ -121,10 +121,14 @@ class NBeatsExpert(ExpertModel):
         X_train, X_val = X.iloc[:split], X.iloc[split:]
         y_train, y_val = y.iloc[:split], y.iloc[split:]
 
-        X_t = torch.as_tensor(dataframe_to_float32_numpy(X_train), dtype=torch.float32, device=self.device)
-        y_t = torch.as_tensor(y_train.values + 1, dtype=torch.long, device=self.device)
-        X_v = torch.as_tensor(dataframe_to_float32_numpy(X_val), dtype=torch.float32, device=self.device)
-        y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device=self.device)
+        # Keep data on CPU initially to avoid VRAM OOM (22M rows > 16GB VRAM)
+        # Batches will be moved to GPU in the loop
+        X_t = torch.as_tensor(dataframe_to_float32_numpy(X_train), dtype=torch.float32, device="cpu")
+        y_t = torch.as_tensor(y_train.values + 1, dtype=torch.long, device="cpu")
+        
+        # Validation set can be on GPU if small enough, but safer on CPU for consistency
+        X_v = torch.as_tensor(dataframe_to_float32_numpy(X_val), dtype=torch.float32, device="cpu")
+        y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device="cpu")
 
         dataset = TensorDataset(X_t, y_t)
 
@@ -221,8 +225,13 @@ class NBeatsExpert(ExpertModel):
             if len(X_val) > 0:
                 self.model.eval()
                 with torch.no_grad():
-                    val_out = self.model(X_v)
-                    val_loss = criterion(val_out, y_v).item()
+                    # Move val data to GPU in chunks or just handle it if it fits (likely fits if < 2GB)
+                    # But to be safe, we should probably batch it too. For now, we assume X_v fits or we risk OOM.
+                    # Given X_v is 15% of 17GB ~ 2.5GB, it fits easily in 16GB VRAM.
+                    X_v_gpu = X_v.to(self.device)
+                    y_v_gpu = y_v.to(self.device)
+                    val_out = self.model(X_v_gpu)
+                    val_loss = criterion(val_out, y_v_gpu).item()
                 self.model.train()
                 if early_stopper(val_loss):
                     break

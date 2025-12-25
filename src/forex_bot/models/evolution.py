@@ -173,6 +173,133 @@ def _loss_gpu(
     return float(cp.asnumpy((total_loss / n) + reg))
 
 
+def _loss_batch_gpu(
+    thetas: list[np.ndarray] | np.ndarray,
+    x_norm_cp: Any,
+    yb_cp: Any,
+    weight_decay: float,
+    d: int,
+    hidden: int,
+    gpu_id: int | None,
+    *,
+    row_idx: Any | None = None,
+    class_idx: Any | None = None,
+    batch_size: int = 8192,
+) -> list[float]:
+    """
+    Vectorized batch loss calculation on GPU.
+    Computes loss for the entire population in parallel using batched matmul.
+    """
+    if not CUPY_AVAILABLE or x_norm_cp is None or yb_cp is None:
+        raise RuntimeError("GPU path unavailable")
+    if gpu_id is not None:
+        cp.cuda.Device(gpu_id).use()
+
+    # Stack population params: (Pop, Theta_Dim)
+    thetas_cp = cp.asarray(thetas)
+    pop_size = thetas_cp.shape[0]
+
+    # Unpack weights for the entire population
+    # Layout: [W1 (d*h) | b1 (h) | W2 (h*3) | b2 (3)]
+    idx = 0
+    w1_size = d * hidden
+    W1 = thetas_cp[:, idx : idx + w1_size].reshape(pop_size, d, hidden)
+    idx += w1_size
+    b1_size = hidden
+    B1 = thetas_cp[:, idx : idx + b1_size].reshape(pop_size, 1, hidden)
+    idx += b1_size
+    w2_size = hidden * 3
+    W2 = thetas_cp[:, idx : idx + w2_size].reshape(pop_size, hidden, 3)
+    idx += w2_size
+    B2 = thetas_cp[:, idx : idx + 3].reshape(pop_size, 1, 3)
+
+    reg = weight_decay * cp.sum(thetas_cp * thetas_cp, axis=1) # (Pop,)
+    n_samples = x_norm_cp.shape[0]
+    total_loss = cp.zeros(pop_size, dtype=cp.float32)
+
+    # Process samples in chunks to manage VRAM
+    # We broadcast (Pop, 1, D, H) against (1, Batch, D) -> (Pop, Batch, H)
+    for start in range(0, n_samples, batch_size):
+        end = min(n_samples, start + batch_size)
+        x_batch = x_norm_cp[start:end] # (Batch, D)
+        y_batch = yb_cp[start:end]     # (Batch,)
+
+        if class_idx is not None:
+            c_batch = class_idx[start:end]
+        else:
+            c_batch = y_batch.astype(cp.int64) + 1
+
+        # Vectorized Forward Pass
+        # X: (Batch, D) -> (1, Batch, D) for broadcasting
+        x_b = x_batch[None, :, :]
+        
+        # Layer 1: (Pop, Batch, H) = (Pop, 1, D, H) * (1, Batch, D, 1) ?? No, manual broadcast or matmul
+        # Easiest: Pop loop is slow? No, use batched matmul (bmm)
+        # Reshape X for matmul: (Batch, D)
+        # We need (Pop, Batch, H). 
+        # Standard: X @ W1[i] + B1[i]. 
+        # Optimized: Concatenate X into a huge batch? No.
+        # Use cp.matmul with broadcasting:
+        # W1: (Pop, D, H)
+        # X: (Batch, D) -> need (Pop, Batch, D) to matmul? Or (Batch, D) @ (Pop, D, H)?
+        # (Batch, D) @ (D, H) = (Batch, H). 
+        # We have Pop matrices.
+        # Einstein Summation is cleanest: 'pdh,bd->pbh'
+        # P=Pop, D=Dim, H=Hidden, B=Batch
+        # cp.tensordot or manual loop? CuPy einsum is fast.
+        
+        # Hidden Act: tanh(X @ W1 + B1)
+        # Using tensordot/matmul:
+        # X (Batch, D), W1 (Pop, D, H) -> (Pop, Batch, H) via broadcast
+        # Since X is shared, we can compute X @ W1[p] in parallel?
+        # Actually, simpler: (Pop, Batch, H) = cp.matmul(x_b, W1) ? No dimensions mismatch
+        
+        # Let's use einsum for clarity and speed on GPU
+        # hidden_pre = cp.einsum('bd,pdh->pbh', x_batch, W1) + B1 # B1 broadcasts (Pop, 1, Hidden) -> (Pop, Batch, Hidden)
+        hidden_pre = cp.tensordot(x_batch, W1, axes=([1],[1])) # Returns (Batch, Pop, Hidden) -> swap to (Pop, Batch, Hidden)
+        hidden_pre = cp.swapaxes(hidden_pre, 0, 1) + B1
+        
+        hidden_act = cp.tanh(hidden_pre)
+
+        # Logits: (Pop, Batch, 3)
+        # W2: (Pop, Hidden, 3)
+        # logits = cp.einsum('pbh,phc->pbc', hidden_act, W2) + B2
+        # Use matmul since dimensions align: (Pop, Batch, H) @ (Pop, H, 3) -> (Pop, Batch, 3)
+        logits = cp.matmul(hidden_act, W2) + B2
+        
+        # Softmax & Loss
+        # logits: (Pop, Batch, 3)
+        max_logits = cp.max(logits, axis=2, keepdims=True)
+        exp_z = cp.exp(logits - max_logits)
+        probs = exp_z / (cp.sum(exp_z, axis=2, keepdims=True) + 1e-9)
+
+        # Gather true class probs: (Pop, Batch)
+        # c_batch: (Batch,) -> Broadcast to (Pop, Batch)
+        # We need specific indices.
+        # Flat indexing is often faster.
+        # Probs shape: (Pop, Batch, 3)
+        # We want probs[p, b, c_batch[b]] for all p,b
+        
+        # Create grid indices
+        # pop_idx: (Pop, 1)
+        # batch_idx: (1, Batch)
+        # c_idx: (1, Batch)
+        # gather_idx = c_idx
+        
+        # Using cp.take_along_axis is robust
+        # c_batch_expanded = c_batch[None, :, None] # (1, Batch, 1)
+        # p_true = cp.take_along_axis(probs, c_batch_expanded, axis=2).squeeze(2) # (Pop, Batch)
+        
+        # Manual indexing for speed if needed, but take_along_axis is good
+        c_exp = c_batch[None, :, None]
+        p_true = cp.take_along_axis(probs, c_exp, axis=2).squeeze(2)
+
+        total_loss += -cp.sum(cp.log(p_true + 1e-9), axis=1)
+
+    mean_loss = (total_loss / n_samples) + reg
+    return [float(l) for l in mean_loss.tolist()]
+
+
 def _run_island(
     args: tuple[
         int,
@@ -243,6 +370,7 @@ def _run_island(
             class_idx_cp = None
 
     def _loss_local(theta_vec: np.ndarray) -> float:
+        # Fallback for single evaluations (best candidate check)
         if use_gpu:
             try:
                 return _loss_gpu(
@@ -266,7 +394,27 @@ def _run_island(
         es = cma.CMAEvolutionStrategy(x0, sigma, opts)
         while not es.stop() and (time.time() - start) < time_budget:
             xc = es.ask()
-            es.tell(xc, [_loss_local(np.asarray(x)) for x in xc])
+            
+            # Vectorized Population Evaluation
+            if use_gpu:
+                try:
+                    fitness_values = _loss_batch_gpu(
+                        xc,
+                        x_norm_cp,
+                        y_cp,
+                        weight_decay,
+                        d,
+                        hidden,
+                        gpu_id,
+                        row_idx=row_idx_cp,
+                        class_idx=class_idx_cp
+                    )
+                    es.tell(xc, fitness_values)
+                except Exception as e:
+                    logger.warning(f"Batch GPU Evo failed, falling back to sequential: {e}")
+                    es.tell(xc, [_loss_local(np.asarray(x)) for x in xc])
+            else:
+                es.tell(xc, [_loss_local(np.asarray(x)) for x in xc])
 
     candidate = np.asarray(es.result.xbest, dtype=float)
     candidate_loss = _loss_local(candidate)

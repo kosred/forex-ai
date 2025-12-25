@@ -248,95 +248,98 @@ class HyperparameterOptimizer:
         # Group models into parallel batches - each batch runs on all GPUs simultaneously
         n_gpus = len(self.device_pool) if self.device_pool else 1
 
-        def run_optimization(name: str, func: Callable, gpu_id: int) -> tuple[str, dict]:
-            """Run a single model optimization on assigned GPU."""
-            if self._should_stop():
-                return name, {}
-            # Set thread-local GPU assignment for _pick_device to use
-            _thread_local.forced_gpu = gpu_id if self.device_pool else None
-            try:
-                logger.info(f"Starting {name} optimization on GPU {gpu_id}")
-                result = func(X_train, y_train, X_val, y_val, meta_val)
-                return name, result
-            except Exception as e:
-                logger.error(f"Optimization for {name} failed: {e}")
-                return name, {}
-            finally:
-                _thread_local.forced_gpu = None
-
-        # Batch 1: Tree-based models (GPU-accelerated) - run in parallel across GPUs
+        # Batch 1: Tree-based models (GPU-accelerated) - run SEQUENTIALLY to avoid CUDA context conflicts
+        # Using ThreadPoolExecutor here causes "cudaErrorInvalidResourceHandle" because cuML and Torch
+        # fight over the GPU context in the same process.
         batch1_models = []
         if LGBM_AVAILABLE:
             batch1_models.append(("LightGBM", self._optimize_lgbm, 0))
-        batch1_models.append(("RandomForest", self._optimize_random_forest, 1 % n_gpus))
-        batch1_models.append(("ExtraTrees", self._optimize_extra_trees, 2 % n_gpus))
+        batch1_models.append(("RandomForest", self._optimize_random_forest, 0))
+        batch1_models.append(("ExtraTrees", self._optimize_extra_trees, 0))
 
-        if n_gpus > 1 and len(batch1_models) > 1:
-            logger.info(f"Running {len(batch1_models)} tree models in PARALLEL across {n_gpus} GPUs")
-            with ThreadPoolExecutor(max_workers=min(len(batch1_models), n_gpus)) as executor:
-                futures = {executor.submit(run_optimization, n, f, g): n for n, f, g in batch1_models}
-                for future in as_completed(futures):
-                    name, result = future.result()
-                    best_params[name] = result
-                    logger.info(f"Completed parallel optimization: {name}")
-        else:
-            for name, func, _ in batch1_models:
-                if self._should_stop():
-                    break
+        for name, func, _ in batch1_models:
+            if self._should_stop():
+                logger.info("Stop requested; skipping remaining optimization studies.")
+                return best_params
+            try:
+                # Force cleanup before starting next model type
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                
+                logger.info(f"Starting {name} optimization (Sequential Mode)")
                 best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
+            except Exception as e:
+                logger.error(f"Optimization for {name} failed: {e}")
 
         if self._should_stop():
             logger.info("Stop requested; skipping remaining optimization studies.")
             return best_params
 
-        # Batch 2: Neural network models - run in parallel across GPUs
+        # Batch 2: Neural network models - run SEQUENTIALLY
+        # Note: Internal Optuna trials still run in PARALLEL across all 4 GPUs.
         batch2_models = [
             ("TabNet", self._optimize_tabnet, 0),
-            ("N-BEATS", self._optimize_nbeats, 1 % n_gpus),
-            ("TiDE", self._optimize_tide, 2 % n_gpus),
-            ("KAN", self._optimize_kan, 3 % n_gpus),
+            ("N-BEATS", self._optimize_nbeats, 0),
+            ("TiDE", self._optimize_tide, 0),
+            ("KAN", self._optimize_kan, 0),
         ]
 
-        if n_gpus > 1:
-            logger.info(f"Running {len(batch2_models)} neural models in PARALLEL across {n_gpus} GPUs")
-            with ThreadPoolExecutor(max_workers=min(len(batch2_models), n_gpus)) as executor:
-                futures = {executor.submit(run_optimization, n, f, g): n for n, f, g in batch2_models}
-                for future in as_completed(futures):
-                    name, result = future.result()
-                    best_params[name] = result
-                    logger.info(f"Completed parallel optimization: {name}")
-        else:
-            for name, func, _ in batch2_models:
-                if self._should_stop():
-                    break
+        for name, func, _ in batch2_models:
+            if self._should_stop():
+                logger.info("Stop requested; skipping remaining optimization studies.")
+                return best_params
+            try:
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+                logger.info(f"Starting {name} optimization (Sequential Mode)")
                 best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
+            except Exception as e:
+                logger.error(f"Optimization for {name} failed: {e}")
 
         if self._should_stop():
             logger.info("Stop requested; skipping remaining optimization studies.")
             return best_params
 
-        # Batch 3: Transformer + RL models - run in parallel
+        # Batch 3: Transformer + RL models - run SEQUENTIALLY
         batch3_models = [("Transformer", self._optimize_transformer, 0)]
         if hasattr(RLExpertPPO, "__init__") and "rl_ppo" in self.settings.models.ml_models:
-            batch3_models.append(("RL_PPO", self._optimize_rl_ppo, 1 % n_gpus))
+            batch3_models.append(("RL_PPO", self._optimize_rl_ppo, 0))
         if hasattr(RLExpertSAC, "__init__") and "rl_sac" in self.settings.models.ml_models:
-            batch3_models.append(("RL_SAC", self._optimize_rl_sac, 2 % n_gpus))
+            batch3_models.append(("RL_SAC", self._optimize_rl_sac, 0))
         if EvoExpertCMA:
-            batch3_models.append(("Neuroevolution", self._optimize_neuroevolution, 3 % n_gpus))
+            batch3_models.append(("Neuroevolution", self._optimize_neuroevolution, 0))
 
-        if n_gpus > 1 and len(batch3_models) > 1:
-            logger.info(f"Running {len(batch3_models)} advanced models in PARALLEL across {n_gpus} GPUs")
-            with ThreadPoolExecutor(max_workers=min(len(batch3_models), n_gpus)) as executor:
-                futures = {executor.submit(run_optimization, n, f, g): n for n, f, g in batch3_models}
-                for future in as_completed(futures):
-                    name, result = future.result()
-                    best_params[name] = result
-                    logger.info(f"Completed parallel optimization: {name}")
-        else:
-            for name, func, _ in batch3_models:
-                if self._should_stop():
-                    break
+        for name, func, _ in batch3_models:
+            if self._should_stop():
+                logger.info("Stop requested; skipping remaining optimization studies.")
+                return best_params
+            try:
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+                logger.info(f"Starting {name} optimization (Sequential Mode)")
                 best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
+            except Exception as e:
+                logger.error(f"Optimization for {name} failed: {e}")
 
         self._save_params(best_params)
         return best_params

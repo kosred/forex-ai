@@ -233,40 +233,66 @@ class TransformerExpertTorch(ExpertModel):
         tf_names = self.tf_names
         base_feats = self.base_feats
         input_dim = self.input_dim
+        num_tf = len(tf_names)
+        n_samples = len(x)
+
+        # Vectorized pre-processing: Pre-allocate 3D array (N, T, F)
+        # This consumes more RAM upfront but avoids the massive CPU bottleneck of row-wise processing during training.
+        X_arr = np.zeros((n_samples, num_tf, input_dim), dtype=np.float32)
+
+        # 1. Map columns to their (t, f) indices
+        # We prefer "M5_close" -> t=idx(M5), f=idx(close)
+        # Base features (no prefix) map to t=0 (first timeframe)
+        
+        # Create a mapping of column name -> (t_idx, f_idx)
+        col_map = {}
+        
+        # Pre-compute indices for fast lookup
+        tf_idx_map = {name: i for i, name in enumerate(tf_names)}
+        feat_idx_map = {name: i for i, name in enumerate(base_feats)}
+
+        for col in x.columns:
+            # Try to match "TF_Feature" pattern
+            matched = False
+            for tf in tf_names:
+                if col.startswith(f"{tf}_"):
+                    feat_part = col[len(tf)+1:]
+                    if feat_part in feat_idx_map:
+                        t_idx = tf_idx_map[tf]
+                        f_idx = feat_idx_map[feat_part]
+                        col_map[col] = (t_idx, f_idx)
+                        matched = True
+                        break
+            
+            # Fallback: Treat as base feature for first timeframe if present in base_feats
+            if not matched and col in feat_idx_map:
+                 # Usually t=0 is the "base" or "fastest" timeframe
+                 col_map[col] = (0, feat_idx_map[col])
+
+        # 2. Fill the array using bulk numpy assignment
+        # Iterate over columns (fast) instead of rows (slow)
+        x_values = x.to_numpy(dtype=np.float32, copy=False)
+        col_names = list(x.columns)
+        
+        for col_idx, col_name in enumerate(col_names):
+            if col_name in col_map:
+                t_idx, f_idx = col_map[col_name]
+                X_arr[:, t_idx, f_idx] = x_values[:, col_idx]
 
         class _DS(torch.utils.data.Dataset):
-            def __init__(self, df: pd.DataFrame, labels: pd.Series | None) -> None:
-                self.df = df
-                self._labels = labels
+            def __init__(self, data_array: np.ndarray, labels: np.ndarray | None) -> None:
+                self.data = data_array
+                self.labels = labels
 
             def __len__(self) -> int:
-                return len(self.df)
+                return len(self.data)
 
             def __getitem__(self, idx: int):
-                row = self.df.iloc[idx]
-                arr = np.zeros((len(tf_names), input_dim), dtype=np.float32)
-                for i, tf in enumerate(tf_names):
-                    # Try to find features for this timeframe
-                    # 1. Exact match: TF_Feature
-                    # 2. Fallback: Feature (only if this is the base/first TF)
-                    vals = []
-                    for feat in base_feats:
-                        col_name = f"{tf}_{feat}"
-                        if col_name in row:
-                            vals.append(row[col_name])
-                        elif i == 0 and feat in row:  # Fallback for base timeframe
-                            vals.append(row[feat])
-                        else:
-                            vals.append(0.0)
+                # Extremely fast slicing
+                return self.data[idx], (self.labels[idx] if self.labels is not None else None)
 
-                    arr[i, :] = np.array(vals, dtype=np.float32)
-
-                lbl = None
-                if self._labels is not None:
-                    lbl = int(self._labels.iloc[idx])
-                return arr, lbl
-
-        return _DS(x, y)
+        y_arr = y.to_numpy(dtype=int) if y is not None else None
+        return _DS(X_arr, y_arr)
 
     def fit(self, x: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
         # Some callers may provide unnamed numeric columns (e.g., DataFrame from a raw numpy array).

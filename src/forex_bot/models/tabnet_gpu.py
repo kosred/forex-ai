@@ -13,13 +13,13 @@ logger = logging.getLogger(__name__)
 TabNetClassifier = None  # type: ignore
 
 
-def _try_import_tabnet() -> Any | None:
+def _try_import_tabnet() -> tuple[Any, Any] | tuple[None, None]:
     try:
-        from pytorch_tabnet.tab_model import TabNetClassifier as _TabNetClassifier  # type: ignore
-
-        return _TabNetClassifier
+        from pytorch_tabnet.tab_model import TabNetClassifier as _TabNetClassifier
+        from pytorch_tabnet.callbacks import Callback
+        return _TabNetClassifier, Callback
     except Exception:
-        return None
+        return None, None
 
 
 class TabNetExpert(ExpertModel):
@@ -99,7 +99,7 @@ class TabNetExpert(ExpertModel):
         tune_torch_backend(str(self.device))
 
     def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs: Any) -> None:
-        tabnet_cls = _try_import_tabnet()
+        tabnet_cls, callback_cls = _try_import_tabnet()
         if tabnet_cls is None:
             logger.warning("pytorch-tabnet not available; skipping TabNet GPU training.")
             return
@@ -125,6 +125,21 @@ class TabNetExpert(ExpertModel):
         max_epochs = 2000
         patience = 50
 
+        import time
+        
+        class TimeLimitCallback(callback_cls):
+            def __init__(self, limit_sec: float):
+                super().__init__()
+                self.limit_sec = limit_sec
+                self.start_time = time.time()
+            
+            def on_epoch_end(self, epoch, logs=None):
+                if (time.time() - self.start_time) > self.limit_sec:
+                    logger.info(f"TabNet stopping early due to time limit ({self.limit_sec}s)")
+                    self.trainer.max_epochs = 0 # Force stop
+
+        callbacks = [TimeLimitCallback(self.max_time_sec)]
+
         self.model.fit(
             X_train=x_train,
             y_train=y_train,
@@ -137,6 +152,7 @@ class TabNetExpert(ExpertModel):
             virtual_batch_size=min(self.batch_size, 128),
             num_workers=0,
             drop_last=False,
+            callbacks=callbacks
         )
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:

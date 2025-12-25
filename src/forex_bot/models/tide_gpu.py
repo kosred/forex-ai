@@ -112,15 +112,14 @@ class TiDEExpert(ExpertModel):
         X_train, X_val = X.iloc[:split], X.iloc[split:]
         y_train, y_val = y.iloc[:split], y.iloc[split:]
 
-        X_t = torch.as_tensor(dataframe_to_float32_numpy(X_train), dtype=torch.float32)
-        y_t = torch.as_tensor(y_train.values + 1, dtype=torch.long)
-        X_v = torch.as_tensor(dataframe_to_float32_numpy(X_val), dtype=torch.float32)
-        y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long)
+        # Force CPU initialization to avoid VRAM OOM
+        X_t = torch.as_tensor(dataframe_to_float32_numpy(X_train), dtype=torch.float32, device="cpu")
+        y_t = torch.as_tensor(y_train.values + 1, dtype=torch.long, device="cpu")
+        X_v = torch.as_tensor(dataframe_to_float32_numpy(X_val), dtype=torch.float32, device="cpu")
+        y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device="cpu")
 
-        # Move validation to device just-in-time
-        X_v = X_v.to(self.device)
-        y_v = y_v.to(self.device)
-
+        # Removed eager move to GPU for validation data
+        
         dataset = TensorDataset(X_t, y_t)
         # GPU Optimization with spawn context to avoid CUDA fork issues
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
@@ -215,8 +214,11 @@ class TiDEExpert(ExpertModel):
             if len(X_val) > 0:
                 self.model.eval()
                 with torch.no_grad():
-                    val_out = self.model(X_v)
-                    val_loss = criterion(val_out, y_v).item()
+                    # Move to GPU explicitly for validation
+                    X_v_gpu = X_v.to(self.device)
+                    y_v_gpu = y_v.to(self.device)
+                    val_out = self.model(X_v_gpu)
+                    val_loss = criterion(val_out, y_v_gpu).item()
                 self.model.train()
                 if early_stopper(val_loss):
                     break

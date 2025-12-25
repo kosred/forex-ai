@@ -258,9 +258,13 @@ class FeatureEngineer:
 
         df = self._merge_indices(df)
 
-        # 3. Multi-Timeframe Features (Simplified loop)
+        # 3. Multi-Timeframe Features (Optimized "Collect then Concat")
         target_tfs = ["M1", "M3", "M5", "M15", "M30", "H1", "H2", "H4", "H12", "D1", "W1", "MN1"]
         htf_cols = []
+        htf_feature_blocks = [] # Collect blocks here
+        
+        import gc 
+
         for tf_name in target_tfs:
             if tf_name in frames and tf_name != base_tf:
                 htf = frames[tf_name].copy()
@@ -293,16 +297,32 @@ class FeatureEngineer:
                         ]
                         subset = htf[[c for c in key_feats if c in htf.columns]].copy()
                         # Prevent lookahead leakage: align to the last *completed* HTF candle.
-                        # Our resampled frames are indexed by candle open time (pandas default label='left'),
-                        # so the candle at timestamp T spans [T, T+tf) and isn't fully known at T.
-                        # Shifting by 1 makes the HTF feature values available from the next candle open.
                         subset = subset.shift(1)
                         subset.columns = [f"{tf_name}_{c}" for c in subset.columns]
+                        
+                        # Reindex is still heavy, but now we store just the small subset, not the full df
                         merged = subset.reindex(df.index, method="ffill").fillna(0.0)
-                        df = df.join(merged)
+                        
+                        # Optimization: Downcast to float32 to save RAM
+                        merged = merged.astype(np.float32)
+                        
+                        htf_feature_blocks.append(merged)
                         htf_cols.extend(merged.columns.tolist())
-                    except Exception:
-                        pass
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to generate HTF features for {tf_name}: {e}")
+                    finally:
+                        # Aggressive cleanup
+                        del htf
+                        if 'subset' in locals(): del subset
+                        if 'merged' in locals(): del merged
+                        gc.collect()
+
+        # Merge all HTF blocks at once
+        if htf_feature_blocks:
+            df = pd.concat([df] + htf_feature_blocks, axis=1, copy=False)
+            del htf_feature_blocks
+            gc.collect()
 
         # MTF confluence: average directional agreement across higher TFs.
         tf_votes = []
