@@ -272,8 +272,11 @@ class HyperparameterOptimizer:
                 except Exception:
                     pass
                 
-                logger.info(f"Starting {name} optimization (Sequential Mode)")
+                logger.info(f"Starting {name} optimization (Sequential Mode, capped trials)")
+                prev_trials = self.n_trials
+                self.n_trials = min(prev_trials, 25)  # cap tree trials
                 best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
+                self.n_trials = prev_trials
             except Exception as e:
                 logger.error(f"Optimization for {name} failed: {e}")
 
@@ -281,7 +284,7 @@ class HyperparameterOptimizer:
             logger.info("Stop requested; skipping remaining optimization studies.")
             return best_params
 
-        # Batch 2: Neural network models - run SEQUENTIALLY
+        # Batch 2: Neural network models - run SEQUENTIALLY (cap trials modestly)
         # Note: Internal Optuna trials still run in PARALLEL across all 4 GPUs.
         batch2_models = [
             ("TabNet", self._optimize_tabnet, 0),
@@ -304,8 +307,12 @@ class HyperparameterOptimizer:
                 except Exception:
                     pass
 
-                logger.info(f"Starting {name} optimization (Sequential Mode)")
+                logger.info(f"Starting {name} optimization (Sequential Mode, capped trials for stability)")
+                prev_trials = self.n_trials
+                # allow slightly more for deep models, but cap to avoid runaway
+                self.n_trials = min(prev_trials, 40)
                 best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
+                self.n_trials = prev_trials
             except Exception as e:
                 logger.error(f"Optimization for {name} failed: {e}")
 

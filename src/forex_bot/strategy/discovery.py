@@ -95,12 +95,15 @@ class AutonomousDiscoveryEngine:
                     except Exception:
                         continue
 
-                # 2. Select diverse portfolio (Top 3 Uncorrelated)
+                # 2. Select diverse portfolio (Top 20 Uncorrelated)
                 portfolio = []
                 # Sort by fitness (Sharpe)
                 valid_candidates.sort(key=lambda x: x.fitness, reverse=True)
 
-                while len(portfolio) < 3 and valid_candidates:
+                # Increased portfolio size to 20 to avoid "blindness" in models
+                target_portfolio_size = 20 
+                
+                while len(portfolio) < target_portfolio_size and valid_candidates:
                     # Pick best remaining
                     leader = valid_candidates.pop(0)
                     portfolio.append(leader)
@@ -115,12 +118,9 @@ class AutonomousDiscoveryEngine:
                         if pd.isna(corr):
                             corr = 0.0
 
-                        # Niching threshold: 0.6 (Allow max 60% similarity)
-                        if abs(corr) < 0.6:
+                        # Niching threshold: 0.7 (Allow a bit more similarity to get 20 strategies)
+                        if abs(corr) < 0.7:
                             survivors.append(candidate)
-                        else:
-                            # Penalized/Removed
-                            pass
                     valid_candidates = survivors
 
                 logger.info(

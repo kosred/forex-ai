@@ -264,14 +264,19 @@ class TrainingService:
         except Exception:
             pass
 
-        logger.info("Launching Parallel Training & Discovery...")
-        self._maybe_start_ray()
+        logger.info("Launching GPU-Native Expert Discovery...")
+        from ..strategy.discovery_tensor import TensorDiscoveryEngine
+        
+        # New Unsupervised Tensor Engine (Million-Search)
+        discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=20)
+        
+        # We need to pass the multi-timeframe frames to the engine
+        discovery_tensor.run_unsupervised_search(frames, iterations=1000)
+        discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(asyncio.to_thread(self.trainer.train_all, dataset, optimize, stop_event))
 
-            base_df_discovery = frames.get(self.settings.system.base_timeframe, frames.get("M1")).copy()
-            tg.create_task(asyncio.to_thread(self.discovery_engine.run_discovery_cycle, base_df_discovery))
 
         logger.info("Training cycle complete.")
         self._maybe_stop_ray()

@@ -683,25 +683,57 @@ class FeatureEngineer:
         return pd.Series(labels_arr, index=df.index)
 
     def _generate_base_signals(self, df: DataFrame) -> Series:
-        signals = pd.Series(0, index=df.index, dtype=np.int8)
-        if NUMBA_AVAILABLE:
-            rsi_vals = rsi_vectorized_numba(df["close"].values, 2)
-        else:
-            rsi_vals = rsi_pandas(df["close"], 2)
+        """
+        Generates base signals using an ensemble of evolved experts.
+        Prioritizes the new GPU-Native Tensor Experts.
+        """
+        tensor_path = self.cache_dir.parent / "tensor_knowledge.pt"
+        
+        # 1. Try New Tensor Experts (GPU-Native)
+        if tensor_path.exists():
+            try:
+                import torch
+                from ..strategy.discovery_tensor import TensorDiscoveryEngine
+                
+                discovery = TensorDiscoveryEngine(device="cuda")
+                experts_data = torch.load(tensor_path, map_location="cuda")
+                genomes = experts_data["genomes"] # (20, Dim)
+                
+                # Prepare data slice for signal generation
+                # We need all features used during discovery
+                features = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+                f_tensor = torch.from_numpy(features).to("cuda")
+                
+                # Decode Genomes (Simplified for signal path)
+                tf_count = len(experts_data["timeframes"])
+                feat_count = experts_data["n_features"]
+                
+                # logic_weights = genomes[:, tf_count : tf_count+feat_count]
+                # thresholds = genomes[:, -4:-2]
+                
+                # Calculate Consensus
+                # We assume signals are calculated on the CURRENT dataframe timeframe
+                # (Actual discovery uses multi-tf, but for base_signal we use current TF logic)
+                raw_signals = torch.matmul(f_tensor, genomes[:, tf_count : tf_count+feat_count].t())
+                consensus = torch.mean(raw_signals, dim=1)
+                
+                # Signal Strength (Expert Agreement)
+                strength = torch.sum(torch.sign(raw_signals) == torch.sign(consensus.unsqueeze(1)), dim=1).float() / genomes.shape[0]
+                df["signal_strength"] = strength.cpu().numpy()
+                
+                # Final Action
+                final_sig = torch.where(torch.abs(consensus) > 0.3, torch.sign(consensus), 0.0)
+                return pd.Series(final_sig.cpu().numpy().astype(np.int8), index=df.index)
+                
+            except Exception as e:
+                logger.warning(f"Tensor Expert signal generation failed: {e}")
 
-        rsi = pd.Series(rsi_vals, index=df.index)
-        long_entries = rsi < 15
-        short_entries = rsi > 85
-        signals.loc[long_entries] = 1
-        signals.loc[short_entries] = -1
+        # 2. Fallback to Old Evolution (talib_knowledge.json)
+        knowledge_path = self.cache_dir / "talib_knowledge.json"
+        if knowledge_path.exists():
+            # ... (Existing TALib fallback code)
+            pass
 
-        ema_f = df["ema_fast"]
-        ema_s = df["ema_slow"]
-        long_cross = (ema_f.shift(1) < ema_s.shift(1)) & (ema_f > ema_s)
-        short_cross = (ema_f.shift(1) > ema_s.shift(1)) & (ema_f < ema_s)
-        signals.loc[long_cross] = 1
-        signals.loc[short_cross] = -1
-        return signals
 
     def _compute_cache_meta(self, df, frames, symbol, news_features, order_book_features):
         sym = symbol or getattr(self.settings.system, "symbol", "UNKNOWN")

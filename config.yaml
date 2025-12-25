@@ -106,7 +106,7 @@ models:
   tabnet_train_seconds: 36000
   kan_train_seconds: 36000
   num_transformers: 2
-  optuna_trials: 20
+  optuna_trials: 25
   optuna_reuse_study: true
   export_onnx: true  # Export ONNX for fast CPU inference (one-time at startup if missing)
   prop_metric_weight: 1.0

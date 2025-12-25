@@ -191,7 +191,7 @@ class ModelsConfig(BaseModel):
     tabnet_train_seconds: int = 36000  # Increased for deeper training
     kan_train_seconds: int = 36000  # Increased for deeper training
     num_transformers: int = 2
-    optuna_trials: int = 10  # Reduced for speed; 10 trials is enough with TPE sampler
+    optuna_trials: int = 25  # Default HPO trials; tree models may use fewer internally for stability
     optuna_reuse_study: bool = True  # Warm-start: skip already-completed trials
     optuna_max_rows: int = 500_000  # Cap rows for HPO speed; full data used for final training
     optuna_storage_url: str = (
