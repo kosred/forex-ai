@@ -138,8 +138,15 @@ class TensorDiscoveryEngine:
         for i in range(iterations):
             searcher.step()
             if i % 100 == 0:
-                best = searcher.status["best_evaluation"]
-                logger.info(f"Generation {i}: Fitness = {best:.4f}")
+                try:
+                    # Robust access to best fitness
+                    best_val = searcher.status.get("best_evaluation")
+                    if best_val is None:
+                        # Fallback for newer EvoTorch versions
+                        best_val = getattr(searcher.best_so_far, "evaluation", 0.0)
+                    logger.info(f"Generation {i}: Fitness = {float(best_val):.4f}")
+                except Exception:
+                    logger.info(f"Generation {i} complete.")
 
         indices = torch.argsort(searcher.population.evaluations.detach().cpu(), descending=True)
         self.best_experts = searcher.population.values.detach().cpu()[indices[:self.n_experts]]
