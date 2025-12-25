@@ -91,11 +91,14 @@ class TensorDiscoveryEngine:
         def fitness_func(genomes: torch.Tensor) -> torch.Tensor:
             """
             Vectorized Backtest for 10,000+ genomes.
-            VRAM-Safe: Processes samples in batches.
+            VRAM-Safe: Processes samples in smaller batches to avoid OOM on A4000.
             """
             pop_size = genomes.shape[0]
             n_samples = self.data_cube.shape[1]
-            batch_size = 500000 # ~500k rows at a time to stay under 16GB VRAM
+            
+            # Reduced batch size significantly to stay safe within 16GB VRAM
+            # (6 TFs * 100k rows * 2000 Pop * 4 bytes is still a lot of memory)
+            batch_size = 100000 
             
             # Decode Genomes
             tf_weights = F.softmax(genomes[:, :len(self.timeframes)], dim=1)
@@ -109,16 +112,22 @@ class TensorDiscoveryEngine:
                 end_idx = min(start_idx + batch_size, n_samples)
                 data_slice = self.data_cube[:, start_idx:end_idx, :] # (TFs, Batch, Feats)
                 
-                # Signal logic for this slice
-                tf_signals = torch.matmul(data_slice, logic_weights.t()) # (6, Batch, Pop)
-                tf_signals = tf_signals.permute(2, 0, 1) # (Pop, TFs, Batch)
+                # Use sub-batches for logic weights to further reduce peak allocation
+                # (Batch, Feats) @ (Pop, Feats).T -> (Batch, Pop)
+                # We do this per TF
+                combined_slice_signals = torch.zeros((pop_size, end_idx - start_idx), device=self.device)
                 
-                combined_signals = torch.bmm(tf_weights.unsqueeze(1), tf_signals).squeeze(1)
+                for tf_idx in range(self.data_cube.shape[0]):
+                    # (Batch, Feats) @ (Pop, Feats).T -> (Batch, Pop)
+                    tf_sig = torch.matmul(data_slice[tf_idx], logic_weights.t()) # (Batch, Pop)
+                    # Apply TF weight
+                    combined_slice_signals += tf_weights[:, tf_idx].unsqueeze(0) * tf_sig.t()
+                    del tf_sig
                 
                 # Trade Actions
-                actions = torch.zeros_like(combined_signals)
-                actions[combined_signals > thresholds[:, 0].unsqueeze(1)] = 1
-                actions[combined_signals < thresholds[:, 1].unsqueeze(1)] = -1
+                actions = torch.zeros_like(combined_slice_signals)
+                actions[combined_slice_signals > thresholds[:, 0].unsqueeze(1)] = 1
+                actions[combined_slice_signals < thresholds[:, 1].unsqueeze(1)] = -1
                 
                 # Returns
                 m1_close = self.ohlc_cube[0, start_idx:end_idx, 3]
@@ -126,6 +135,10 @@ class TensorDiscoveryEngine:
                 rets[1:] = (m1_close[1:] - m1_close[:-1]) / (m1_close[:-1] + 1e-9)
                 
                 all_strategy_returns.append(actions * rets.unsqueeze(0))
+                
+                # Explicit cleanup
+                del combined_slice_signals, actions, rets
+                torch.cuda.empty_cache()
                 
             # Combine returns from all batches
             strategy_returns = torch.cat(all_strategy_returns, dim=1)
