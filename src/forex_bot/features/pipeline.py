@@ -731,8 +731,55 @@ class FeatureEngineer:
         # 2. Fallback to Old Evolution (talib_knowledge.json)
         knowledge_path = self.cache_dir / "talib_knowledge.json"
         if knowledge_path.exists():
-            # ... (Existing TALib fallback code)
-            pass
+            try:
+                import json
+                from ..strategy.genes.factory import GeneFactory
+                from ..features.talib_mixer import TALibStrategyMixer
+                
+                data = json.loads(knowledge_path.read_text())
+                genes_data = data.get("best_genes", [])
+                
+                if genes_data:
+                    mixer = TALibStrategyMixer()
+                    all_signals = []
+                    genes = [GeneFactory.from_dict(g) for g in genes_data]
+                    cache = mixer.bulk_calculate_indicators(df, genes)
+                    for gene in genes:
+                        sig = mixer.compute_signals(df, gene, cache=cache)
+                        all_signals.append(sig.to_numpy(dtype=np.float32))
+                    
+                    if all_signals:
+                        signal_matrix = np.vstack(all_signals)
+                        consensus = np.mean(signal_matrix, axis=0)
+                        active_experts = np.sum(signal_matrix != 0, axis=0)
+                        agreement = np.sum(np.sign(signal_matrix) == np.sign(consensus), axis=0) / np.maximum(active_experts, 1)
+                        df["signal_strength"] = agreement.astype(np.float32)
+                        final_sig = np.where(np.abs(consensus) > 0.2, np.sign(consensus), 0).astype(np.int8)
+                        return pd.Series(final_sig, index=df.index)
+            except Exception as e:
+                logger.warning(f"Failed to load evolved experts, falling back to RSI: {e}")
+
+        # 3. Final Fallback (Old RSI/EMA cross)
+        signals = pd.Series(0, index=df.index, dtype=np.int8)
+        try:
+            if NUMBA_AVAILABLE:
+                rsi_vals = rsi_vectorized_numba(df["close"].values, 2)
+            else:
+                rsi_vals = rsi_pandas(df["close"], 2)
+
+            rsi = pd.Series(rsi_vals, index=df.index)
+            signals.loc[rsi < 15] = 1
+            signals.loc[rsi > 85] = -1
+
+            ema_f = df["ema_fast"]
+            ema_s = df["ema_slow"]
+            signals.loc[(ema_f.shift(1) < ema_s.shift(1)) & (ema_f > ema_s)] = 1
+            signals.loc[(ema_f.shift(1) > ema_s.shift(1)) & (ema_f < ema_s)] = -1
+        except Exception as e:
+            logger.error(f"Final signal fallback failed: {e}")
+        
+        df["signal_strength"] = 0.5 # Neutral strength for fallback
+        return signals
 
 
     def _compute_cache_meta(self, df, frames, symbol, news_features, order_book_features):

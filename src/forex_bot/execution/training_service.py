@@ -1017,8 +1017,17 @@ class TrainingService:
 
 # Standalone worker function for ProcessPoolExecutor (must be picklable)
 def _hpc_feature_worker(settings, frames, sym, news_features=None):
-    # Re-instantiate FE inside worker
-    from ..features.pipeline import FeatureEngineer
+    # Fix for CUDA FP8 header compilation error in Ubuntu 24.04 / CUDA 12.8
+    os.environ["CUPY_ACCELERATORS"] = ""
+    os.environ["CUDA_CACHE_DISABLE"] = "1"
+    
+    try:
+        # Re-instantiate FE inside worker
+        from ..features.pipeline import FeatureEngineer
 
-    fe = FeatureEngineer(settings)
-    return fe.prepare(frames, news_features=news_features, symbol=sym)
+        fe = FeatureEngineer(settings)
+        return fe.prepare(frames, news_features=news_features, symbol=sym)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Worker failed for {sym}: {e}")
+        return None
