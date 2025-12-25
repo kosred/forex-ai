@@ -82,7 +82,17 @@ class TensorDiscoveryEngine:
                     genomes = chunk.clone().detach().to(dev)
                     local_pop = genomes.shape[0]
                     n_samples = gpu_data_cubes[gpu_idx].shape[1]
-                    batch_size = 100000 # Larger batch possible because only 1/4 of pop is here
+                    
+                    # Auto-scale batch size based on VRAM (A4000=16GB -> 100k, A6000=48GB -> 400k+)
+                    try:
+                        total_mem = torch.cuda.get_device_properties(dev).total_memory
+                        # Conservative heuristic: 100k rows per 8GB of VRAM safe zone
+                        # Reserve 4GB overhead
+                        usable_gb = max(1, (total_mem / (1024**3)) - 4)
+                        batch_size = int(usable_gb * 15000) 
+                        batch_size = min(n_samples, max(50000, batch_size))
+                    except Exception:
+                        batch_size = 100000 # Fallback
                 
                 tf_count = gpu_data_cubes[gpu_idx].shape[0]
                 tf_weights = F.softmax(genomes[:, :tf_count], dim=1)
@@ -160,10 +170,11 @@ class TensorDiscoveryEngine:
         problem = Problem("max", fitness_func, initial_bounds=(-1.0, 1.0), 
                          solution_length=genome_dim, device="cpu", vectorized=True)
         
-        # cooperative population of 4000
-        searcher = CMAES(problem, popsize=4000, stdev_init=0.5)
+        # cooperative population of 4000 (default) or scaled by env
+        pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 4000))
+        searcher = CMAES(problem, popsize=pop_size, stdev_init=0.5)
         
-        logger.info(f"Starting COOPERATIVE 4-GPU Discovery (Pop: 4000)...")
+        logger.info(f"Starting COOPERATIVE {len(self.gpu_list)}-GPU Discovery (Pop: {pop_size})...")
         for i in range(iterations):
             searcher.step()
             if i % 10 == 0:
