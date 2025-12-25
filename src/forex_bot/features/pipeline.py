@@ -499,15 +499,15 @@ class FeatureEngineer:
 
     def _compute_comprehensive_talib_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Dynamically injects the massive TA-Lib indicator set (Unsupervised Mode).
-        Generates 150+ indicators and lets the models/genes decide what works.
+        Dynamically injects the massive TA-Lib indicator set with HYPERSPACE EXPANSION.
+        Generates multiple variations (Fast, Med, Slow) so the Discovery Engine can
+        'evolve' parameters by selecting the best features.
         """
         if not TALIB_AVAILABLE:
             return df
             
         try:
-            # Prepare inputs dictionary (standard TA-Lib abstract API format)
-            # Use float64 for calculation precision, but we'll cast results to float32
+            # Inputs (float64 for precision)
             inputs = {
                 'open': df["open"].values.astype(np.float64),
                 'high': df["high"].values.astype(np.float64),
@@ -516,32 +516,72 @@ class FeatureEngineer:
                 'volume': df["volume"].values.astype(np.float64) if "volume" in df.columns else np.random.random(len(df))
             }
 
-            # Memory Guard: If dataset is huge, random sampling or specific prioritization might be needed.
-            # For now, we trust the VPS 30GB RAM to handle ~200 cols * 5M rows (~4GB).
-            
-            # Iterate through EVERYTHING
+            # 1. Standard "Kitchen Sink" (Defaults)
+            # We still run this to catch everything else not in our explicit variations list
             for ind_name in ALL_INDICATORS:
                 try:
-                    # abstract.Function is the magic key to "mix and match" without hardcoding
+                    # Skip if we handle it explicitly below to avoid duplicates (optional, but cleaner)
+                    if ind_name in ["SMA", "EMA", "RSI", "BBANDS", "ADX", "CCI", "MOM", "ROC", "WILLR", "ATR"]:
+                        continue
+                        
                     func = abstract.Function(ind_name)
-                    
-                    # Compute
                     res = func(inputs)
-                    
-                    # Handle Multi-Output Indicators (e.g. BBANDS -> upper, middle, lower)
                     if isinstance(res, (list, tuple)):
                         for i, arr in enumerate(res):
-                            # Prefix to avoid collisions with our manual features
-                            col_name = f"ta_{ind_name.lower()}_{i}"
-                            df[col_name] = arr.astype(np.float32)
-                    # Handle Single-Output Indicators (Series or Array)
+                            df[f"ta_{ind_name.lower()}_{i}"] = arr.astype(np.float32)
                     elif isinstance(res, (pd.Series, np.ndarray)):
-                        col_name = f"ta_{ind_name.lower()}"
-                        df[col_name] = res.astype(np.float32) if isinstance(res, np.ndarray) else res.values.astype(np.float32)
-                        
+                        val = res.values if isinstance(res, pd.Series) else res
+                        df[f"ta_{ind_name.lower()}"] = val.astype(np.float32)
                 except Exception:
-                    # Some indicators might fail due to data length or missing inputs (e.g. MAVP)
                     continue
+
+            # 2. Hyperspace Variations (The "Unsupervised Parameter Search")
+            # We generate multiple versions of high-value indicators.
+            # The Discovery Engine will learn to weight 'ta_rsi_9' higher than 'ta_rsi_14' if it works better.
+            
+            # Simple Period Variations
+            simple_vars = {
+                "RSI": [9, 14, 21, 34],
+                "ADX": [14, 30],
+                "ATR": [14, 30],
+                "CCI": [14, 34, 50],
+                "MOM": [10, 20],
+                "ROC": [10, 20],
+                "WILLR": [14, 34],
+                "SMA": [20, 50, 100, 200],
+                "EMA": [9, 21, 50, 200],
+                "WMA": [20, 50],
+                "T3": [5, 10],
+                "CMO": [9, 14]
+            }
+            
+            for name, periods in simple_vars.items():
+                try:
+                    func = abstract.Function(name)
+                    for p in periods:
+                        # Most TA-Lib functions take 'timeperiod'
+                        res = func(inputs, timeperiod=p)
+                        col = f"ta_{name.lower()}_{p}"
+                        if isinstance(res, (pd.Series, np.ndarray)):
+                            val = res.values if isinstance(res, pd.Series) else res
+                            df[col] = val.astype(np.float32)
+                except Exception:
+                    pass
+
+            # Complex Variations (BBANDS)
+            # (period, dev_up, dev_dn)
+            bb_vars = [(20, 2.0, 2.0), (20, 2.5, 2.5), (50, 2.0, 2.0)]
+            try:
+                func = abstract.Function("BBANDS")
+                for p, dev_up, dev_dn in bb_vars:
+                    # BBANDS returns [upper, middle, lower]
+                    u, m, l = func(inputs, timeperiod=p, nbdevup=dev_up, nbdevdn=dev_dn)
+                    # We usually care about bandwidth or %b, but raw bands are useful for crossing logic
+                    suffix = f"{p}_{int(dev_up*10)}"
+                    df[f"ta_bb_upper_{suffix}"] = u.astype(np.float32)
+                    df[f"ta_bb_lower_{suffix}"] = l.astype(np.float32)
+            except Exception:
+                pass
 
         except Exception as e:
             logger.warning(f"TA-Lib comprehensive dynamic injection failed: {e}")

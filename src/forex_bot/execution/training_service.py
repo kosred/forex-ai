@@ -283,7 +283,8 @@ class TrainingService:
              discovery_frames[base_tf] = rich_df
 
         # New Unsupervised Tensor Engine (Million-Search)
-        discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=20)
+        # We increase experts to 100 to create a diverse "Council of 100" for the deep models
+        discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=100)
         
         # We need to pass the enriched multi-timeframe frames to the engine
         discovery_tensor.run_unsupervised_search(
