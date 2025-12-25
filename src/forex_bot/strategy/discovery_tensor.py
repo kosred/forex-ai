@@ -230,16 +230,15 @@ class TensorDiscoveryEngine:
                 std_ret = torch.sqrt(torch.clamp((sum_sq_ret / n_samples) - mean_ret**2, min=1e-9)) + 1e-6
                 sharpe = (mean_ret / std_ret) * (252 * 1440)**0.5
                 
-                # Prop Firm Constraints
+                # Prop Firm Constraints (ULTRA-CONSERVATIVE)
                 fitness = sharpe * (profitable_chunks / 10.0)
                 
-                # 1. Hard Max Drawdown Limit (8%)
-                fitness = torch.where(max_dd > 0.08, torch.tensor(-1e9, device=dev), fitness)
+                # 1. Hard Max Total Drawdown Limit (7% instead of 8% for safety)
+                fitness = torch.where(max_dd > 0.07, torch.tensor(-1e9, device=dev), fitness)
                 
-                # 2. Daily Drawdown Penalty (Soft limit 5%)
-                # Since precise daily calculation is heavy, we assume 'max_dd' correlates
-                # But we add a stricter penalty for fast drops (volatility)
-                fitness = torch.where(std_ret * np.sqrt(1440) > 0.045, fitness * 0.5, fitness)
+                # 2. Daily Drawdown Penalty (Soft limit 4% instead of 4.5% for safety)
+                # Penalize any gene where volatility projects a >4% daily move
+                fitness = torch.where(std_ret * np.sqrt(1440) > 0.04, fitness * 0.1, fitness)
 
                 return fitness.cpu()
 
