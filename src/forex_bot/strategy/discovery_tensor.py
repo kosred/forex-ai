@@ -73,64 +73,79 @@ class TensorDiscoveryEngine:
         
         # [TF_Selector (6) | Logic_Weights (N_Features) | Thresholds (2)]
         genome_dim = self.data_cube.shape[0] + self.n_features + 2
-        pop_size = 2000
+        pop_size = 1000 # Reduced for additional VRAM safety
         
         def fitness_func(genomes: torch.Tensor) -> torch.Tensor:
             n_samples = self.data_cube.shape[1]
             batch_size = 50000 
             
-            # 1. Decode Genomes
+            # Decode Genomes
             tf_count = self.data_cube.shape[0]
             tf_weights = F.softmax(genomes[:, :tf_count], dim=1)
             logic_weights = genomes[:, tf_count : tf_count+self.n_features]
             thresholds = genomes[:, -2:]
             
-            all_strategy_returns = []
+            # Cumulative metrics to avoid storing large tensors
+            sum_returns = torch.zeros(pop_size, device=self.device)
+            sum_sq_returns = torch.zeros(pop_size, device=self.device)
+            max_drawdown = torch.zeros(pop_size, device=self.device)
+            running_cum_ret = torch.zeros(pop_size, device=self.device)
+            running_peak = torch.zeros(pop_size, device=self.device)
             
-            # 2. VRAM-SAFE LOOP
+            # Consistency: 10 chunks
+            chunk_size = n_samples // 10
+            profitable_chunks = torch.zeros(pop_size, device=self.device)
+            current_chunk_ret = torch.zeros(pop_size, device=self.device)
+
+            # VRAM-SAFE LOOP
             for start_idx in range(0, n_samples, batch_size):
                 end_idx = min(start_idx + batch_size, n_samples)
                 data_slice = self.data_cube[:, start_idx:end_idx, :]
                 
-                # Running sum for consensus
                 combined_slice_signals = torch.zeros((pop_size, end_idx - start_idx), device=self.device)
-                
                 for tf_idx in range(tf_count):
                     tf_sig = torch.matmul(data_slice[tf_idx], logic_weights.t())
                     combined_slice_signals = combined_slice_signals + (tf_weights[:, tf_idx].unsqueeze(1) * tf_sig.t())
                     del tf_sig
                 
-                # Actions: out-of-place logic
                 long_mask = (combined_slice_signals > thresholds[:, 0].unsqueeze(1)).float()
                 short_mask = (combined_slice_signals < thresholds[:, 1].unsqueeze(1)).float()
                 actions = long_mask - short_mask
                 
-                # Returns
                 m1_close = self.ohlc_cube[0, start_idx:end_idx, 3]
                 rets = torch.zeros_like(m1_close)
                 rets[1:] = (m1_close[1:] - m1_close[:-1]) / (m1_close[:-1] + 1e-9)
                 
-                all_strategy_returns.append(actions * rets.unsqueeze(0))
+                # Batch returns: (Pop, Batch_Samples)
+                batch_returns = actions * rets.unsqueeze(0)
                 
-                del combined_slice_signals, actions, rets, long_mask, short_mask
+                # 1. Update Sharpe Metrics
+                sum_returns += batch_returns.sum(dim=1)
+                sum_sq_returns += (batch_returns**2).sum(dim=1)
+                
+                # 2. Update Consistency (Approximate by batch or better by chunk)
+                current_chunk_ret += batch_returns.sum(dim=1)
+                if (end_idx // chunk_size) > (start_idx // chunk_size):
+                    profitable_chunks += (current_chunk_ret > 0).float()
+                    current_chunk_ret.zero_()
+
+                # 3. Update Drawdown (Peak tracking)
+                # This is a simplified rolling DD to save memory
+                for t in range(batch_returns.shape[1]):
+                    running_cum_ret += batch_returns[:, t]
+                    running_peak = torch.maximum(running_peak, running_cum_ret)
+                    max_drawdown = torch.maximum(max_drawdown, running_peak - running_cum_ret)
+
+                del combined_slice_signals, actions, rets, batch_returns, long_mask, short_mask
                 torch.cuda.empty_cache()
-                
-            strategy_returns = torch.cat(all_strategy_returns, dim=1)
             
-            # 3. Consistency (6/10 Rule)
-            chunks = strategy_returns.chunk(10, dim=1)
-            profitable_chunks = torch.stack([ (c.sum(dim=1) > 0).float() for c in chunks ]).sum(dim=0)
-            
-            # 4. Metrics
-            mean_ret = strategy_returns.mean(dim=1)
-            std_ret = strategy_returns.std(dim=1) + 1e-6
+            # Final Metrics
+            mean_ret = sum_returns / n_samples
+            std_ret = torch.sqrt(torch.abs((sum_sq_returns / n_samples) - mean_ret**2)) + 1e-6
             sharpe = (mean_ret / std_ret) * (252 * 1440)**0.5
             
-            cum_ret = strategy_returns.cumsum(dim=1)
-            max_dd = (torch.cummax(cum_ret, dim=1)[0] - cum_ret).max(dim=1)[0]
-            
             fitness = sharpe * (profitable_chunks / 10.0)
-            fitness[max_dd > 0.08] = -1e9
+            fitness[max_drawdown > 0.08] = -1e9 # 8% Max DD limit
             
             return fitness
 
