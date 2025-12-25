@@ -233,10 +233,19 @@ class NBeatsExpert(ExpertModel):
                 if is_cuda:
                     bx = bx.to(self.device, non_blocking=True)
                     by = by.to(self.device, non_blocking=True)
+                
+                # Volatility Weighting (Prop Firm Optimization)
+                # Feature 0 is 'returns'. Penalize errors on big moves to reduce drawdown.
+                with torch.no_grad():
+                    # Scale: 1% move => weight +1.0. 
+                    vol_weight = 1.0 + (torch.abs(bx[:, 0]) * 100.0)
+
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                     out = self.model(bx)
-                    loss = criterion(out, by)
+                    # Use functional CE to apply per-sample weights dynamically
+                    raw_loss = nn.functional.cross_entropy(out, by, weight=class_weights, reduction='none')
+                    loss = (raw_loss * vol_weight).mean()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -455,10 +464,15 @@ class TiDEExpert(ExpertModel):
             epoch_loss = 0.0
             steps = 0
             for bx, by in loader:
+                # Volatility Weighting (Prop Firm Optimization)
+                with torch.no_grad():
+                    vol_weight = 1.0 + (torch.abs(bx[:, 0]) * 100.0)
+
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     out = self.model(bx)
-                    loss = criterion(out, by)
+                    raw_loss = nn.functional.cross_entropy(out, by, weight=class_weights, reduction='none')
+                    loss = (raw_loss * vol_weight).mean()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -671,10 +685,15 @@ class TabNetExpert(ExpertModel):
             epoch_loss = 0.0
             steps = 0
             for bx, by in loader:
+                # Volatility Weighting (Prop Firm Optimization)
+                with torch.no_grad():
+                    vol_weight = 1.0 + (torch.abs(bx[:, 0]) * 100.0)
+
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     logits = self.model(bx)
-                    loss = criterion(logits, by)
+                    raw_loss = nn.functional.cross_entropy(logits, by, weight=class_weights, reduction='none')
+                    loss = (raw_loss * vol_weight).mean()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -876,10 +895,15 @@ class KANExpert(ExpertModel):
             epoch_loss = 0.0
             steps = 0
             for bx, by in loader:
+                # Volatility Weighting (Prop Firm Optimization)
+                with torch.no_grad():
+                    vol_weight = 1.0 + (torch.abs(bx[:, 0]) * 100.0)
+
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     out = self.model(bx)
-                    loss = criterion(out, by)
+                    raw_loss = nn.functional.cross_entropy(out, by, weight=class_weights, reduction='none')
+                    loss = (raw_loss * vol_weight).mean()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()

@@ -459,6 +459,10 @@ class RandomForestExpert(ExpertModel):
             }
             params = self.params.copy()
             params["class_weight"] = class_weight if class_weight else "balanced_subsample"
+            
+            # Clean GPU params that choke sklearn
+            for k in ["gpu_device_id", "n_streams", "max_batch_size", "n_bins"]:
+                params.pop(k, None)
 
             self.model = RandomForestClassifier(**params)
             self.model.fit(x, y)
