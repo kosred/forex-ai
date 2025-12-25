@@ -79,6 +79,7 @@ IMPORT_TO_PYPI = {
     "efficient_kan": "efficient-kan",
     "neuralforecast": "neuralforecast",
     "tslib": "tslib",
+    "evotorch": "evotorch",
 }
 
 # Known Standard Library modules to exclude (Python 3.10+)
