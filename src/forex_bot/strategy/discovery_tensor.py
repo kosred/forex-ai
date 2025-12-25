@@ -66,7 +66,7 @@ class TensorDiscoveryEngine:
         @torch.no_grad()
         def fitness_func(genomes_all: torch.Tensor) -> torch.Tensor:
             """
-            DISTRIBUTED Evaluation: Splits population across all 4 GPUs.
+            DISTRIBUTED Evaluation: Splits population across all available GPUs.
             """
             pop_size = genomes_all.shape[0]
             # Split population into 4 chunks
