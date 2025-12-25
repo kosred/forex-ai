@@ -124,10 +124,14 @@ class TensorDiscoveryEngine:
                 # Sum the list to get final consensus for this slice
                 combined_slice_signals = torch.stack(slice_signals_list).sum(dim=0)
                 
-                # Trade Actions
-                actions = torch.zeros_like(combined_slice_signals)
-                actions[combined_slice_signals > thresholds[:, 0].unsqueeze(1)] = 1
-                actions[combined_slice_signals < thresholds[:, 1].unsqueeze(1)] = -1
+                # Trade Actions (Use torch.where to avoid modifying ReadOnlyTensors)
+                # actions: 1 for buy, -1 for sell, 0 for neutral
+                actions = torch.where(combined_slice_signals > thresholds[:, 0].unsqueeze(1), 
+                                      torch.ones_like(combined_slice_signals), 
+                                      torch.zeros_like(combined_slice_signals))
+                actions = torch.where(combined_slice_signals < thresholds[:, 1].unsqueeze(1), 
+                                      -torch.ones_like(combined_slice_signals), 
+                                      actions)
                 
                 # Returns
                 m1_close = self.ohlc_cube[0, start_idx:end_idx, 3]
