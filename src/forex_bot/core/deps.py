@@ -237,7 +237,8 @@ def ensure_dependencies() -> None:
     standard_libs = []
     
     for pkg in missing:
-        if any(x in pkg for x in ["torch", "cupy"]):
+        # Only core torch libs are on the special index; evotorch is on standard PyPI
+        if any(x == pkg for x in ["torch", "torchvision", "torchaudio"]):
             gpu_libs.append(pkg)
         else:
             standard_libs.append(pkg)
