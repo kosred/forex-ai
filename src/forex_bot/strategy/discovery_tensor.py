@@ -120,8 +120,8 @@ class TensorDiscoveryEngine:
                 for tf_idx in range(self.data_cube.shape[0]):
                     # (Batch, Feats) @ (Pop, Feats).T -> (Batch, Pop)
                     tf_sig = torch.matmul(data_slice[tf_idx], logic_weights.t()) # (Batch, Pop)
-                    # Apply TF weight
-                    combined_slice_signals += tf_weights[:, tf_idx].unsqueeze(0) * tf_sig.t()
+                    # Apply TF weight: (Pop, 1) * (Pop, Batch) -> (Pop, Batch)
+                    combined_slice_signals += tf_weights[:, tf_idx].unsqueeze(1) * tf_sig.t()
                     del tf_sig
                 
                 # Trade Actions
