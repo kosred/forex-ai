@@ -934,7 +934,12 @@ class TrainingService:
             
             # We pick the largest symbol's timeframe set as the candidate for multi-TF discovery
             # (In Global mode, we look for experts that work universally)
-            discovery_tensor.run_unsupervised_search(raw_frames_map["EURUSD"] if "EURUSD" in raw_frames_map else next(iter(raw_frames_map.values())), iterations=1000)
+            target_sym = "EURUSD" if "EURUSD" in raw_frames_map else next(iter(raw_frames_map.keys()))
+            discovery_tensor.run_unsupervised_search(
+                raw_frames_map[target_sym],
+                news_features=news_map.get(target_sym) if news_map else None,
+                iterations=1000
+            )
             discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
         # --- BARRIER ---
