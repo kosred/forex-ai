@@ -106,6 +106,8 @@ class TiDEExpert(ExpertModel):
                 self.model.to(self.device)
                 from .device import maybe_compile
                 self.model = maybe_compile(self.model, mode="reduce-overhead")
+            except Exception as e:
+                logger.warning(f"torch.compile failed for TiDE GPU: {e}")
 
         split = int(len(X) * 0.85)
         X_train, X_val = X.iloc[:split], X.iloc[split:]
