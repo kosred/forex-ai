@@ -78,10 +78,11 @@ class TensorDiscoveryEngine:
             
             def _eval_on_gpu(chunk: torch.Tensor, gpu_idx: int):
                 dev = torch.device(self.gpu_list[gpu_idx])
-                genomes = chunk.clone().detach().to(dev)
-                local_pop = genomes.shape[0]
-                n_samples = gpu_data_cubes[gpu_idx].shape[1]
-                batch_size = 100000 # Larger batch possible because only 1/4 of pop is here
+                with torch.cuda.device(dev):
+                    genomes = chunk.clone().detach().to(dev)
+                    local_pop = genomes.shape[0]
+                    n_samples = gpu_data_cubes[gpu_idx].shape[1]
+                    batch_size = 100000 # Larger batch possible because only 1/4 of pop is here
                 
                 tf_count = gpu_data_cubes[gpu_idx].shape[0]
                 tf_weights = F.softmax(genomes[:, :tf_count], dim=1)

@@ -352,7 +352,9 @@ class TransformerExpertTorch(ExpertModel):
         want_compile = compile_flag not in {"0", "false", "no"}
         if want_compile and torch.cuda.is_available() and str(self.device).startswith("cuda"):
             try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
+        self.model.to(self.device)
+        from .device import maybe_compile
+        self.model = maybe_compile(self.model, mode="reduce-overhead")
                 logger.info("torch.compile enabled for Transformer (mode=reduce-overhead).")
             except Exception as e:
                 logger.warning(f"torch.compile failed for Transformer, continuing without: {e}", exc_info=True)

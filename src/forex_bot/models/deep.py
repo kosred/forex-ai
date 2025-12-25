@@ -166,7 +166,8 @@ class NBeatsExpert(ExpertModel):
 
         try:
             if torch.cuda.is_available() and hasattr(torch, "compile"):
-                self.model = torch.compile(self.model)
+                from .device import maybe_compile
+        self.model = maybe_compile(self.model)
         except Exception as e:
             logger.warning(f"NBeats torch.compile failed: {e}")
 
@@ -398,7 +399,8 @@ class TiDEExpert(ExpertModel):
 
         try:
             if torch.cuda.is_available() and hasattr(torch, "compile"):
-                self.model = torch.compile(self.model)
+                from .device import maybe_compile
+        self.model = maybe_compile(self.model)
         except Exception as e:
             logger.warning(f"TiDE torch.compile failed: {e}")
 
@@ -613,7 +615,8 @@ class TabNetExpert(ExpertModel):
 
         try:
             if torch.cuda.is_available() and hasattr(torch, "compile"):
-                self.model = torch.compile(self.model)
+                from .device import maybe_compile
+        self.model = maybe_compile(self.model)
         except Exception as e:
             logger.warning(f"TabNet torch.compile failed: {e}")
 
@@ -817,7 +820,8 @@ class KANExpert(ExpertModel):
 
         try:
             if torch.cuda.is_available() and hasattr(torch, "compile"):
-                self.model = torch.compile(self.model)
+                from .device import maybe_compile
+        self.model = maybe_compile(self.model)
         except Exception as e:
             logger.warning(f"KAN torch.compile failed: {e}")
 

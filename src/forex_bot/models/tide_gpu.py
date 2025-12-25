@@ -101,12 +101,9 @@ class TiDEExpert(ExpertModel):
 
         is_cuda = str(self.device).startswith("cuda")
         compile_flag = os.environ.get("TORCH_COMPILE", "auto").lower()
-        if compile_flag not in {"0", "false", "no"} and is_cuda:
-            try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                logger.info("torch.compile enabled for TiDE GPU.")
-            except Exception as e:
-                logger.warning(f"torch.compile failed for TiDE GPU: {e}")
+        self.model.to(self.device)
+        from .device import maybe_compile
+        self.model = maybe_compile(self.model, mode="reduce-overhead")
 
         split = int(len(X) * 0.85)
         X_train, X_val = X.iloc[:split], X.iloc[split:]

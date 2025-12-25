@@ -282,3 +282,25 @@ def wrap_ddp(
         return model_dp, dev, False, 0, 1
     except Exception:
         return model, device, False, 0, 1
+
+
+def maybe_compile(model: torch.nn.Module, **kwargs) -> torch.nn.Module:
+    """
+    Conditionally apply torch.compile to a model.
+    Disabled if FOREX_BOT_DISABLE_COMPILE=1 or on Windows (where it often fails).
+    """
+    if os.environ.get("FOREX_BOT_DISABLE_COMPILE") == "1":
+        return model
+    
+    if os.name == "nt" and os.environ.get("FOREX_BOT_FORCE_COMPILE") != "1":
+        # torch.compile is notoriously flaky on Windows
+        return model
+
+    try:
+        if hasattr(torch, "compile"):
+            logger.info(f"Applying torch.compile to {model.__class__.__name__}...")
+            return torch.compile(model, **kwargs)
+    except Exception as e:
+        logger.warning(f"torch.compile failed for {model.__class__.__name__}: {e}")
+    
+    return model

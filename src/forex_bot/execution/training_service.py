@@ -872,13 +872,20 @@ class TrainingService:
             spawn_ctx = multiprocessing.get_context("spawn")
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
                 futures: dict[concurrent.futures.Future, str] = {}
-                for sym, frames in raw_frames_map.items():
+                gpu_count = len(self.discovery_engine.gpu_pool) if hasattr(self.discovery_engine, "gpu_pool") else 1
+                if gpu_count <= 1:
+                    import torch
+                    gpu_count = torch.cuda.device_count()
+
+                for i, (sym, frames) in enumerate(raw_frames_map.items()):
+                    assigned_gpu = i % max(1, gpu_count)
                     fut = executor.submit(
                         _hpc_feature_worker,
                         self.settings.model_copy(),
                         frames,
                         sym,
                         news_map.get(sym),
+                        assigned_gpu,
                     )
                     futures[fut] = sym
 
@@ -1030,8 +1037,11 @@ class TrainingService:
 
 
 # Standalone worker function for ProcessPoolExecutor (must be picklable)
-def _hpc_feature_worker(settings, frames, sym, news_features=None):
+def _hpc_feature_worker(settings, frames, sym, news_features=None, assigned_gpu=0):
     try:
+        # Set GPU affinity before any torch/cupy imports
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+        
         # Re-instantiate FE inside worker
         from ..features.pipeline import FeatureEngineer
 
