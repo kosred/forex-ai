@@ -135,7 +135,9 @@ class TensorDiscoveryEngine:
                     running_peak = batch_peaks[:, -1]
 
                     del signals, actions, rets, batch_rets, batch_cum, abs_cum, batch_peaks
-                    torch.cuda.empty_cache()
+                
+                # We only clear cache after the full sample pass, not per batch
+                torch.cuda.empty_cache()
                 
                 mean_ret = sum_ret / n_samples
                 std_ret = torch.sqrt(torch.clamp((sum_sq_ret / n_samples) - mean_ret**2, min=1e-9)) + 1e-6
@@ -164,7 +166,7 @@ class TensorDiscoveryEngine:
         logger.info(f"Starting COOPERATIVE 4-GPU Discovery (Pop: 4000)...")
         for i in range(iterations):
             searcher.step()
-            if i % 50 == 0:
+            if i % 10 == 0:
                 best_val = searcher.status.get("best_eval", 0.0)
                 logger.info(f"Generation {i}: Global Best Fitness = {float(best_val):.4f}")
 
