@@ -101,6 +101,7 @@ class TiDEExpert(ExpertModel):
 
         is_cuda = str(self.device).startswith("cuda")
         compile_flag = os.environ.get("TORCH_COMPILE", "auto").lower()
+        if compile_flag not in {"0", "false", "no"} and is_cuda:
             try:
                 self.model.to(self.device)
                 from .device import maybe_compile
