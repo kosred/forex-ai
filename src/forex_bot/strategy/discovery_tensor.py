@@ -102,12 +102,17 @@ class TensorDiscoveryEngine:
                 end_idx = min(start_idx + batch_size, n_samples)
                 data_slice = self.data_cube[:, start_idx:end_idx, :]
                 
-                combined_slice_signals = torch.zeros((pop_size, end_idx - start_idx), device=self.device)
-                for tf_idx in range(tf_count):
+                # Force standard mutable tensor for accumulation
+                current_batch_size = end_idx - start_idx
+                combined_slice_signals = torch.zeros((pop_size, current_batch_size), device=self.device, dtype=torch.float32)
+                
+                for tf_idx in range(self.data_cube.shape[0]):
                     tf_sig = torch.matmul(data_slice[tf_idx], logic_weights.t())
+                    # Out-of-place add
                     combined_slice_signals = combined_slice_signals + (tf_weights[:, tf_idx].unsqueeze(1) * tf_sig.t())
                     del tf_sig
                 
+                # Actions: out-of-place logic
                 long_mask = (combined_slice_signals > thresholds[:, 0].unsqueeze(1)).float()
                 short_mask = (combined_slice_signals < thresholds[:, 1].unsqueeze(1)).float()
                 actions = long_mask - short_mask
@@ -119,24 +124,36 @@ class TensorDiscoveryEngine:
                 # Batch returns: (Pop, Batch_Samples)
                 batch_returns = actions * rets.unsqueeze(0)
                 
-                # 1. Update Sharpe Metrics
-                sum_returns += batch_returns.sum(dim=1)
-                sum_sq_returns += (batch_returns**2).sum(dim=1)
+                # Update Sharpe Metrics (Out-of-place)
+                sum_returns = sum_returns + batch_returns.sum(dim=1)
+                sum_sq_returns = sum_sq_returns + (batch_returns**2).sum(dim=1)
                 
-                # 2. Update Consistency (Approximate by batch or better by chunk)
-                current_chunk_ret += batch_returns.sum(dim=1)
+                # Update Consistency (Out-of-place)
+                current_chunk_ret = current_chunk_ret + batch_returns.sum(dim=1)
                 if (end_idx // chunk_size) > (start_idx // chunk_size):
-                    profitable_chunks += (current_chunk_ret > 0).float()
-                    current_chunk_ret.zero_()
+                    profitable_chunks = profitable_chunks + (current_chunk_ret > 0).float()
+                    current_chunk_ret = torch.zeros_like(current_chunk_ret)
 
-                # 3. Update Drawdown (Peak tracking)
-                # This is a simplified rolling DD to save memory
-                for t in range(batch_returns.shape[1]):
-                    running_cum_ret += batch_returns[:, t]
-                    running_peak = torch.maximum(running_peak, running_cum_ret)
-                    max_drawdown = torch.maximum(max_drawdown, running_peak - running_cum_ret)
+                # Update Drawdown (Peak tracking - vectorized batch update)
+                # Instead of a slow per-time loop, we use batch cumulative sum
+                batch_cum_ret = batch_returns.cumsum(dim=1)
+                
+                # Absolute cumulative return including previous batches
+                abs_batch_cum_ret = batch_cum_ret + running_cum_ret.unsqueeze(1)
+                
+                # Global peak tracking
+                batch_peaks = torch.cummax(abs_batch_cum_ret, dim=1)[0]
+                batch_peaks = torch.maximum(batch_peaks, running_peak.unsqueeze(1))
+                
+                # Drawdown update
+                batch_dd = batch_peaks - abs_batch_cum_ret
+                max_drawdown = torch.maximum(max_drawdown, batch_dd.max(dim=1)[0])
+                
+                # Carry forward state for next batch
+                running_cum_ret = abs_batch_cum_ret[:, -1]
+                running_peak = batch_peaks[:, -1]
 
-                del combined_slice_signals, actions, rets, batch_returns, long_mask, short_mask
+                del combined_slice_signals, actions, rets, batch_returns, long_mask, short_mask, batch_cum_ret, abs_batch_cum_ret, batch_peaks, batch_dd
                 torch.cuda.empty_cache()
             
             # Final Metrics
