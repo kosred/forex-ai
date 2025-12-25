@@ -101,9 +101,10 @@ class TiDEExpert(ExpertModel):
 
         is_cuda = str(self.device).startswith("cuda")
         compile_flag = os.environ.get("TORCH_COMPILE", "auto").lower()
-        self.model.to(self.device)
-        from .device import maybe_compile
-        self.model = maybe_compile(self.model, mode="reduce-overhead")
+            try:
+                self.model.to(self.device)
+                from .device import maybe_compile
+                self.model = maybe_compile(self.model, mode="reduce-overhead")
 
         split = int(len(X) * 0.85)
         X_train, X_val = X.iloc[:split], X.iloc[split:]

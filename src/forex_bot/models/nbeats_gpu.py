@@ -112,9 +112,9 @@ class NBeatsExpert(ExpertModel):
         compile_flag = os.environ.get("TORCH_COMPILE", "auto").lower()
         if compile_flag not in {"0", "false", "no"} and is_cuda:
             try:
-        self.model.to(self.device)
-        from .device import maybe_compile
-        self.model = maybe_compile(self.model, mode="reduce-overhead")
+                self.model.to(self.device)
+                from .device import maybe_compile
+                self.model = maybe_compile(self.model, mode="reduce-overhead")
 
                 logger.info("torch.compile enabled for NBeats GPU.")
             except Exception as e:
