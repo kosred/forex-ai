@@ -112,18 +112,18 @@ class TensorDiscoveryEngine:
                 end_idx = min(start_idx + batch_size, n_samples)
                 data_slice = self.data_cube[:, start_idx:end_idx, :] # (TFs, Batch, Feats)
                 
-                # Running sum consensus (Avoids massive stack OOM)
-                combined_slice_signals = torch.zeros((pop_size, end_idx - start_idx), device=self.device)
+                # Force standard mutable tensor for accumulation
+                current_batch_size = end_idx - start_idx
+                combined_slice_signals = torch.zeros((pop_size, current_batch_size), device=self.device, dtype=torch.float32)
                 
                 for tf_idx in range(self.data_cube.shape[0]):
                     # (Batch, Feats) @ (Pop, Feats).T -> (Batch, Pop)
                     tf_sig = torch.matmul(data_slice[tf_idx], logic_weights.t()) # (Batch, Pop)
-                    # Add weighted contribution directly
-                    combined_slice_signals += tf_weights[:, tf_idx].unsqueeze(1) * tf_sig.t()
+                    # Add weighted contribution: (Pop, 1) * (Pop, Batch)
+                    combined_slice_signals = combined_slice_signals + (tf_weights[:, tf_idx].unsqueeze(1) * tf_sig.t())
                     del tf_sig
                 
-                # Trade Actions (Use torch.where to avoid modifying ReadOnlyTensors)
-                # actions: 1 for buy, -1 for sell, 0 for neutral
+                # Trade Actions (Use out-of-place torch.where)
                 actions = torch.where(combined_slice_signals > thresholds[:, 0].unsqueeze(1), 
                                       torch.ones_like(combined_slice_signals), 
                                       torch.zeros_like(combined_slice_signals))
