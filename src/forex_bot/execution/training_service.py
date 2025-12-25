@@ -267,11 +267,30 @@ class TrainingService:
         logger.info("Launching GPU-Native Expert Discovery...")
         from ..strategy.discovery_tensor import TensorDiscoveryEngine
         
+        # ENRICHMENT: Inject the engineered features (TA-Lib, etc.) into the frames for Discovery
+        # This allows the unsupervised engine to see the 200+ new features we just generated.
+        discovery_frames = frames.copy()
+        base_tf = self.settings.system.base_timeframe
+        if base_tf in discovery_frames:
+             # Merge dataset.X (features) with original OHLC (needed for PnL)
+             rich_df = dataset.X.copy()
+             # Ensure OHLC exists (dataset.X might strictly be features)
+             if "close" not in rich_df.columns:
+                 orig = discovery_frames[base_tf].reindex(rich_df.index).ffill()
+                 for col in ["open", "high", "low", "close"]:
+                     if col in orig.columns:
+                         rich_df[col] = orig[col]
+             discovery_frames[base_tf] = rich_df
+
         # New Unsupervised Tensor Engine (Million-Search)
         discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=20)
         
-        # We need to pass the multi-timeframe frames to the engine
-        discovery_tensor.run_unsupervised_search(frames, iterations=1000)
+        # We need to pass the enriched multi-timeframe frames to the engine
+        discovery_tensor.run_unsupervised_search(
+            discovery_frames, 
+            news_features=news_feats,
+            iterations=1000
+        )
         discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
         async with asyncio.TaskGroup() as tg:
