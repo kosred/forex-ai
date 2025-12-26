@@ -1094,15 +1094,25 @@ class TrainingService:
 # Standalone worker function for ProcessPoolExecutor (must be picklable)
 def _hpc_feature_worker(settings, frames, sym, news_features=None, assigned_gpu=0):
     try:
+        import sys
+        import os
+        from pathlib import Path
+        
         # Set GPU affinity before any torch/cupy imports
         os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
         
+        # Add src/ to path explicitly to ensure latest code is loaded in the worker process
+        project_root = Path(__file__).resolve().parents[3]
+        src_path = str(project_root / "src")
+        if src_path not in sys.path:
+            sys.path.insert(0, src_path)
+        
         # Re-instantiate FE inside worker
-        from ..features.pipeline import FeatureEngineer
+        from forex_bot.features.pipeline import FeatureEngineer
 
         fe = FeatureEngineer(settings)
         return fe.prepare(frames, news_features=news_features, symbol=sym)
     except Exception as e:
         import logging
-        logging.getLogger(__name__).error(f"Worker failed for {sym}: {e}")
+        logging.getLogger(__name__).error(f"Worker failed for {sym}: {e}", exc_info=True)
         return None
