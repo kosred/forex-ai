@@ -509,96 +509,183 @@ class FeatureEngineer:
             labels=labels,
         )
 
-    def _compute_comprehensive_talib_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Dynamically injects the massive TA-Lib indicator set with HYPERSPACE EXPANSION.
-        Generates multiple variations (Fast, Med, Slow) so the Discovery Engine can
-        'evolve' parameters by selecting the best features.
-        """
-        if not TALIB_AVAILABLE:
-            return df
-            
-        try:
-            # Inputs (float64 for precision)
-            inputs = {
-                'open': df["open"].values.astype(np.float64),
-                'high': df["high"].values.astype(np.float64),
-                'low': df["low"].values.astype(np.float64),
-                'close': df["close"].values.astype(np.float64),
-                'volume': df["volume"].values.astype(np.float64) if "volume" in df.columns else np.random.random(len(df))
-            }
+        def _compute_comprehensive_talib_features(self, df: pd.DataFrame) -> pd.DataFrame:
 
-            # 1. Standard "Kitchen Sink" (Defaults)
-            # We still run this to catch everything else not in our explicit variations list
-            for ind_name in ALL_INDICATORS:
-                try:
-                    # Skip if we handle it explicitly below to avoid duplicates (optional, but cleaner)
-                    if ind_name in ["SMA", "EMA", "RSI", "BBANDS", "ADX", "CCI", "MOM", "ROC", "WILLR", "ATR"]:
-                        continue
+            """
+
+            Dynamically injects the massive TA-Lib indicator set with HYPERSPACE EXPANSION.
+
+            Optimized to collect features and concat once to avoid memory fragmentation.
+
+            """
+
+            if not TALIB_AVAILABLE:
+
+                return df
+
+                
+
+            try:
+
+                # Inputs (float64 for precision)
+
+                inputs = {
+
+                    'open': df["open"].values.astype(np.float64),
+
+                    'high': df["high"].values.astype(np.float64),
+
+                    'low': df["low"].values.astype(np.float64),
+
+                    'close': df["close"].values.astype(np.float64),
+
+                    'volume': df["volume"].values.astype(np.float64) if "volume" in df.columns else np.random.random(len(df))
+
+                }
+
+    
+
+                # Collect new columns here instead of inserting into df one-by-one
+
+                new_features = {}
+
+    
+
+                # 1. Standard "Kitchen Sink" (Defaults)
+
+                for ind_name in ALL_INDICATORS:
+
+                    try:
+
+                        if ind_name in ["SMA", "EMA", "RSI", "BBANDS", "ADX", "CCI", "MOM", "ROC", "WILLR", "ATR"]:
+
+                            continue
+
+                            
+
+                        func = abstract.Function(ind_name)
+
+                        res = func(inputs)
+
                         
-                    func = abstract.Function(ind_name)
-                    res = func(inputs)
-                    if isinstance(res, (list, tuple)):
-                        for i, arr in enumerate(res):
-                            df[f"ta_{ind_name.lower()}_{i}"] = arr.astype(np.float32)
-                    elif isinstance(res, (pd.Series, np.ndarray)):
-                        val = res.values if isinstance(res, pd.Series) else res
-                        df[f"ta_{ind_name.lower()}"] = val.astype(np.float32)
-                except Exception:
-                    continue
 
-            # 2. Hyperspace Variations (The "Unsupervised Parameter Search")
-            # We generate multiple versions of high-value indicators.
-            # The Discovery Engine will learn to weight 'ta_rsi_9' higher than 'ta_rsi_14' if it works better.
-            
-            # Simple Period Variations
-            simple_vars = {
-                "RSI": [9, 14, 21, 34],
-                "ADX": [14, 30],
-                "ATR": [14, 30],
-                "CCI": [14, 34, 50],
-                "MOM": [10, 20],
-                "ROC": [10, 20],
-                "WILLR": [14, 34],
-                "SMA": [20, 50, 100, 200],
-                "EMA": [9, 21, 50, 200],
-                "WMA": [20, 50],
-                "T3": [5, 10],
-                "CMO": [9, 14]
-            }
-            
-            for name, periods in simple_vars.items():
-                try:
-                    func = abstract.Function(name)
-                    for p in periods:
-                        # Most TA-Lib functions take 'timeperiod'
-                        res = func(inputs, timeperiod=p)
-                        col = f"ta_{name.lower()}_{p}"
-                        if isinstance(res, (pd.Series, np.ndarray)):
+                        if isinstance(res, (list, tuple)):
+
+                            for i, arr in enumerate(res):
+
+                                new_features[f"ta_{ind_name.lower()}_{i}"] = arr.astype(np.float32)
+
+                        elif isinstance(res, (pd.Series, np.ndarray)):
+
                             val = res.values if isinstance(res, pd.Series) else res
-                            df[col] = val.astype(np.float32)
+
+                            new_features[f"ta_{ind_name.lower()}"] = val.astype(np.float32)
+
+                    except Exception:
+
+                        continue
+
+    
+
+                # 2. Hyperspace Variations
+
+                simple_vars = {
+
+                    "RSI": [9, 14, 21, 34],
+
+                    "ADX": [14, 30],
+
+                    "ATR": [14, 30],
+
+                    "CCI": [14, 34, 50],
+
+                    "MOM": [10, 20],
+
+                    "ROC": [10, 20],
+
+                    "WILLR": [14, 34],
+
+                    "SMA": [20, 50, 100, 200],
+
+                    "EMA": [9, 21, 50, 200],
+
+                    "WMA": [20, 50],
+
+                    "T3": [5, 10],
+
+                    "CMO": [9, 14]
+
+                }
+
+                
+
+                for name, periods in simple_vars.items():
+
+                    try:
+
+                        func = abstract.Function(name)
+
+                        for p in periods:
+
+                            res = func(inputs, timeperiod=p)
+
+                            col = f"ta_{name.lower()}_{p}"
+
+                            if isinstance(res, (pd.Series, np.ndarray)):
+
+                                val = res.values if isinstance(res, pd.Series) else res
+
+                                new_features[col] = val.astype(np.float32)
+
+                    except Exception:
+
+                        pass
+
+    
+
+                # Complex Variations (BBANDS)
+
+                bb_vars = [(20, 2.0, 2.0), (20, 2.5, 2.5), (50, 2.0, 2.0)]
+
+                try:
+
+                    func = abstract.Function("BBANDS")
+
+                    for p, dev_up, dev_dn in bb_vars:
+
+                        u, m, l = func(inputs, timeperiod=p, nbdevup=dev_up, nbdevdn=dev_dn)
+
+                        suffix = f"{p}_{int(dev_up*10)}"
+
+                        new_features[f"ta_bb_upper_{suffix}"] = u.astype(np.float32)
+
+                        new_features[f"ta_bb_lower_{suffix}"] = l.astype(np.float32)
+
                 except Exception:
+
                     pass
 
-            # Complex Variations (BBANDS)
-            # (period, dev_up, dev_dn)
-            bb_vars = [(20, 2.0, 2.0), (20, 2.5, 2.5), (50, 2.0, 2.0)]
-            try:
-                func = abstract.Function("BBANDS")
-                for p, dev_up, dev_dn in bb_vars:
-                    # BBANDS returns [upper, middle, lower]
-                    u, m, l = func(inputs, timeperiod=p, nbdevup=dev_up, nbdevdn=dev_dn)
-                    # We usually care about bandwidth or %b, but raw bands are useful for crossing logic
-                    suffix = f"{p}_{int(dev_up*10)}"
-                    df[f"ta_bb_upper_{suffix}"] = u.astype(np.float32)
-                    df[f"ta_bb_lower_{suffix}"] = l.astype(np.float32)
-            except Exception:
-                pass
+                
 
-        except Exception as e:
-            logger.warning(f"TA-Lib comprehensive dynamic injection failed: {e}")
-        
-        return df.fillna(0.0)
+                # Efficient Merge
+
+                if new_features:
+
+                    new_df = pd.DataFrame(new_features, index=df.index)
+
+                    return pd.concat([df, new_df], axis=1)
+
+    
+
+            except Exception as e:
+
+                logger.warning(f"TA-Lib comprehensive dynamic injection failed: {e}")
+
+            
+
+            return df.fillna(0.0)
+
+    
 
     def _compute_atr_wicks_cpu(self, df):
         high, low, close = df["high"].values, df["low"].values, df["close"].values
@@ -726,25 +813,37 @@ class FeatureEngineer:
 
     def _compute_volatility_features(self, df: DataFrame, *, as_pandas: bool = True) -> DataFrame:
         try:
-            gpu_mode = hasattr(df, "to_pandas") and df.__class__.__module__.startswith("cudf")  # crude check
+            gpu_mode = hasattr(df, "to_pandas") and df.__class__.__module__.startswith("cudf")
             if gpu_mode and hasattr(df, "to_pandas"):
                 pass  # type: ignore
-            df["realized_vol"] = df["returns"].rolling(30).std().fillna(0.0)
-            df["ewma_vol"] = df["returns"].ewm(span=30, adjust=False).std().fillna(0.0)
+            
+            new_feats = {}
+            new_feats["realized_vol"] = df["returns"].rolling(30).std().fillna(0.0)
+            new_feats["ewma_vol"] = df["returns"].ewm(span=30, adjust=False).std().fillna(0.0)
 
             rolling_20 = df["close"].rolling(20)
             ma20 = rolling_20.mean()
             sd20 = rolling_20.std().fillna(0.0)
-            df["boll_width"] = np.where(ma20.abs() > 1e-6, 2.0 * sd20 / ma20.abs(), 0.0)
+            # Use safe division
+            new_feats["boll_width"] = np.where(ma20.abs() > 1e-6, 2.0 * sd20 / ma20.abs(), 0.0)
 
             rolling_50 = df["close"].rolling(50)
             ma50 = rolling_50.mean()
             sd50 = rolling_50.std().fillna(0.0)
-            df["zscore_close"] = np.where(sd50 > 1e-6, (df["close"] - ma50) / sd50, 0.0)
+            new_feats["zscore_close"] = np.where(sd50 > 1e-6, (df["close"] - ma50) / sd50, 0.0)
 
             if gpu_mode and hasattr(df, "to_pandas"):
                 df = df.to_pandas()
+            
+            # Efficient Merge
+            vol_df = pd.DataFrame(new_feats, index=df.index)
+            # Update existing df columns if they exist (to respect pipeline flow) or append
+            # Since we modify df in place usually, but here we return df.
+            # Faster: concat
+            return pd.concat([df, vol_df], axis=1)
+            
         except Exception:
+            # Fallback
             for col in ["realized_vol", "ewma_vol", "boll_width", "zscore_close"]:
                 if col not in df.columns:
                     df[col] = 0.0
