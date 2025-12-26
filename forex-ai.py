@@ -9,17 +9,39 @@ Usage:
     ./forex-ai.py --verbose    # Enable debug logging
 
 Works on Windows, Linux, Mac with zero configuration.
+Auto-detects HPC environments (CUDA, multiple GPUs) and optimizes accordingly.
 """
 
 import os
 import sys
+import subprocess
 from pathlib import Path
 
+# --- 1. Path & Environment Bootstrap ---
 # Fix Python path for direct execution from source tree
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_DIR = SCRIPT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+
+# Ensure PYTHONPATH includes src for subprocesses (workers, DDP)
+os.environ["PYTHONPATH"] = str(SRC_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+# --- 2. HPC / Stability Tuning ---
+# Disable torch.compile to prevent nvvmAddNVVMContainerToProgram/JIT errors on some drivers
+os.environ.setdefault("FOREX_BOT_DISABLE_COMPILE", "1")
+
+# Tuning for 16GB+ VRAM Cards (A4000/A6000)
+os.environ.setdefault("FOREX_BOT_GLOBAL_POOL_MEM_FRAC", "0.20")
+os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", "auto")
+
+# Linux-specific: Ensure system CUDA libraries take precedence if present
+if sys.platform.startswith("linux"):
+    cuda_lib = "/usr/local/cuda/targets/x86_64-linux/lib"
+    if os.path.exists(cuda_lib):
+        current_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        if cuda_lib not in current_ld:
+            os.environ["LD_LIBRARY_PATH"] = f"{cuda_lib}:{current_ld}"
 
 if __name__ == "__main__":
     if "--_worker" in sys.argv[1:]:
@@ -34,66 +56,71 @@ if __name__ == "__main__":
 
     print("=" * 60)
     try:
-        print("?? FOREX AI TRADING BOT")
+        print("?? FOREX AI TRADING BOT (Universal Launcher)")
     except UnicodeEncodeError:
-        print("FOREX AI TRADING BOT")  # Fallback for Windows terminals
+        print("FOREX AI TRADING BOT (Universal Launcher)")
     print("=" * 60)
 
-    # Defer heavy imports (deps auto-install) to normal mode only.
+    # --- 3. Dependency Check ---
     try:
         if os.environ.get("FOREX_BOT_SKIP_DEPS", "0") != "1":
             print("[INIT] Checking and auto-installing dependencies (Hardware-Aware)...", flush=True)
             from forex_bot.core.deps import ensure_dependencies
 
             ensure_dependencies()
+            
+            # Self-Correction: Ensure package is installed in editable mode if using venv
+            # This prevents "AttributeError" in workers due to stale package installs
+            if sys.prefix != sys.base_prefix: # Running in venv
+                try:
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", "."], cwd=SCRIPT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print("[INIT] Source code linked to environment (pip install -e .).")
+                except Exception:
+                    pass
         else:
             print("[INIT] Skipping dependency bootstrap (FOREX_BOT_SKIP_DEPS=1).", flush=True)
     except Exception as dep_err:
         print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
 
-    # Auto-set GPU-related env hints for parallel model training (non-DDP).
-    # Uses all visible GPUs unless user overrides FOREX_BOT_MAX_GPUS.
+    # --- 4. Hardware Detection & DDP Launch ---
     try:
         import torch
-
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
             cpu_cores = os.cpu_count() or 1
+            
+            print(f"[INIT] Detected {gpu_count} GPUs. Tuning for performance...")
+            
             # Use all visible GPUs unless user overrides.
             os.environ.setdefault("FOREX_BOT_MAX_GPUS", str(gpu_count))
             os.environ.setdefault("SYSTEM__NUM_GPUS", str(gpu_count))
             os.environ.setdefault("SYSTEM__ENABLE_GPU_PREFERENCE", "auto")
             os.environ.setdefault("FOREX_BOT_TREE_DEVICE", "auto")
-            # Cap threads per worker to avoid CPU thrash; scale with cores/gpus.
+            
+            # Cap threads per worker to avoid CPU thrash
             threads_per_worker = max(2, min(16, cpu_cores // max(1, gpu_count)))
             os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(threads_per_worker))
-            # Keep parallel models enabled by default when multi-GPU present.
-            if gpu_count > 1:
-                os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", "1")
-            # Keep feature workers modest to avoid pool crashes; at most 4 or gpu_count.
-            fw = str(os.environ.get("FEATURE_WORKERS", "")).strip()
-            if not fw:
-                os.environ["FEATURE_WORKERS"] = str(max(1, min(4, gpu_count)))
-    except Exception:
-        pass
+            
+            # Feature Workers: Scale with CPU cores but cap to avoid OOM
+            if not os.environ.get("FEATURE_WORKERS"):
+                # A4000/A6000 nodes usually have high core counts
+                rec_workers = max(1, min(32, cpu_cores // 2))
+                os.environ["FEATURE_WORKERS"] = str(rec_workers)
 
-    # NOTE: Auto-DDP launch is opt-in via FOREX_BOT_ENABLE_DDP=1.
-    if (
-        os.name != "nt"
-        and os.environ.get("FOREX_BOT_DDP_LAUNCHED") != "1"
-        and os.environ.get("FOREX_BOT_ENABLE_DDP") == "1"
-    ):
-        try:
-            import torch
-        except Exception:
-            torch = None
-        if torch is not None and torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            if gpu_count and gpu_count > 1:
-                import subprocess
-
+            # Auto-DDP: If > 1 GPU and running on Linux, relaunch with torchrun
+            # We skip this if already launched or on Windows (DDP issues)
+            if (
+                os.name != "nt"
+                and gpu_count > 1
+                and os.environ.get("FOREX_BOT_DDP_LAUNCHED") != "1"
+                and "--train" in sys.argv # Only use DDP for training
+            ):
+                print(f"[HPC] Relaunching with torch.distributed.run across {gpu_count} GPUs...", flush=True)
                 env = os.environ.copy()
                 env["FOREX_BOT_DDP_LAUNCHED"] = "1"
+                # OMP_NUM_THREADS=1 prevents CPU oversubscription in DDP
+                env["OMP_NUM_THREADS"] = "1" 
+                
                 cmd = [
                     sys.executable,
                     "-m",
@@ -102,20 +129,24 @@ if __name__ == "__main__":
                     __file__,
                     *sys.argv[1:],
                 ]
-                print(f"[INIT] Detected {gpu_count} GPUs. Relaunching under torchrun for DDP...", flush=True)
                 subprocess.check_call(cmd, env=env)
                 sys.exit(0)
+    except Exception:
+        pass
 
+    # --- 5. Main Execution ---
     from forex_bot.main import _global_models_exist, main
 
     has_models = _global_models_exist()
     mode_desc = "LIVE TRADING (models exist)" if has_models else "TRAINING FIRST (no models)"
-    print(f"Mode: AUTOMATIC - {mode_desc}")
+    if "--train" in sys.argv: mode_desc = "TRAINING (Forced)"
+    if "--run" in sys.argv: mode_desc = "LIVE TRADING (Forced)"
+    
+    print(f"Mode: {mode_desc}")
     print(f"Working Directory: {os.getcwd()}")
     print(f"Python: {sys.version.split()[0]}")
     print("=" * 60)
 
-    # Delegate CLI parsing and logging setup to forex_bot.main
     try:
         main()
     except KeyboardInterrupt:
@@ -124,6 +155,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n[ERROR] Fatal error: {e}")
         import traceback
-
         traceback.print_exc()
         sys.exit(1)
