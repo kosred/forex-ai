@@ -294,11 +294,12 @@ class TrainingService:
         
         print("DEBUG: Aligning all discovery frames to enriched feature space...")
         reference_df = discovery_frames[base_tf]
+        aligned_frames = {}
         
         for tf in ["M1", "M5", "M15", "H1", "H4", "D1"]:
             if tf in frames:
                 # Reindex reference (Rich Features) to target TF index
-                aligned = reference_df.reindex(frames[tf].index, method="ffill").fillna(0.0)
+                aligned = reference_df.reindex(frames[tf].index).ffill().fillna(0.0)
                 # Ensure OHLC is from the TARGET timeframe
                 aligned["open"] = frames[tf]["open"]
                 aligned["high"] = frames[tf]["high"]

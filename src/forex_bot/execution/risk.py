@@ -209,6 +209,7 @@ class RiskManager:
             silent=True,  # Silence logs during initialization and backtesting
         )
 
+        self.last_risk_mult = 1.0
         self.load_state()
 
     def save_state(self) -> None:
