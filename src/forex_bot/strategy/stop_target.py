@@ -28,6 +28,41 @@ def _rolling_var(values: np.ndarray, window: int) -> np.ndarray:
     return pd.Series(values).rolling(window, min_periods=window).var(ddof=1).to_numpy()
 
 
+def _vol_ewma(close: np.ndarray, *, window: int, lam: float) -> np.ndarray:
+    close = np.asarray(close, dtype=np.float64)
+    n = len(close)
+    if n < 2:
+        return np.zeros_like(close)
+    lam = float(lam)
+    if not np.isfinite(lam) or lam <= 0.0 or lam >= 1.0:
+        lam = 0.94
+    r = np.diff(_safe_log(close))
+    var = np.full(n, np.nan, dtype=np.float64)
+    if window <= 1:
+        init = float(np.nanmean(r * r)) if r.size > 0 else 0.0
+    else:
+        span = min(window, r.size)
+        init = float(np.nanmean(r[:span] * r[:span])) if span > 0 else 0.0
+    if not np.isfinite(init):
+        init = 0.0
+    if n > 1:
+        var[1] = init
+    for i in range(1, r.size):
+        prev = var[i]
+        if not np.isfinite(prev):
+            prev = init
+        var[i + 1] = (lam * prev) + ((1.0 - lam) * (r[i] * r[i]))
+    sigma = np.sqrt(np.maximum(var, 0.0))
+    last = 0.0
+    for i in range(n):
+        val = sigma[i]
+        if np.isfinite(val) and val > 0:
+            last = float(val)
+        else:
+            sigma[i] = last
+    return sigma
+
+
 def _vol_parkinson(high: np.ndarray, low: np.ndarray) -> np.ndarray:
     hl = _safe_log(high) - _safe_log(low)
     return (hl * hl) / (4.0 * np.log(2.0))
@@ -77,6 +112,83 @@ def _vol_yang_zhang(open_: np.ndarray, high: np.ndarray, low: np.ndarray, close:
     return np.sqrt(np.maximum(sigma2, 0.0))
 
 
+def _normalize_ensemble_weights(weights: dict[str, float] | None) -> dict[str, float] | None:
+    if not weights:
+        return None
+    normalized: dict[str, float] = {}
+    for key, value in weights.items():
+        if value is None:
+            continue
+        name = str(key).strip().lower()
+        if name in {"yz", "yang-zhang"}:
+            name = "yang_zhang"
+        elif name in {"gk", "garman-klass", "garman klass"}:
+            name = "garman_klass"
+        elif name in {"rs", "rogers-satchell", "rogers satchell"}:
+            name = "rogers_satchell"
+        elif name in {"pk", "park"}:
+            name = "parkinson"
+        try:
+            val = float(value)
+        except Exception:
+            continue
+        if val > 0:
+            normalized[name] = val
+    if not normalized:
+        return None
+    total = float(sum(normalized.values()))
+    if total <= 0:
+        return None
+    for key in list(normalized.keys()):
+        normalized[key] = normalized[key] / total
+    return normalized
+
+
+def _get_ensemble_weights(settings: Settings | None, regime: str | None = None) -> dict[str, float] | None:
+    if settings is None:
+        return None
+    if regime:
+        override = getattr(settings.risk, f"vol_ensemble_weights_{regime}", None)
+        if isinstance(override, dict) and override:
+            return _normalize_ensemble_weights(override)
+    base = getattr(settings.risk, "vol_ensemble_weights", None)
+    if isinstance(base, dict) and base:
+        return _normalize_ensemble_weights(base)
+    return None
+
+
+def _resolve_ewma_lambda(settings: Settings | None, df: pd.DataFrame | None = None) -> float:
+    lam = 0.94
+    if settings is None:
+        return lam
+    try:
+        lam = float(getattr(settings.risk, "ewma_lambda", 0.94) or 0.94)
+    except Exception:
+        lam = 0.94
+    tf_map = getattr(settings.risk, "ewma_lambda_by_timeframe", None)
+    tf = None
+    if df is not None:
+        try:
+            tf = df.attrs.get("timeframe") or df.attrs.get("tf")
+        except Exception:
+            tf = None
+    if not tf:
+        try:
+            tf = getattr(settings.system, "base_timeframe", None)
+        except Exception:
+            tf = None
+    if tf_map and tf:
+        try:
+            tf_key = str(tf).strip().upper()
+            if tf_key in tf_map:
+                lam = float(tf_map[tf_key])
+        except Exception:
+            pass
+    if not np.isfinite(lam) or lam <= 0.0 or lam >= 1.0:
+        lam = 0.94
+    return lam
+
+
 def estimate_volatility(
     open_: np.ndarray,
     high: np.ndarray,
@@ -85,8 +197,37 @@ def estimate_volatility(
     *,
     window: int,
     method: str,
+    weights: dict[str, float] | None = None,
+    ewma_lambda: float | None = None,
 ) -> np.ndarray:
     method = (method or "yang_zhang").lower()
+    if method in {"ensemble", "mix", "blend"}:
+        v_pk = _vol_parkinson(high, low)
+        sigma_pk = np.sqrt(np.maximum(_rolling_mean(v_pk, window), 0.0))
+
+        v_gk = _vol_garman_klass(open_, high, low, close)
+        sigma_gk = np.sqrt(np.maximum(_rolling_mean(v_gk, window), 0.0))
+
+        v_rs = _vol_rogers_satchell(open_, high, low, close)
+        sigma_rs = np.sqrt(np.maximum(_rolling_mean(v_rs, window), 0.0))
+
+        sigma_yz = _vol_yang_zhang(open_, high, low, close, window)
+
+        stacked = np.vstack([sigma_yz, sigma_gk, sigma_rs, sigma_pk])
+        weights = _normalize_ensemble_weights(weights)
+        if weights:
+            w = np.array(
+                [
+                    weights.get("yang_zhang", 0.0),
+                    weights.get("garman_klass", 0.0),
+                    weights.get("rogers_satchell", 0.0),
+                    weights.get("parkinson", 0.0),
+                ],
+                dtype=np.float64,
+            )
+            if np.sum(w) > 0:
+                return np.nansum(stacked * w[:, None], axis=0)
+        return np.nanmedian(stacked, axis=0)
     if method in {"parkinson", "park"}:
         v = _vol_parkinson(high, low)
         return np.sqrt(np.maximum(_rolling_mean(v, window), 0.0))
@@ -96,6 +237,9 @@ def estimate_volatility(
     if method in {"rogers_satchell", "rs"}:
         v = _vol_rogers_satchell(open_, high, low, close)
         return np.sqrt(np.maximum(_rolling_mean(v, window), 0.0))
+    if method in {"ewma", "riskmetrics"}:
+        lam = float(ewma_lambda) if ewma_lambda is not None else 0.94
+        return _vol_ewma(close, window=window, lam=lam)
     # Default: Yang-Zhang
     return _vol_yang_zhang(open_, high, low, close, window)
 
@@ -235,6 +379,7 @@ def compute_stop_distance_series(
 
     method = str(getattr(settings.risk, "vol_estimator", "yang_zhang"))
     window = int(getattr(settings.risk, "vol_window", 50) or 50)
+    ewma_lambda = _resolve_ewma_lambda(settings, df)
     horizon = int(getattr(settings.risk, "vol_horizon_bars", 5) or 5)
     tail_window = int(getattr(settings.risk, "tail_window", 100) or 100)
     tail_alpha = float(getattr(settings.risk, "tail_alpha", 0.975) or 0.975)
@@ -252,7 +397,31 @@ def compute_stop_distance_series(
     if len(close) < max(window, tail_window, 5):
         return None
 
-    sigma = estimate_volatility(open_, high, low, close, window=window, method=method)
+    weights = _get_ensemble_weights(settings)
+    adx_trend = float(getattr(settings.risk, "regime_adx_trend", 25.0) or 25.0)
+    adx_range = float(getattr(settings.risk, "regime_adx_range", 20.0) or 20.0)
+    hurst_window = int(getattr(settings.risk, "hurst_window", 100) or 100)
+    hurst_trend = float(getattr(settings.risk, "hurst_trend", 0.55) or 0.55)
+    hurst_range = float(getattr(settings.risk, "hurst_range", 0.45) or 0.45)
+    regime = infer_regime(
+        df,
+        adx_trend=adx_trend,
+        adx_range=adx_range,
+        hurst_window=hurst_window,
+        hurst_trend=hurst_trend,
+        hurst_range=hurst_range,
+    )
+    weights = _get_ensemble_weights(settings, regime=regime)
+    sigma = estimate_volatility(
+        open_,
+        high,
+        low,
+        close,
+        window=window,
+        method=method,
+        weights=weights,
+        ewma_lambda=ewma_lambda,
+    )
     vol_dist = close * sigma * float(np.sqrt(max(1, horizon)))
 
     es_series = estimate_expected_shortfall_series(
@@ -273,10 +442,6 @@ def compute_stop_distance_series(
 
     dist = dist.astype(np.float64, copy=False)
     dist[~np.isfinite(dist)] = np.nan
-
-    if "atr" in df.columns:
-        atr = df["atr"].to_numpy(dtype=np.float64)
-        dist = np.where(np.isfinite(dist), dist, atr)
 
     med = np.nanmedian(dist)
     if not np.isfinite(med) or med <= 0:
@@ -307,6 +472,7 @@ def infer_stop_target_pips(
     # Configurable parameters (defaults are conservative).
     method = str(getattr(settings.risk, "vol_estimator", "yang_zhang"))
     window = int(getattr(settings.risk, "vol_window", 50) or 50)
+    ewma_lambda = _resolve_ewma_lambda(settings, df)
     horizon = int(getattr(settings.risk, "vol_horizon_bars", 5) or 5)
     tail_window = int(getattr(settings.risk, "tail_window", 100) or 100)
     tail_alpha = float(getattr(settings.risk, "tail_alpha", 0.975) or 0.975)
@@ -330,7 +496,25 @@ def infer_stop_target_pips(
     if len(close) < max(window, tail_window, 5):
         return None
 
-    sigma = estimate_volatility(open_, high, low, close, window=window, method=method)
+    regime = infer_regime(
+        df,
+        adx_trend=adx_trend,
+        adx_range=adx_range,
+        hurst_window=hurst_window,
+        hurst_trend=hurst_trend,
+        hurst_range=hurst_range,
+    )
+    weights = _get_ensemble_weights(settings, regime=regime)
+    sigma = estimate_volatility(
+        open_,
+        high,
+        low,
+        close,
+        window=window,
+        method=method,
+        weights=weights,
+        ewma_lambda=ewma_lambda,
+    )
     sigma_last = float(sigma[-1]) if np.isfinite(sigma[-1]) else 0.0
 
     es = estimate_expected_shortfall(close, window=tail_window, alpha=tail_alpha)
@@ -346,14 +530,6 @@ def infer_stop_target_pips(
 
     sl_pips = dist / max(float(pip_size), 1e-9)
 
-    regime = infer_regime(
-        df,
-        adx_trend=adx_trend,
-        adx_range=adx_range,
-        hurst_window=hurst_window,
-        hurst_trend=hurst_trend,
-        hurst_range=hurst_range,
-    )
     if regime == "trend":
         rr = rr_trend
     elif regime == "range":

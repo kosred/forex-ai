@@ -26,9 +26,10 @@ def clean_cache():
     cache_dir = Path("cache")
     removed = False
 
-    # Prefer granular cleanup so a locked sqlite file doesn't prevent clearing feature/optuna caches.
+    # Prefer granular cleanup so a locked sqlite file doesn't prevent clearing feature/HPO caches.
     removed |= _safe_rmtree(cache_dir / "features")
-    removed |= _safe_rmtree(cache_dir / "optuna")
+    removed |= _safe_rmtree(cache_dir / "hpo")
+    removed |= _safe_rmtree(cache_dir / "ray_tune")
     for name in ("news.sqlite", "news.sqlite-shm", "news.sqlite-wal", "strategy_ledger.sqlite"):
         try:
             f = (cache_dir / name).resolve()

@@ -753,7 +753,7 @@ class TrainingService:
             y=y_train,
             index=X_train.index,
             feature_names=list(X_train.columns),
-            # Provide symbol-aware OHLC metadata so Optuna can score profitability by symbol.
+            # Provide symbol-aware OHLC metadata so HPO can score profitability by symbol.
             # The trainer guards against leaking multi-symbol metadata into models that require single-series OHLC.
             metadata=meta_train,
             labels=y_train,
@@ -820,6 +820,11 @@ class TrainingService:
                         month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(
                             dtype=np.int64
                         )
+                        day_idx = (
+                            idx.year.astype(np.int32) * 10000
+                            + idx.month.astype(np.int32) * 100
+                            + idx.day.astype(np.int32)
+                        ).to_numpy(dtype=np.int64)
 
                         pip_size, pip_value_per_lot = infer_pip_metrics(sym)
                         sl_cfg = getattr(self.settings.risk, "meta_label_sl_pips", None)
@@ -853,6 +858,10 @@ class TrainingService:
 
                         spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
                         commission = float(getattr(self.settings.risk, "commission_per_lot", 0.0))
+                        max_hold = int(getattr(self.settings.risk, "triple_barrier_max_bars", 0) or 0)
+                        trailing_enabled = bool(getattr(self.settings.risk, "trailing_enabled", False))
+                        trailing_mult = float(getattr(self.settings.risk, "trailing_atr_multiplier", 1.0) or 1.0)
+                        trailing_trigger_r = float(getattr(self.settings.risk, "trailing_be_trigger_r", 1.0) or 1.0)
 
                         arr = fast_evaluate_strategy(
                             close_prices=meta_e["close"].to_numpy(dtype=np.float64),
@@ -860,8 +869,13 @@ class TrainingService:
                             low_prices=meta_e["low"].to_numpy(dtype=np.float64),
                             signals=sig_s.to_numpy(dtype=np.int8),
                             month_indices=month_idx,
+                            day_indices=day_idx,
                             sl_pips=sl_pips,
                             tp_pips=tp_pips,
+                            max_hold_bars=max_hold,
+                            trailing_enabled=trailing_enabled,
+                            trailing_atr_multiplier=trailing_mult,
+                            trailing_be_trigger_r=trailing_trigger_r,
                             pip_value=pip_size,
                             spread_pips=spread,
                             commission_per_trade=commission,
@@ -878,6 +892,7 @@ class TrainingService:
                             "sqn",
                             "trades",
                             "consistency_score",
+                            "daily_dd",
                         ]
                         fast = {k: float(v) for k, v in zip(keys, arr.tolist(), strict=False)}
 
@@ -907,6 +922,7 @@ class TrainingService:
                         "sqn",
                         "trades",
                         "consistency_score",
+                        "daily_dd",
                     ],
                 )
 

@@ -83,8 +83,24 @@ risk:
   meta_label_fixed_tp: 0.0040
   # Stop/target engine (unsupervised blend of volatility + tail risk)
   stop_target_mode: blend
-  vol_estimator: yang_zhang
+  vol_estimator: ensemble  # ensemble | yang_zhang | garman_klass | parkinson | rogers_satchell | ewma
+  vol_ensemble_weights:
+    yang_zhang: 1.0
+    garman_klass: 1.0
+    rogers_satchell: 1.0
+    parkinson: 1.0
   vol_window: 50
+  ewma_lambda: 0.94
+  ewma_lambda_by_timeframe:
+    M1: 0.90
+    M5: 0.92
+    M15: 0.94
+    M30: 0.95
+    H1: 0.96
+    H4: 0.97
+    D1: 0.98
+    W1: 0.985
+    MN1: 0.99
   vol_horizon_bars: 5
   tail_window: 100
   tail_alpha: 0.975
@@ -113,7 +129,6 @@ models:
   rl_parallel_envs: 1
   rl_train_seconds: 36000
   evo_train_seconds: 36000
-  evo_optuna_train_seconds: 900  # per Optuna trial (keeps Evo_Opt from running for hours)
   evo_hidden_size: 64
   evo_population: 32
   evo_islands: 4
@@ -131,9 +146,13 @@ models:
   tabnet_train_seconds: 36000
   kan_train_seconds: 36000
   num_transformers: 2
-  optuna_trials: 25
-  optuna_reuse_study: true
+  hpo_backend: ax
+  hpo_trials: 0  # 0 = use default trial count
+  hpo_max_rows: 500000
+  ray_tune_max_concurrency: 1
   export_onnx: true  # Export ONNX for fast CPU inference (one-time at startup if missing)
+  phase5_filter_meta_blender: true
+  phase5_core_models: [transformer, nbeats, tide, tabnet, kan]
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
   prop_min_trades: 30

@@ -106,8 +106,13 @@ def fast_evaluate_strategy(
     low_prices: np.ndarray,
     signals: np.ndarray,
     month_indices: np.ndarray,  # New: integer encoding of month (e.g. 2023*12 + 1)
+    day_indices: np.ndarray,  # Integer encoding of day (e.g. 20240130)
     sl_pips: float,
     tp_pips: float,
+    max_hold_bars: int = 0,
+    trailing_enabled: bool = False,
+    trailing_atr_multiplier: float = 1.0,
+    trailing_be_trigger_r: float = 1.0,
     pip_value: float = 0.0001,
     spread_pips: float = 1.5,
     commission_per_trade: float = 0.0,  # Flat cost
@@ -115,9 +120,10 @@ def fast_evaluate_strategy(
 ) -> np.ndarray:
     """
     Numba-optimized backtester with Monthly Consistency Tracking.
+    Implements triple-barrier exits: SL/TP plus a max-hold time barrier, with optional trailing.
     Returns metrics array:
     [NetProfit, Sharpe, Sortino, MaxDD, WinRate, ProfitFactor, Expectancy, SQN,
-     Trades, ConsistencyScore]
+     Trades, ConsistencyScore, MaxDailyDD]
     """
     n = len(close_prices)
     equity = 100000.0
@@ -135,8 +141,15 @@ def fast_evaluate_strategy(
     monthly_pnls = np.zeros(240)
     month_ptr = -1
 
+    last_day_val = -1
+    day_peak = equity
+    day_low = equity
+    max_daily_dd = 0.0
+
     in_position = 0
     entry_price = 0.0
+    entry_index = -1
+    trail_price = 0.0
 
     cash_per_pip = pip_value_per_lot
 
@@ -149,6 +162,16 @@ def fast_evaluate_strategy(
                     monthly_pnls[month_ptr] = current_month_pnl
             current_month_pnl = 0.0
             last_month_val = m_val
+
+        d_val = day_indices[i] if i < len(day_indices) else last_day_val
+        if d_val != last_day_val:
+            if last_day_val != -1 and day_peak > 0:
+                dd = (day_peak - day_low) / day_peak
+                if dd > max_daily_dd:
+                    max_daily_dd = dd
+            last_day_val = d_val
+            day_peak = equity
+            day_low = equity
 
         if in_position != 0:
             current_low = low_prices[i]
@@ -164,19 +187,36 @@ def fast_evaluate_strategy(
                 sl_price = entry_price - (sl_pips * pip_value)
                 tp_price = entry_price + (tp_pips * pip_value)
 
+                if trailing_enabled:
+                    move = current_high - entry_price
+                    if move >= (trailing_be_trigger_r * sl_pips * pip_value):
+                        trail_dist = trailing_atr_multiplier * sl_pips * pip_value
+                        candidate = current_high - trail_dist
+                        if trail_price == 0.0 or candidate > trail_price:
+                            trail_price = candidate
+                        if trail_price > sl_price:
+                            sl_price = trail_price
+
                 if current_low <= sl_price:
                     pnl = (sl_price - entry_price) / pip_value * cash_per_pip
                     exit_signal = True
                 elif current_high >= tp_price:
                     pnl = (tp_price - entry_price) / pip_value * cash_per_pip
                     exit_signal = True
-                elif signals[i] == -1:
-                    pnl = (close_prices[i] - entry_price) / pip_value * cash_per_pip
-                    exit_signal = True
 
             elif in_position == -1:  # Short
                 sl_price = entry_price + (sl_pips * pip_value)
                 tp_price = entry_price - (tp_pips * pip_value)
+
+                if trailing_enabled:
+                    move = entry_price - current_low
+                    if move >= (trailing_be_trigger_r * sl_pips * pip_value):
+                        trail_dist = trailing_atr_multiplier * sl_pips * pip_value
+                        candidate = current_low + trail_dist
+                        if trail_price == 0.0 or candidate < trail_price:
+                            trail_price = candidate
+                        if trail_price < sl_price:
+                            sl_price = trail_price
 
                 if current_high >= sl_price:
                     pnl = (entry_price - sl_price) / pip_value * cash_per_pip
@@ -184,7 +224,20 @@ def fast_evaluate_strategy(
                 elif current_low <= tp_price:
                     pnl = (entry_price - tp_price) / pip_value * cash_per_pip
                     exit_signal = True
-                elif signals[i] == 1:
+
+            if not exit_signal and max_hold_bars > 0 and entry_index >= 0:
+                if (i - entry_index) >= max_hold_bars:
+                    if in_position == 1:
+                        pnl = (close_prices[i] - entry_price) / pip_value * cash_per_pip
+                    else:
+                        pnl = (entry_price - close_prices[i]) / pip_value * cash_per_pip
+                    exit_signal = True
+
+            if not exit_signal:
+                if in_position == 1 and signals[i] == -1:
+                    pnl = (close_prices[i] - entry_price) / pip_value * cash_per_pip
+                    exit_signal = True
+                elif in_position == -1 and signals[i] == 1:
                     pnl = (entry_price - close_prices[i]) / pip_value * cash_per_pip
                     exit_signal = True
 
@@ -197,6 +250,8 @@ def fast_evaluate_strategy(
                 returns[trade_count] = pnl
                 trade_count += 1
                 in_position = 0
+                entry_index = -1
+                trail_price = 0.0
 
                 if pnl > 0:
                     wins += 1
@@ -207,21 +262,34 @@ def fast_evaluate_strategy(
 
                 if equity > peak_equity:
                     peak_equity = equity
+                if equity > day_peak:
+                    day_peak = equity
+                if equity < day_low:
+                    day_low = equity
 
         if in_position == 0:
             sig = signals[i]
             if sig == 1:
                 in_position = 1
                 entry_price = close_prices[i] + (spread_pips * pip_value)
+                entry_index = i
+                trail_price = 0.0
             elif sig == -1:
                 in_position = -1
                 entry_price = close_prices[i]
+                entry_index = i
+                trail_price = 0.0
 
     if month_ptr < 239:
         monthly_pnls[month_ptr + 1] = current_month_pnl
 
+    if last_day_val != -1 and day_peak > 0:
+        dd = (day_peak - day_low) / day_peak
+        if dd > max_daily_dd:
+            max_daily_dd = dd
+
     if trade_count == 0:
-        return np.zeros(10)
+        return np.zeros(11)
 
     net_profit = equity - 100000.0
     win_rate = wins / trade_count
@@ -295,5 +363,6 @@ def fast_evaluate_strategy(
             sqn,
             float(trade_count),
             consistency_score,
+            max_daily_dd,
         ]
     )

@@ -228,10 +228,10 @@ class AutoTuneHints:
     n_jobs: int
     train_batch_size: int
     inference_batch_size: int
-    optuna_trials: int
+    hpo_trials: int
     adaptive_training_budget: float
     feature_workers: int
-    is_hpc: bool = False  # New flag for High Performance Compute clusters
+    is_hpc: bool = False  # New flag for High Performance Compute clusters      
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -241,7 +241,7 @@ class AutoTuneHints:
             "n_jobs": self.n_jobs,
             "train_batch_size": self.train_batch_size,
             "inference_batch_size": self.inference_batch_size,
-            "optuna_trials": self.optuna_trials,
+            "hpo_trials": self.hpo_trials,
             "adaptive_training_budget": self.adaptive_training_budget,
             "feature_workers": self.feature_workers,
             "is_hpc": self.is_hpc,
@@ -268,14 +268,15 @@ class AutoTuner:
         try:
             cur_train_bs = int(getattr(self.settings.models, "train_batch_size", 0) or 0)
             cur_infer_bs = int(getattr(self.settings.models, "inference_batch_size", 0) or 0)
-            cur_trials = int(getattr(self.settings.models, "optuna_trials", 0) or 0)
+            cur_trials = int(getattr(self.settings.models, "hpo_trials", 0) or 0)
 
             self.settings.models.train_batch_size = int(max(32, min(max(cur_train_bs, hints.train_batch_size), 2048)))
             self.settings.models.inference_batch_size = int(
                 max(32, min(max(cur_infer_bs, hints.inference_batch_size), 4096))
             )
             if cur_trials <= 0:
-                self.settings.models.optuna_trials = int(max(1, min(hints.optuna_trials, 200)))
+                auto_trials = int(max(1, min(hints.hpo_trials, 200)))
+                self.settings.models.hpo_trials = auto_trials
         except Exception:
             pass
 
@@ -356,7 +357,8 @@ class AutoTuner:
             else:
                 train_batch = 256
                 infer_batch = 1024
-            optuna_trials = max(int(getattr(self.settings.models, "optuna_trials", 25)), 50)
+            base_trials = int(getattr(self.settings.models, "hpo_trials", 25) or 25)
+            hpo_trials = max(base_trials, 50)
             adaptive_budget = 7200.0  # used only when a model budget is unset
             self.logger.info(
                 f"HPC mode detected: {self.profile.num_gpus} GPUs, {ram_gb:.0f}GB RAM. Unleashing full power."
@@ -371,7 +373,8 @@ class AutoTuner:
             else:
                 train_batch = 256
                 infer_batch = 1024
-            optuna_trials = max(int(getattr(self.settings.models, "optuna_trials", 25)), 25)
+            base_trials = int(getattr(self.settings.models, "hpo_trials", 25) or 25)
+            hpo_trials = max(base_trials, 25)
             adaptive_budget = 3600.0  # used only when a model budget is unset
         else:
             # CPU Mode (Your PC)
@@ -388,7 +391,8 @@ class AutoTuner:
                 train_batch = 64
                 infer_batch = 32
 
-            optuna_trials = min(self.settings.models.optuna_trials, 10)
+            base_trials = int(getattr(self.settings.models, "hpo_trials", 10) or 10)
+            hpo_trials = min(base_trials, 10)
             adaptive_budget = 1800.0  # used only when a model budget is unset
 
         # Feature worker scaling: higher on big RAM boxes.
@@ -406,7 +410,7 @@ class AutoTuner:
             n_jobs=n_jobs,
             train_batch_size=train_batch,
             inference_batch_size=infer_batch,
-            optuna_trials=optuna_trials,
+            hpo_trials=hpo_trials,
             adaptive_training_budget=adaptive_budget,
             feature_workers=feature_workers,
             is_hpc=is_hpc,

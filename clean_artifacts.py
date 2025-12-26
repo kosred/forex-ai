@@ -78,9 +78,10 @@ def clean_artifacts(
 
     if cache:
         cache_dir = root / "cache"
-        # Prefer granular cleanup so a locked sqlite file doesn't prevent clearing feature/optuna caches.
+        # Prefer granular cleanup so a locked sqlite file doesn't prevent clearing feature/HPO caches.
         removed_any |= _safe_rmtree(cache_dir / "features")
-        removed_any |= _safe_rmtree(cache_dir / "optuna")
+        removed_any |= _safe_rmtree(cache_dir / "hpo")
+        removed_any |= _safe_rmtree(cache_dir / "ray_tune")
         for name in ("news.sqlite", "news.sqlite-shm", "news.sqlite-wal", "strategy_ledger.sqlite"):
             removed_any |= _safe_unlink(cache_dir / name)
         try:
@@ -164,7 +165,7 @@ def _parse_args() -> argparse.Namespace:
         description="Safely delete generated artifacts (cache/models/logs) in this project."
     )
     parser.add_argument("--all", action="store_true", help="Remove cache, models, tool caches, and __pycache__")
-    parser.add_argument("--cache", action="store_true", help="Remove `cache/` (features, optuna journals, news cache)")
+    parser.add_argument("--cache", action="store_true", help="Remove `cache/` (features, HPO runs, news cache)")
     parser.add_argument("--models", action="store_true", help="Remove `models/` (trained model artifacts)")
     parser.add_argument("--ruff-cache", action="store_true", help="Remove `.ruff_cache/`")
     parser.add_argument("--pytest-cache", action="store_true", help="Remove `.pytest_cache/`")

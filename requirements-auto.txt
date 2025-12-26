@@ -19,7 +19,6 @@ onnx==1.20.0
 onnxmltools==1.14.0
 onnxruntime==1.23.2
 openai==2.14.0
-optuna==4.6.0
 pandas==2.3.3
 polars==1.36.1
 psutil==7.1.3

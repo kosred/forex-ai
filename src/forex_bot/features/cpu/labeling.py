@@ -187,7 +187,7 @@ if NUMBA_AVAILABLE:
         min_dist : float
             Minimum distance for SL/TP
         fixed_sl, fixed_tp : float
-            Fallback values when ATR is zero
+            Retained for API compatibility; when ATR is zero the label is skipped.
 
         Returns
         -------
@@ -209,8 +209,8 @@ if NUMBA_AVAILABLE:
                 dist_sl = curr_atr * atr_mult
                 dist_tp = dist_sl * rr
             else:
-                dist_sl = fixed_sl
-                dist_tp = fixed_tp
+                # No reliable distance -> skip labeling for this bar.
+                continue
 
             if dist_sl < min_dist:
                 dist_sl = min_dist
@@ -494,8 +494,8 @@ else:
                 dist_sl = curr_atr * atr_mult
                 dist_tp = dist_sl * rr
             else:
-                dist_sl = fixed_sl
-                dist_tp = fixed_tp
+                # No reliable distance -> skip labeling for this bar.
+                continue
 
             dist_sl = max(dist_sl, min_dist)
             dist_tp = max(dist_tp, min_dist)

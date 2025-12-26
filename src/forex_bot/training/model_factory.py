@@ -32,7 +32,7 @@ class ModelFactory:
 
         # 1. Resolve Parameters
         params = {}
-        # Map config names to Optuna key names if needed
+        # Map config names to HPO key names if needed
         opt_key_map = {
             "xgboost": "XGBoost",
             "lightgbm": "LightGBM",
@@ -51,7 +51,7 @@ class ModelFactory:
         elif model_name in best_params:
             params = best_params[model_name].copy()
 
-        # 2. Batch size (config override if not fixed by Optuna params)
+        # 2. Batch size (config override if not fixed by HPO params)
         if "batch_size" not in params:
             cfg_bs = getattr(self.settings.models, "train_batch_size", None)
             if cfg_bs and int(cfg_bs) > 0:
@@ -75,6 +75,9 @@ class ModelFactory:
 
         # 4. Filter Init Kwargs based on Signature
         init_kwargs = params.copy()
+        # Tree experts expect a single "params" dict in __init__
+        if model_name in {"lightgbm", "random_forest", "extra_trees"}:
+            init_kwargs = {"params": params.copy()}
 
         # Inject Device if supported
         if prefer_gpu and self.available_gpus:

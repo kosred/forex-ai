@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from ..core.config import Settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +38,7 @@ class StrategyMetrics:
     monthly_win_rate: float
     positive_months: int
     negative_months: int
+    avg_monthly_return_pct: float
     profit_per_trade: float
     avg_trade_duration_hours: float
     trades_per_month: float
@@ -45,14 +48,20 @@ class StrategyMetrics:
 
 
 class StrategyQualityAnalyzer:
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings | None = None) -> None:
+        settings = settings or Settings()
         self.min_sharpe = 1.2
+        self.min_sortino = 1.2
+        self.min_calmar = 1.0
         self.min_profit_factor = 1.5
         self.min_win_rate = 0.50
         self.min_trades = 50
-        self.max_dd_acceptable = 0.15
+        self.max_dd_acceptable = float(getattr(settings.risk, "total_drawdown_limit", 0.15) or 0.15)
+        self.min_monthly_return_pct = float(
+            getattr(settings.risk, "monthly_profit_target_pct", 0.04) or 0.04
+        )
         self.edge_significance_pvalue = 0.05
-        logger.info("StrategyQualityAnalyzer initialized")
+        logger.info("StrategyQualityAnalyzer initialized (iron guard)")
 
     def analyze_strategy(
         self, strategy_id: str, trades: pd.DataFrame, initial_balance: float = 100_000
@@ -106,8 +115,9 @@ class StrategyQualityAnalyzer:
 
         p_value = self._test_statistical_significance(returns)
 
-        monthly_metrics = self._analyze_monthly_consistency(trades)
+        monthly_metrics = self._analyze_monthly_consistency(trades, initial_balance=initial_balance)
         monthly_win_rate = monthly_metrics["win_rate"]
+        avg_monthly_return_pct = monthly_metrics["avg_return_pct"]
 
         if "duration" not in trades.columns and "exit_time" in trades.columns and "entry_time" in trades.columns:
             trades["duration"] = (
@@ -140,6 +150,7 @@ class StrategyQualityAnalyzer:
             monthly_win_rate=monthly_win_rate,
             positive_months=monthly_metrics["positive"],
             negative_months=monthly_metrics["negative"],
+            avg_monthly_return_pct=avg_monthly_return_pct,
             profit_per_trade=np.mean(pnls) if len(pnls) else 0.0,
             avg_trade_duration_hours=avg_duration,
             trades_per_month=trades_per_month,
@@ -201,9 +212,11 @@ class StrategyQualityAnalyzer:
         t_stat, p_value = stats.ttest_1samp(returns, 0.0, alternative="greater")
         return p_value
 
-    def _analyze_monthly_consistency(self, trades: pd.DataFrame) -> dict[str, Any]:
+    def _analyze_monthly_consistency(
+        self, trades: pd.DataFrame, *, initial_balance: float
+    ) -> dict[str, Any]:
         if trades.empty or "entry_time" not in trades.columns:
-            return {"win_rate": 0.0, "positive": 0, "negative": 0}
+            return {"win_rate": 0.0, "positive": 0, "negative": 0, "avg_return_pct": 0.0}
 
         try:
             trades_copy = trades.copy()
@@ -213,13 +226,17 @@ class StrategyQualityAnalyzer:
             positive = (monthly_pnl > 0).sum()
             negative = (monthly_pnl <= 0).sum()
             total = len(monthly_pnl)
+            avg_return_pct = (
+                float(monthly_pnl.mean() / initial_balance) if total > 0 else 0.0
+            )
             return {
                 "win_rate": positive / total if total > 0 else 0.0,
                 "positive": int(positive),
                 "negative": int(negative),
+                "avg_return_pct": avg_return_pct,
             }
         except Exception:
-            return {"win_rate": 0.0, "positive": 0, "negative": 0}
+            return {"win_rate": 0.0, "positive": 0, "negative": 0, "avg_return_pct": 0.0}
 
     def _calculate_trade_frequency(self, trades: pd.DataFrame) -> float:
         if len(trades) == 0:
@@ -254,16 +271,14 @@ class StrategyQualityAnalyzer:
 
     def _score_strategy(self, metrics: StrategyMetrics) -> None:
         score = 0.0
-        if metrics.sharpe_ratio >= 2.0:
+        if metrics.sortino_ratio >= 3.0:
             score += 30
-        elif metrics.sharpe_ratio >= 1.5:
-            score += 23
-        elif metrics.sharpe_ratio >= 1.2:
+        elif metrics.sortino_ratio >= 2.0:
+            score += 24
+        elif metrics.sortino_ratio >= 1.5:
             score += 18
-        elif metrics.sharpe_ratio >= 1.0:
-            score += 15
-        elif metrics.sharpe_ratio >= 0.8:
-            score += 10
+        elif metrics.sortino_ratio >= 1.2:
+            score += 12
 
         if metrics.profit_factor >= 2.5:
             score += 20
@@ -284,6 +299,13 @@ class StrategyQualityAnalyzer:
             score += 10
         elif metrics.win_rate >= 0.50:
             score += 8
+
+        if metrics.calmar_ratio >= 2.0:
+            score += 20
+        elif metrics.calmar_ratio >= 1.5:
+            score += 15
+        elif metrics.calmar_ratio >= 1.0:
+            score += 10
 
         if metrics.max_drawdown_pct <= 0.08:
             score += 15
@@ -306,13 +328,18 @@ class StrategyQualityAnalyzer:
         elif metrics.monthly_win_rate >= 0.50:
             score += 5
 
+        if metrics.avg_monthly_return_pct >= self.min_monthly_return_pct:
+            score += 10
+
         metrics.quality_score = min(100.0, score)
 
         metrics.has_edge = (
-            metrics.sharpe_ratio >= self.min_sharpe
+            metrics.sortino_ratio >= self.min_sortino
+            and metrics.calmar_ratio >= self.min_calmar
             and metrics.profit_factor >= self.min_profit_factor
             and metrics.win_rate >= self.min_win_rate
             and metrics.max_drawdown_pct <= self.max_dd_acceptable
+            and metrics.avg_monthly_return_pct >= self.min_monthly_return_pct
             and metrics.statistical_significance <= self.edge_significance_pvalue
             and metrics.total_trades >= self.min_trades
         )
@@ -350,6 +377,7 @@ class StrategyQualityAnalyzer:
             monthly_win_rate=0.0,
             positive_months=0,
             negative_months=0,
+            avg_monthly_return_pct=0.0,
             profit_per_trade=0.0,
             avg_trade_duration_hours=0.0,
             trades_per_month=0.0,
@@ -357,10 +385,10 @@ class StrategyQualityAnalyzer:
 
 
 class StrategyRanker:
-    def __init__(self, cache_dir: Path) -> None:
+    def __init__(self, cache_dir: Path, settings: Settings | None = None) -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.analyzer = StrategyQualityAnalyzer()
+        self.analyzer = StrategyQualityAnalyzer(settings=settings)
         self.strategy_metrics: dict[str, StrategyMetrics] = {}
 
     def evaluate_strategies(

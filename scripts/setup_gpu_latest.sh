@@ -36,7 +36,7 @@ echo "[*] Installing latest CUDA PyTorch from $CUDA_INDEX ..."
 pip install --index-url "$CUDA_INDEX" torch torchvision torchaudio
 
 echo "[*] Installing core deps..."
-pip install --upgrade numpy pandas scipy scikit-learn numba optuna psutil pyarrow matplotlib tabulate tensorboard
+pip install --upgrade numpy pandas scipy scikit-learn numba psutil pyarrow matplotlib tabulate tensorboard
 
 echo "[*] Installing gradient boosting libs..."
 pip install --upgrade lightgbm xgboost catboost

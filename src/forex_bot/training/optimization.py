@@ -1,60 +1,41 @@
-import hashlib
+import inspect
 import json
 import logging
 import os
-import shutil
-import subprocess
-import threading
 import time
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-# Thread-local storage for GPU assignment in parallel optimization
-_thread_local = threading.local()
-
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import TimeSeriesSplit
 
 try:
-    import redis  # type: ignore
-
-    REDIS_PY_AVAILABLE = True
-except Exception:
-    redis = None  # type: ignore
-    REDIS_PY_AVAILABLE = False
-
-try:
-    import optuna
-    from optuna.trial import Trial, TrialState
-
-    OPTUNA_AVAILABLE = True
-except ImportError:
-    OPTUNA_AVAILABLE = False
-
-try:
-    from ax.service.ax_client import AxClient, MultiObjectiveAxClient
-    from ax.service.utils.instantiation import ObjectiveProperties
+    import ax  # type: ignore
     AX_AVAILABLE = True
 except ImportError:
     AX_AVAILABLE = False
 
 try:
-    import lightgbm as lgb
+    import ray
+    from ray import tune
+    from ray.tune.schedulers import ASHAScheduler
+    from ray.tune.search import ConcurrencyLimiter
+    from ray.tune.search.ax import AxSearch
 
-    LGBM_AVAILABLE = True
-except ImportError:
-    lgb = None
-    LGBM_AVAILABLE = False
+    RAY_AVAILABLE = True
+except Exception:
+    ray = None  # type: ignore
+    tune = None  # type: ignore
+    ASHAScheduler = None  # type: ignore
+    ConcurrencyLimiter = None  # type: ignore
+    AxSearch = None  # type: ignore
+    RAY_AVAILABLE = False
+
 
 
 from ..core.config import Settings
 from ..core.system import normalize_device_preference
 from ..models.device import get_available_gpus, select_device
-from ..models.evolution import EvoExpertCMA
-from ..models.rl import RLExpertPPO, RLExpertSAC, _build_continuous_env
 from ..models.transformers import TransformerExpertTorch
 from ..models.trees import ExtraTreesExpert, LightGBMExpert, RandomForestExpert
 from ..strategy.fast_backtest import (
@@ -63,7 +44,7 @@ from ..strategy.fast_backtest import (
     infer_sl_tp_pips_auto,
 )
 
-# Dynamic GPU/CPU model selection - use GPU versions when available for Optuna
+# Dynamic GPU/CPU model selection - use GPU versions when available for HPO
 _gpus = get_available_gpus()
 if _gpus:
     from ..models.kan_gpu import KANExpert
@@ -77,96 +58,9 @@ else:
     from ..models.tide import TiDEExpert
 
 logger = logging.getLogger(__name__)
-_JOURNAL_STORAGE_SENTINEL = "__journal__"
-
-class AxOptimizer:
-    """
-    2025-Grade Bayesian Optimizer powered by Meta's Ax and BoTorch.
-    Native GPU acceleration for hyperparameter search.
-    Optimizes for the 'Pareto Frontier' between Profit and Drawdown.
-    """
-    def __init__(self, settings: Settings, cache_dir: str = "cache"):
-        self.settings = settings
-        self.cache_dir = Path(cache_dir) / "ax"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.n_trials = max(1, int(getattr(self.settings.models, "optuna_trials", 30)))
-        
-        risk_thresh = float(getattr(self.settings.risk, "min_confidence_threshold", 0.55))
-        self.prop_conf_threshold = risk_thresh
-        
-        self.device_pool = get_available_gpus()
-        self.stop_event = None
-
-    def optimize_model(self, name: str, X_train, y_train, X_val, y_val, meta_val, search_space: list[dict]):
-        """Runs a Multi-Objective Bayesian Search for a specific model."""
-        if not AX_AVAILABLE:
-            return {}
-
-        logger.info(f"[AX] Starting Multi-Objective Search for {name} ({self.n_trials} trials)...")
-        
-        # MO-Ax allows us to optimize for two conflicting goals at once
-        client = MultiObjectiveAxClient()
-        client.create_experiment(
-            name=f"{name}_Optimization",
-            parameters=search_space,
-            objectives={
-                "prop_score": ObjectiveProperties(minimize=False, threshold=0.0),
-                "drawdown": ObjectiveProperties(minimize=True, threshold=0.08)
-            },
-        )
-
-        for i in range(self.n_trials):
-            if self.stop_event and self.stop_event.is_set(): break
-            
-            params, trial_index = client.get_next_trial()
-            
-            # 1. Instantiate Model
-            device = self.device_pool[i % len(self.device_pool)] if self.device_pool else "cpu"
-            
-            # Dynamic Dispatch
-            model = self._create_model(name, params, device)
-            
-            try:
-                # 2. Train
-                model.fit(X_train, y_train)
-                
-                # 3. Evaluate
-                preds = model.predict_proba(X_val)
-                # We use a custom evaluator that returns BOTH profit and drawdown
-                metrics = self._evaluate_mo(y_val, preds, meta_val)
-                
-                # 4. Report to BoTorch
-                client.complete_trial(trial_index=trial_index, raw_data=metrics)
-                
-                logger.info(f"  Trial {i}: Profit={metrics['prop_score']:.4f}, DD={metrics['drawdown']:.4%}")
-            except Exception as e:
-                logger.error(f"  Trial {i} failed: {e}")
-                client.log_trial_failure(trial_index=trial_index)
-
-        # Retrieve the best 'balanced' parameters from the Pareto frontier
-        try:
-            best_params, _ = client.get_best_parameters()
-            return best_params
-        except Exception:
-            return {}
-
-    def _create_model(self, name, params, device):
-        if name == "N-BEATS": return NBeatsExpert(**params, device=device)
-        if name == "TiDE": return TiDEExpert(**params, device=device)
-        if name == "TabNet": return TabNetExpert(**params, device=device)
-        if name == "KAN": return KANExpert(**params, device=device)
-        return None
-
-    def _evaluate_mo(self, y_true, y_pred, meta_val) -> dict:
-        # Standard logic to calculate score
-        # For brevity, I'll use a simplified version of your _objective_base
-        # But returning a dict for Ax
-        # (Implementation details omitted for brevity, but follows your prop-aware logic)
-        return {"prop_score": 0.5, "drawdown": 0.02} # Placeholder
-
 class HyperparameterOptimizer:
     """
-    Auto-tunes model hyperparameters using Optuna.
+    Auto-tunes model hyperparameters using Ray Tune + Ax/BoTorch (default).
     Objective:
       - If OHLC metadata is available: prop-aware composite score (profit-like backtest + small accuracy term).
       - Otherwise: fallback to accuracy only (trial values will look like ~0.xx).
@@ -174,12 +68,18 @@ class HyperparameterOptimizer:
 
     def __init__(self, settings: Settings, cache_dir: str = "cache") -> None:
         self.settings = settings
-        self.cache_dir = Path(cache_dir) / "optuna"
+        self.hpo_backend = str(getattr(self.settings.models, "hpo_backend", "ax") or "ax").lower()
+        hpo_trials = int(getattr(self.settings.models, "hpo_trials", 0) or 0)
+        self.n_trials = max(1, hpo_trials if hpo_trials > 0 else 25)
+        self.cache_dir = Path(cache_dir) / "hpo"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.n_trials = max(1, int(getattr(self.settings.models, "optuna_trials", 25)))
-        self.available = OPTUNA_AVAILABLE
+        self.ray_dir = Path(cache_dir) / "ray_tune"
+        self.ray_dir.mkdir(parents=True, exist_ok=True)
+        self.available = RAY_AVAILABLE and AX_AVAILABLE
         self.meta_df: pd.DataFrame | None = None
-        self.reuse_study = bool(getattr(self.settings.models, "optuna_reuse_study", False))
+        self.ray_max_concurrency = max(
+            1, int(getattr(self.settings.models, "ray_tune_max_concurrency", 1) or 1)
+        )
 
         # FIX: Sync with Risk Manager's threshold to prevent "Training/Trading Gap"
         # If we train for 0.55 but trade at 0.70, we select models that fail in prod.
@@ -193,61 +93,741 @@ class HyperparameterOptimizer:
         dev_pref = normalize_device_preference(getattr(self.settings.system, "enable_gpu_preference", "auto"))
         self.device_pool = get_available_gpus() if dev_pref != "cpu" else []
         if dev_pref == "gpu" and not self.device_pool:
-            logger.warning("GPU requested for Optuna but no CUDA devices detected; falling back to CPU.")
+            logger.warning("GPU requested but no CUDA devices detected; falling back to CPU.")
         self.default_device = select_device("cpu" if dev_pref == "cpu" else "auto")
         self.stop_event: Any | None = None
-        # Set by `_run_study()` to prevent CPU oversubscription when Optuna runs parallel trials.
-        self._optuna_cpu_threads: int = 0
+        self._hpo_cpu_threads: int = 0
 
-        if not OPTUNA_AVAILABLE:
-            logger.warning("Optuna not available. Skipping optimization.")
-
-        self._study_suffix = None
-
-    def _time_series_holdout(
-        self, X: pd.DataFrame, y: pd.Series, n_splits: int = 3, embargo: int = 100
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        """
-        Create a simple time-series aware train/val split with an embargo gap.
-        Falls back to the original split if data is too short.
-        """
-        try:
-            if len(X) < max(embargo * 2, 200):
-                return X, pd.DataFrame(index=X.index), y, pd.Series(dtype=y.dtype)
-            tscv = TimeSeriesSplit(n_splits=n_splits, gap=embargo)
-            splits = list(tscv.split(X))
-            if not splits:
-                return X, pd.DataFrame(index=X.index), y, pd.Series(dtype=y.dtype)
-            train_idx, val_idx = splits[-1]
-            return X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
-        except Exception:
-            return X, pd.DataFrame(index=X.index), y, pd.Series(dtype=y.dtype)
-
-    def _dataset_signature(self, X: pd.DataFrame, y: pd.Series) -> str:  # noqa: N803
-        """Generate a short hash to distinguish datasets/configs for studies."""
-        try:
-            vc = y.value_counts().to_dict()
-        except Exception:
-            vc = {}
-        try:
-            sample_hash = hashlib.sha256(
-                pd.util.hash_pandas_object(X.head(500), index=False).values.tobytes()
-            ).hexdigest()
-        except Exception:
-            sample_hash = hashlib.sha256(str((X.shape, tuple(X.columns))).encode()).hexdigest()
-        payload = {
-            "rows": len(X),
-            "cols": tuple(X.columns),
-            "y_counts": vc,
-            "sample": sample_hash,
-        }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
+        if not (RAY_AVAILABLE and AX_AVAILABLE):
+            logger.warning("Ray Tune/Ax not available. Skipping optimization.")
 
     def _should_stop(self) -> bool:
         try:
             return bool(self.stop_event and getattr(self.stop_event, "is_set", lambda: False)())
         except Exception:
             return False
+
+    def _ray_trials_for_model(self, name: str) -> int:
+        trials = int(self.n_trials)
+        if name in {"TabNet", "N-BEATS", "TiDE", "KAN"}:
+            trials = max(5, trials // 2)
+        if name == "Transformer":
+            trials = max(3, trials // 3)
+        if (str(self.default_device) == "cpu" and not self.device_pool) and name in {"TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"}:
+            trials = min(trials, 3)
+        return max(1, int(trials))
+
+    def _ax_search_space(self, name: str, y_train: pd.Series) -> list[dict[str, Any]]:
+        if name == "LightGBM":
+            return [
+                {"name": "n_estimators", "type": "range", "bounds": [100, 1000], "value_type": "int"},
+                {"name": "num_leaves", "type": "range", "bounds": [20, 150], "value_type": "int"},
+                {"name": "learning_rate", "type": "range", "bounds": [0.01, 0.3], "log_scale": True},
+                {"name": "feature_fraction", "type": "range", "bounds": [0.5, 1.0]},
+                {"name": "bagging_fraction", "type": "range", "bounds": [0.5, 1.0]},
+                {"name": "min_child_samples", "type": "range", "bounds": [10, 100], "value_type": "int"},
+            ]
+        if name == "RandomForest":
+            return [
+                {"name": "n_estimators", "type": "range", "bounds": [100, 300], "value_type": "int"},
+                {"name": "max_depth", "type": "range", "bounds": [8, 16], "value_type": "int"},
+                {"name": "min_samples_split", "type": "range", "bounds": [2, 10], "value_type": "int"},
+                {"name": "min_samples_leaf", "type": "range", "bounds": [1, 5], "value_type": "int"},
+                {"name": "max_features", "type": "range", "bounds": [0.5, 1.0]},
+                {"name": "bootstrap", "type": "choice", "values": [True, False]},
+            ]
+        if name == "ExtraTrees":
+            return [
+                {"name": "n_estimators", "type": "range", "bounds": [200, 800], "value_type": "int"},
+                {"name": "max_depth", "type": "range", "bounds": [10, 24], "value_type": "int"},
+                {"name": "min_samples_split", "type": "range", "bounds": [2, 10], "value_type": "int"},
+                {"name": "min_samples_leaf", "type": "range", "bounds": [1, 6], "value_type": "int"},
+                {"name": "max_features", "type": "range", "bounds": [0.4, 0.9]},
+                {"name": "bootstrap", "type": "choice", "values": [True, False]},
+            ]
+        if name == "TabNet":
+            return [
+                {"name": "hidden_dim", "type": "range", "bounds": [32, 128], "value_type": "int"},
+                {"name": "n_steps", "type": "range", "bounds": [3, 7], "value_type": "int"},
+                {"name": "gamma", "type": "range", "bounds": [1.0, 2.0]},
+                {"name": "lambda_sparse", "type": "range", "bounds": [1e-5, 1e-2], "log_scale": True},
+                {"name": "lr", "type": "range", "bounds": [1e-4, 1e-2], "log_scale": True},
+                {"name": "batch_size", "type": "range", "bounds": [512, 8192], "value_type": "int"},
+            ]
+        if name == "N-BEATS":
+            return [
+                {"name": "hidden_dim", "type": "range", "bounds": [64, 256], "value_type": "int"},
+                {"name": "n_layers", "type": "range", "bounds": [2, 6], "value_type": "int"},
+                {"name": "n_blocks", "type": "range", "bounds": [1, 4], "value_type": "int"},
+                {"name": "lr", "type": "range", "bounds": [1e-4, 1e-2], "log_scale": True},
+                {"name": "batch_size", "type": "range", "bounds": [512, 4096], "value_type": "int"},
+            ]
+        if name == "TiDE":
+            return [
+                {"name": "hidden_dim", "type": "range", "bounds": [64, 512], "value_type": "int"},
+                {"name": "lr", "type": "range", "bounds": [1e-4, 1e-2], "log_scale": True},
+                {"name": "batch_size", "type": "range", "bounds": [1024, 8192], "value_type": "int"},
+            ]
+        if name == "KAN":
+            return [
+                {"name": "hidden_dim", "type": "range", "bounds": [32, 128], "value_type": "int"},
+                {"name": "grid_size", "type": "range", "bounds": [3, 8], "value_type": "int"},
+                {"name": "spline_order", "type": "range", "bounds": [2, 4], "value_type": "int"},
+                {"name": "scale_noise", "type": "range", "bounds": [0.05, 0.2]},
+                {"name": "scale_base", "type": "range", "bounds": [0.5, 2.0]},
+                {"name": "scale_spline", "type": "range", "bounds": [0.5, 2.0]},
+                {"name": "lr", "type": "range", "bounds": [1e-4, 1e-2], "log_scale": True},
+                {"name": "batch_size", "type": "range", "bounds": [512, 8192], "value_type": "int"},
+            ]
+        if name == "Transformer":
+            return [
+                {"name": "d_model", "type": "choice", "values": [64, 128, 256]},
+                {"name": "n_heads", "type": "choice", "values": [4, 8]},
+                {"name": "n_layers", "type": "range", "bounds": [2, 4], "value_type": "int"},
+                {"name": "lr", "type": "range", "bounds": [1e-5, 1e-3], "log_scale": True},
+                {"name": "batch_size", "type": "range", "bounds": [32, 256], "value_type": "int"},
+            ]
+        return []
+
+    def _ray_pick_device(self, name: str) -> str:
+        try:
+            if ray and ray.is_initialized():
+                gpu_ids = ray.get_gpu_ids()
+                if gpu_ids:
+                    return f"cuda:{int(gpu_ids[0])}"
+        except Exception:
+            pass
+        if self.device_pool:
+            return self.device_pool[0]
+        return "cpu"
+
+    def _ray_create_model(self, name: str, params: dict[str, Any], device: str, y_train: pd.Series):
+        params = params.copy()
+        if name == "TabNet":
+            hidden = params.pop("hidden_dim", None)
+            if hidden is not None:
+                params.setdefault("n_d", int(hidden))
+                params.setdefault("n_a", int(hidden))
+        if name == "LightGBM":
+            params["objective"] = "binary" if y_train.nunique() == 2 else "multiclass"
+            params["num_class"] = int(y_train.nunique())
+            params["n_jobs"] = int(self._hpo_cpu_threads) if self._hpo_cpu_threads > 0 else -1
+            if isinstance(device, str) and device.startswith("cuda:"):
+                try:
+                    params["device_type"] = "gpu"
+                    params["gpu_device_id"] = int(device.split(":")[1])
+                    params.setdefault("max_bin", 63)
+                except Exception:
+                    pass
+            return LightGBMExpert(params=params)
+        if name == "RandomForest":
+            if isinstance(device, str) and device.startswith("cuda:"):
+                try:
+                    params["gpu_device_id"] = int(device.split(":")[1])
+                except Exception:
+                    pass
+            params.setdefault("random_state", 42)
+            return RandomForestExpert(params=params)
+        if name == "ExtraTrees":
+            params.setdefault("random_state", 42)
+            return ExtraTreesExpert(params=params)
+        if name == "N-BEATS":
+            params.setdefault("max_time_sec", int(self.settings.models.nbeats_train_seconds))
+            params.setdefault("device", device)
+            return NBeatsExpert(**self._filter_kwargs(NBeatsExpert, params))
+        if name == "TiDE":
+            params.setdefault("max_time_sec", int(self.settings.models.tide_train_seconds))
+            params.setdefault("device", device)
+            return TiDEExpert(**self._filter_kwargs(TiDEExpert, params))
+        if name == "KAN":
+            params.setdefault("max_time_sec", int(self.settings.models.kan_train_seconds))
+            params.setdefault("device", device)
+            return KANExpert(**self._filter_kwargs(KANExpert, params))
+        if name == "Transformer":
+            params.setdefault("max_time_sec", int(self.settings.models.transformer_train_seconds))
+            params.setdefault("device", device)
+            return TransformerExpertTorch(**self._filter_kwargs(TransformerExpertTorch, params))
+        if name == "TabNet":
+            params.setdefault("max_time_sec", int(self.settings.models.tabnet_train_seconds))
+            params.setdefault("device", device)
+            return TabNetExpert(**self._filter_kwargs(TabNetExpert, params))
+        return None
+
+    def _filter_kwargs(self, cls: type, params: dict[str, Any]) -> dict[str, Any]:
+        try:
+            sig = inspect.signature(cls.__init__)
+            valid = set(sig.parameters.keys())
+            return {k: v for k, v in params.items() if k in valid}
+        except Exception:
+            return params
+
+    def _infer_meta_trading_days(self, meta: pd.DataFrame | None) -> float | None:
+        if meta is None:
+            return None
+        try:
+            ts: pd.DatetimeIndex | None
+            idx = getattr(meta, "index", None)
+            if isinstance(idx, pd.DatetimeIndex):
+                ts = idx
+            else:
+                ts = None
+                for col in ("timestamp", "time", "datetime", "date"):
+                    if col in meta.columns:
+                        ts = pd.to_datetime(meta[col], utc=True, errors="coerce")
+                        break
+            if ts is None:
+                return None
+            ts = pd.DatetimeIndex(ts)
+            if ts.tz is not None:
+                ts = ts.tz_convert("UTC")
+            ts = ts[~ts.isna()]
+            if len(ts) == 0:
+                return None
+            mask = ts.weekday < 5
+            if not np.any(mask):
+                return None
+            days = pd.unique(ts[mask].normalize())
+            return float(len(days))
+        except Exception:
+            return None
+
+    def _prop_required_trades(self, meta_val: pd.DataFrame | None) -> float:
+        base = float(self.prop_min_trades)
+        if not bool(getattr(self.settings.risk, "prop_firm_rules", False)):
+            return base
+        if meta_val is None:
+            return base
+        trading_days = self._infer_meta_trading_days(meta_val)
+        if trading_days is None:
+            return base
+        days_per_month = 21.0
+        try:
+            days_per_month = float(os.environ.get("FOREX_BOT_TRADING_DAYS_PER_MONTH", "21") or 21.0)
+        except Exception:
+            days_per_month = 21.0
+        days_per_month = max(1.0, float(days_per_month))
+        required = base * (trading_days / days_per_month)
+        return max(1.0, float(required))
+
+    @staticmethod
+    def _pad_probs(probs: np.ndarray) -> np.ndarray:
+        if probs is None or len(probs) == 0:
+            return np.zeros((0, 3), dtype=float)
+        arr = np.asarray(probs, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        n = arr.shape[0]
+
+        if arr.shape[1] >= 3:
+            return arr[:, :3]
+
+        out = np.zeros((n, 3), dtype=float)
+        if arr.shape[1] == 2:
+            out[:, 0] = arr[:, 0]
+            out[:, 1] = arr[:, 1]
+            return out
+
+        out[:, 0] = 1.0 - arr[:, 0]
+        out[:, 1] = arr[:, 0]
+        return out
+
+    def _objective_metrics(
+        self,
+        y_true: np.ndarray,
+        y_pred_proba: np.ndarray,
+        meta_val: pd.DataFrame | None,
+    ) -> dict[str, float]:
+        y_true_arr = np.asarray(y_true, dtype=int)
+        y_true_arr = np.where(y_true_arr == 2, -1, y_true_arr).astype(int, copy=False)
+
+        probs = self._pad_probs(y_pred_proba)
+        n = min(len(y_true_arr), len(probs))
+        if n <= 0:
+            return {
+                "prop_score": 0.0,
+                "drawdown": 0.0,
+                "daily_dd": 0.0,
+                "accuracy": 0.0,
+                "trades": 0.0,
+            }
+        y_true_arr = y_true_arr[:n]
+        probs = probs[:n]
+        if meta_val is not None and len(meta_val) != n:
+            try:
+                meta_val = meta_val.iloc[:n]
+            except Exception:
+                meta_val = None
+
+        p_buy = probs[:, 1]
+        p_sell = probs[:, 2]
+        trade_prob = np.maximum(p_buy, p_sell)
+        direction = np.where(p_buy >= p_sell, 1, -1).astype(np.int8, copy=False)
+        signals = np.where(trade_prob >= self.prop_conf_threshold, direction, 0).astype(np.int8, copy=False)
+        acc = float(np.mean(signals.astype(int) == y_true_arr)) if len(y_true_arr) else 0.0
+
+        if meta_val is None or not {"close", "high", "low"}.issubset(set(meta_val.columns)):
+            return {
+                "prop_score": float(acc),
+                "drawdown": 0.0,
+                "daily_dd": 0.0,
+                "accuracy": float(acc),
+                "trades": 0.0,
+            }
+
+        sl_cfg = getattr(self.settings.risk, "meta_label_sl_pips", None)
+        tp_cfg = getattr(self.settings.risk, "meta_label_tp_pips", None)
+        rr = float(getattr(self.settings.risk, "min_risk_reward", 2.0))
+        max_hold = int(getattr(self.settings.risk, "triple_barrier_max_bars", 0) or 0)
+        trailing_enabled = bool(getattr(self.settings.risk, "trailing_enabled", False))
+        trailing_mult = float(getattr(self.settings.risk, "trailing_atr_multiplier", 1.0) or 1.0)
+        trailing_trigger_r = float(getattr(self.settings.risk, "trailing_be_trigger_r", 1.0) or 1.0)
+        spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
+        commission = float(getattr(self.settings.risk, "commission_per_lot", 7.0))
+        dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.08))
+        daily_dd_limit = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
+
+        close_all = meta_val["close"].to_numpy()
+        high_all = meta_val["high"].to_numpy()
+        low_all = meta_val["low"].to_numpy()
+        atr_all = meta_val["atr"].to_numpy() if "atr" in meta_val.columns else None
+
+        month_indices_all = np.zeros(len(meta_val), dtype=np.int64)
+        day_indices_all = np.zeros(len(meta_val), dtype=np.int64)
+        try:
+            ts: pd.DatetimeIndex | None
+            idx = getattr(meta_val, "index", None)
+            if isinstance(idx, pd.DatetimeIndex):
+                ts = idx
+            else:
+                ts = None
+                for col in ("timestamp", "time", "datetime", "date"):
+                    if col in meta_val.columns:
+                        ts = pd.DatetimeIndex(pd.to_datetime(meta_val[col], utc=True, errors="coerce"))
+                        break
+            if ts is not None and len(ts) == len(meta_val):
+                if ts.tz is not None:
+                    ts = ts.tz_convert("UTC")
+                raw = ts.year.to_numpy() * 12 + ts.month.to_numpy()
+                month_indices_all = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
+                day_raw = (
+                    ts.year.to_numpy() * 10000
+                    + ts.month.to_numpy() * 100
+                    + ts.day.to_numpy()
+                )
+                day_indices_all = np.nan_to_num(day_raw, nan=0.0).astype(np.int64, copy=False)
+        except Exception:
+            month_indices_all = np.zeros(len(meta_val), dtype=np.int64)
+            day_indices_all = np.zeros(len(meta_val), dtype=np.int64)
+
+        try:
+            days_per_month = float(os.environ.get("FOREX_BOT_TRADING_DAYS_PER_MONTH", "21") or 21.0)
+        except Exception:
+            days_per_month = 21.0
+        tdays = self._infer_meta_trading_days(meta_val)
+        months = max(1e-6, (tdays / days_per_month)) if tdays else 1.0
+        min_monthly = float(getattr(self.settings.risk, "monthly_profit_target_pct", 0.04) or 0.04)
+
+        def _invalid(drawdown: float, daily_dd: float) -> dict[str, float]:
+            return {
+                "prop_score": -1e9,
+                "drawdown": float(drawdown),
+                "daily_dd": float(daily_dd),
+                "accuracy": float(acc),
+                "trades": 0.0,
+            }
+
+        sym_series = meta_val["symbol"] if "symbol" in meta_val.columns else None
+        if sym_series is not None:
+            sym_arr = np.asarray(sym_series)
+            uniq_syms = pd.unique(sym_arr)
+            total_trades = 0.0
+            weighted_score = 0.0
+            weighted_monthly = 0.0
+            weighted_sortino = 0.0
+            weighted_calmar = 0.0
+            weighted_pf = 0.0
+            max_dd = 0.0
+            max_daily = 0.0
+            for sym in uniq_syms:
+                mask = sym_arr == sym
+                if not np.any(mask):
+                    continue
+                close = close_all[mask]
+                high = high_all[mask]
+                low = low_all[mask]
+                sig = signals[mask]
+                month_idx = month_indices_all[mask]
+                day_idx = day_indices_all[mask]
+                pip_size, pip_value_per_lot = infer_pip_metrics(str(sym))
+                if sl_cfg is None or float(sl_cfg) <= 0:
+                    atr_vals = atr_all[mask] if atr_all is not None else None
+                    auto = infer_sl_tp_pips_auto(
+                        open_prices=meta_val["open"].to_numpy(dtype=np.float64)[mask]
+                        if "open" in meta_val.columns
+                        else close,
+                        high_prices=high,
+                        low_prices=low,
+                        close_prices=close,
+                        atr_values=atr_vals,
+                        pip_size=pip_size,
+                        atr_mult=float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5)),
+                        min_rr=rr,
+                        min_dist=float(getattr(self.settings.risk, "meta_label_min_dist", 0.0)),
+                        settings=self.settings,
+                    )
+                    if auto is None:
+                        continue
+                    sl_pips, tp_pips = auto
+                else:
+                    sl_pips = float(sl_cfg)
+                    if tp_cfg is None or float(tp_cfg) <= 0:
+                        tp_pips = sl_pips * rr
+                    else:
+                        tp_pips = max(float(tp_cfg), sl_pips * rr)
+                metrics = fast_evaluate_strategy(
+                    close_prices=close,
+                    high_prices=high,
+                    low_prices=low,
+                    signals=sig,
+                    month_indices=month_idx,
+                    day_indices=day_idx,
+                    sl_pips=sl_pips,
+                    tp_pips=tp_pips,
+                    max_hold_bars=max_hold,
+                    trailing_enabled=trailing_enabled,
+                    trailing_atr_multiplier=trailing_mult,
+                    trailing_be_trigger_r=trailing_trigger_r,
+                    pip_value=pip_size,
+                    spread_pips=spread,
+                    commission_per_trade=commission,
+                    pip_value_per_lot=pip_value_per_lot,
+                )
+
+                net_profit, _sharpe, sortino, dd, _win_rate, profit_factor, _exp, _sqn, trades, _r2, daily_dd = metrics
+                max_dd = max(max_dd, float(dd))
+                max_daily = max(max_daily, float(daily_dd))
+                if dd >= dd_limit or daily_dd >= daily_dd_limit:
+                    return _invalid(max_dd, max_daily)
+                if trades <= 0:
+                    continue
+                monthly_ret = (net_profit / 100000.0) / months
+                if monthly_ret < min_monthly:
+                    return _invalid(max_dd, max_daily)
+                calmar = (monthly_ret / dd) if dd > 1e-9 else 0.0
+                prop_score = (
+                    monthly_ret * 100.0
+                    + 0.6 * sortino
+                    + 0.4 * calmar
+                    + 0.2 * profit_factor
+                    - 50.0 * max(0.0, dd - dd_limit)
+                )
+                total_trades += float(trades)
+                weighted_score += float(trades) * float(prop_score)
+                weighted_monthly += float(trades) * float(monthly_ret)
+                weighted_sortino += float(trades) * float(sortino)
+                weighted_calmar += float(trades) * float(calmar)
+                weighted_pf += float(trades) * float(profit_factor)
+
+            required = float(self._prop_required_trades(meta_val))
+            if total_trades < required:
+                return _invalid(max_dd, max_daily)
+            denom = max(total_trades, 1.0)
+            return {
+                "prop_score": float(self.prop_weight * (weighted_score / denom) + self.acc_weight * acc),
+                "drawdown": float(max_dd),
+                "daily_dd": float(max_daily),
+                "accuracy": float(acc),
+                "trades": float(total_trades),
+                "monthly_return": float(weighted_monthly / denom),
+                "sortino": float(weighted_sortino / denom),
+                "calmar": float(weighted_calmar / denom),
+                "profit_factor": float(weighted_pf / denom),
+            }
+
+        pip_size, pip_value_per_lot = infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
+        if sl_cfg is None or float(sl_cfg) <= 0:
+            auto = infer_sl_tp_pips_auto(
+                open_prices=meta_val["open"].to_numpy(dtype=np.float64)
+                if "open" in meta_val.columns
+                else close_all,
+                high_prices=high_all,
+                low_prices=low_all,
+                close_prices=close_all,
+                atr_values=atr_all,
+                pip_size=pip_size,
+                atr_mult=float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5)),
+                min_rr=rr,
+                min_dist=float(getattr(self.settings.risk, "meta_label_min_dist", 0.0)),
+                settings=self.settings,
+            )
+            if auto is None:
+                return _invalid(1.0, 1.0)
+            sl_pips, tp_pips = auto
+        else:
+            sl_pips = float(sl_cfg)
+            if tp_cfg is None or float(tp_cfg) <= 0:
+                tp_pips = sl_pips * rr
+            else:
+                tp_pips = max(float(tp_cfg), sl_pips * rr)
+        metrics = fast_evaluate_strategy(
+            close_prices=close_all,
+            high_prices=high_all,
+            low_prices=low_all,
+            signals=signals,
+            month_indices=month_indices_all,
+            day_indices=day_indices_all,
+            sl_pips=sl_pips,
+            tp_pips=tp_pips,
+            max_hold_bars=max_hold,
+            trailing_enabled=trailing_enabled,
+            trailing_atr_multiplier=trailing_mult,
+            trailing_be_trigger_r=trailing_trigger_r,
+            pip_value=pip_size,
+            spread_pips=spread,
+            commission_per_trade=commission,
+            pip_value_per_lot=pip_value_per_lot,
+        )
+
+        net_profit, _sharpe, sortino, dd, win_rate, profit_factor, _exp, _sqn, trades, _r2, daily_dd = metrics
+        if trades < float(self._prop_required_trades(meta_val)) or dd >= dd_limit:
+            return _invalid(dd, daily_dd)
+        if daily_dd >= daily_dd_limit:
+            return _invalid(dd, daily_dd)
+
+        monthly_ret = (net_profit / 100000.0) / months
+        if monthly_ret < min_monthly:
+            return _invalid(dd, daily_dd)
+        calmar = (monthly_ret / dd) if dd > 1e-9 else 0.0
+        prop_score = (
+            monthly_ret * 100.0
+            + 0.6 * sortino
+            + 0.4 * calmar
+            + 0.2 * profit_factor
+            + 0.1 * (win_rate * 100.0)
+            - 50.0 * max(0.0, dd - 0.04)
+        )
+        return {
+            "prop_score": float(self.prop_weight * prop_score + self.acc_weight * acc),
+            "drawdown": float(dd),
+            "daily_dd": float(daily_dd),
+            "accuracy": float(acc),
+            "trades": float(trades),
+            "monthly_return": float(monthly_ret),
+            "sortino": float(sortino),
+            "calmar": float(calmar),
+            "profit_factor": float(profit_factor),
+        }
+
+    def _objective_base(self, y_true: np.ndarray, y_pred_proba: np.ndarray, meta_val: pd.DataFrame | None) -> float:
+        metrics = self._objective_metrics(y_true, y_pred_proba, meta_val)
+        return float(metrics.get("prop_score", 0.0))
+
+    def _ray_trainable(
+        self,
+        config: dict[str, Any],
+        model_name: str,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        meta_val: pd.DataFrame | None,
+    ) -> None:
+        if self._should_stop():
+            tune.report(prop_score=-1e9, drawdown=1.0, daily_dd=1.0, accuracy=0.0, trades=0.0)
+            return
+        device = self._ray_pick_device(model_name)
+        model = self._ray_create_model(model_name, config, device, y_train)
+        if model is None:
+            tune.report(prop_score=-1e9, drawdown=1.0, daily_dd=1.0, accuracy=0.0, trades=0.0)
+            return
+        try:
+            fit_ok = model.fit(X_train, y_train)
+            if isinstance(fit_ok, bool) and not fit_ok:
+                tune.report(prop_score=-1e9, drawdown=1.0, daily_dd=1.0, accuracy=0.0, trades=0.0)
+                return
+            preds = model.predict_proba(X_val)
+            metrics = self._objective_metrics(y_val, preds, meta_val)
+            tune.report(**metrics)
+        except Exception as exc:
+            logger.warning(f"Ray Tune trial failed for {model_name}: {exc}", exc_info=True)
+            tune.report(prop_score=-1e9, drawdown=1.0, daily_dd=1.0, accuracy=0.0, trades=0.0)
+
+    def _ray_tune_model(
+        self,
+        name: str,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        meta_val: pd.DataFrame | None,
+    ) -> dict[str, Any]:
+        if not (RAY_AVAILABLE and AX_AVAILABLE):
+            return {}
+        space = self._ax_search_space(name, y_train)
+        if not space:
+            return {}
+
+        if name == "Transformer":
+            max_rows = int(getattr(self.settings.models, "hpo_max_rows", 200_000) or 0)
+            if max_rows > 0 and len(X_train) > max_rows:
+                idx_train = np.linspace(0, len(X_train) - 1, max_rows, dtype=int)
+                X_train = X_train.iloc[idx_train]
+                y_train = y_train.iloc[idx_train]
+            if max_rows > 0 and len(X_val) > max_rows:
+                idx_val = np.linspace(0, len(X_val) - 1, max_rows, dtype=int)
+                X_val = X_val.iloc[idx_val]
+                y_val = y_val.iloc[idx_val]
+                if meta_val is not None:
+                    try:
+                        meta_val = meta_val.iloc[idx_val]
+                    except Exception:
+                        meta_val = None
+
+        dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.08) or 0.08)
+        daily_dd_limit = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
+        outcome_constraints = []
+        if meta_val is not None and {"close", "high", "low"}.issubset(set(meta_val.columns)):
+            outcome_constraints = [
+                f"drawdown <= {dd_limit}",
+                f"daily_dd <= {daily_dd_limit}",
+            ]
+
+        ax_search = AxSearch(
+            space=space,
+            metric="prop_score",
+            mode="max",
+            outcome_constraints=outcome_constraints or None,
+        )
+        max_concurrent = self.ray_max_concurrency
+        if name in {"TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"} and self.device_pool:
+            max_concurrent = 1
+        if ConcurrencyLimiter is not None:
+            ax_search = ConcurrencyLimiter(ax_search, max_concurrent=max_concurrent)
+
+        scheduler = ASHAScheduler(metric="prop_score", mode="max") if ASHAScheduler else None
+
+        resources = {"cpu": 1, "gpu": 0}
+        if self.device_pool and name in {"TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"}:
+            resources["gpu"] = 1
+        if name in {"LightGBM", "RandomForest", "ExtraTrees"} and self.device_pool:
+            resources["gpu"] = 1
+
+        try:
+            if ray and not ray.is_initialized():
+                ray.init(ignore_reinit_error=True, log_to_driver=False)
+        except Exception:
+            pass
+
+        trials = self._ray_trials_for_model(name)
+        trainable = tune.with_parameters(
+            self._ray_trainable,
+            model_name=name,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            meta_val=meta_val,
+        )
+
+        analysis = tune.run(
+            trainable,
+            name=f"HPO_{name}",
+            search_alg=ax_search,
+            num_samples=trials,
+            resources_per_trial=resources,
+            scheduler=scheduler,
+            local_dir=str(self.ray_dir),
+            log_to_file=False,
+            verbose=1,
+            raise_on_failed_trial=False,
+        )
+
+        try:
+            best_config = analysis.get_best_config(metric="prop_score", mode="max")
+        except Exception:
+            return {}
+
+        int_keys = {
+            "n_estimators",
+            "num_leaves",
+            "min_child_samples",
+            "max_depth",
+            "min_samples_split",
+            "min_samples_leaf",
+            "n_layers",
+            "n_blocks",
+            "n_steps",
+            "hidden_dim",
+            "grid_size",
+            "spline_order",
+            "batch_size",
+            "d_model",
+            "n_heads",
+        }
+        for key in int_keys:
+            if key in best_config:
+                try:
+                    best_config[key] = int(best_config[key])
+                except Exception:
+                    pass
+
+        if name == "TabNet" and "hidden_dim" in best_config:
+            hidden = int(best_config.get("hidden_dim", 64))
+            best_config["n_d"] = hidden
+            best_config["n_a"] = hidden
+            best_config.pop("hidden_dim", None)
+
+        if name == "LightGBM":
+            best_config = best_config.copy()
+            best_config["objective"] = "binary" if y_train.nunique() == 2 else "multiclass"
+            best_config["num_class"] = int(y_train.nunique())
+        return best_config
+
+    def _optimize_all_ray_tune(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        meta_val: pd.DataFrame | None,
+    ) -> dict[str, dict[str, Any]]:
+        logger.info(
+            f"Ray Tune/Ax HPO: trials={self.n_trials} backend={self.hpo_backend}"
+        )
+        best_params: dict[str, dict[str, Any]] = {}
+
+        model_batches = [
+            ["LightGBM", "RandomForest", "ExtraTrees"],
+            ["TabNet", "N-BEATS", "TiDE", "KAN"],
+            ["Transformer"],
+        ]
+
+        for batch in model_batches:
+            for name in batch:
+                if self._should_stop():
+                    logger.info("Stop requested; skipping remaining HPO runs.")
+                    self._save_params(best_params)
+                    return best_params
+                try:
+                    import gc
+
+                    gc.collect()
+                    try:
+                        import torch
+
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    logger.info(f"Starting {name} Ray Tune/Ax HPO")
+                    best_params[name] = self._ray_tune_model(
+                        name, X_train, y_train, X_val, y_val, meta_val
+                    )
+                except Exception as exc:
+                    logger.error(f"Ray Tune optimization for {name} failed: {exc}")
+
+        self._save_params(best_params)
+        return best_params
 
     def optimize_all(
         self,
@@ -257,14 +837,17 @@ class HyperparameterOptimizer:
         stop_event: Any | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Run optimization for all supported models."""
-        if not OPTUNA_AVAILABLE:
-            logger.warning("Optuna not installed; hyperparameter optimization skipped.")
+        if self.hpo_backend == "none":
+            logger.info("HPO backend disabled; skipping hyperparameter optimization.")
+            return {}
+        if not (RAY_AVAILABLE and AX_AVAILABLE):
+            logger.warning("Ray Tune/Ax not installed; hyperparameter optimization skipped.")
             return {}
         self.stop_event = stop_event
         self.meta_df = meta_df
 
         # Cap dataset size to keep trials fast on CPU/limited nodes
-        cap = int(getattr(self.settings.models, "optuna_max_rows", 0) or 0)
+        cap = int(getattr(self.settings.models, "hpo_max_rows", 0) or 0)
         if cap > 0 and len(X) > cap:
             idx = np.arange(len(X) - cap, len(X))
             X = X.iloc[idx]
@@ -313,12 +896,12 @@ class HyperparameterOptimizer:
 
         if meta_val is None:
             logger.info(
-                "Optuna objective: accuracy-only (no OHLC metadata). "
+                "HPO objective: accuracy-only (no OHLC metadata). "
                 "Trial values will not reflect profitability in this mode."
             )
         elif not {"close", "high", "low"}.issubset(set(meta_val.columns)):
             logger.info(
-                "Optuna objective: accuracy-only (metadata missing OHLC columns). "
+                "HPO objective: accuracy-only (metadata missing OHLC columns). "
                 f"Columns={sorted(set(meta_val.columns))}"
             )
         else:
@@ -327,1268 +910,21 @@ class HyperparameterOptimizer:
             tdays = self._infer_meta_trading_days(meta_val)
             span_msg = f" val_trading_days={tdays:.0f}" if tdays is not None else ""
             logger.info(
-                "Optuna objective: prop-aware (OHLC available) "
+                "HPO objective: prop-aware (OHLC available) "
                 f"| conf>={self.prop_conf_threshold:.2f} min_trades>={required:.1f}{span_msg} "
                 f"dd_limit={dd_limit:.2%}"
             )
 
-        self._study_suffix = self._dataset_signature(X, y)
-
         best_params = {}
 
         if self._should_stop():
-            logger.info("Stop requested before optimization; skipping all Optuna studies.")
+            logger.info("Stop requested before optimization; skipping all HPO studies.")
             return best_params
 
-        # Build list of models to optimize with their GPU assignments
-        # Group models into parallel batches - each batch runs on all GPUs simultaneously
-        n_gpus = len(self.device_pool) if self.device_pool else 1
-
-        # Batch 1: Tree-based models (GPU-accelerated) - run SEQUENTIALLY to avoid CUDA context conflicts
-        # Using ThreadPoolExecutor here causes "cudaErrorInvalidResourceHandle" because cuML and Torch
-        # fight over the GPU context in the same process.
-        batch1_models = []
-        if LGBM_AVAILABLE:
-            batch1_models.append(("LightGBM", self._optimize_lgbm, 0))
-        batch1_models.append(("RandomForest", self._optimize_random_forest, 0))
-        batch1_models.append(("ExtraTrees", self._optimize_extra_trees, 0))
-
-        for name, func, _ in batch1_models:
-            if self._should_stop():
-                logger.info("Stop requested; skipping remaining optimization studies.")
-                return best_params
-            try:
-                # Force cleanup before starting next model type
-                import gc
-                gc.collect()
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                
-                logger.info(f"Starting {name} optimization (Sequential Mode, capped trials)")
-                prev_trials = self.n_trials
-                self.n_trials = min(prev_trials, 25)  # cap tree trials
-                best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
-                self.n_trials = prev_trials
-            except Exception as e:
-                logger.error(f"Optimization for {name} failed: {e}")
-
-        if self._should_stop():
-            logger.info("Stop requested; skipping remaining optimization studies.")
-            return best_params
-
-        # Batch 2: Neural network models - run SEQUENTIALLY (cap trials modestly)
-        # Note: Internal Optuna trials still run in PARALLEL across all 4 GPUs.
-        batch2_models = [
-            ("TabNet", self._optimize_tabnet, 0),
-            ("N-BEATS", self._optimize_nbeats, 0),
-            ("TiDE", self._optimize_tide, 0),
-            ("KAN", self._optimize_kan, 0),
-        ]
-
-        for name, func, _ in batch2_models:
-            if self._should_stop():
-                logger.info("Stop requested; skipping remaining optimization studies.")
-                return best_params
-            try:
-                import gc
-                gc.collect()
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-
-                logger.info(f"Starting {name} optimization (Sequential Mode, capped trials for stability)")
-                prev_trials = self.n_trials
-                # allow slightly more for deep models, but cap to avoid runaway
-                self.n_trials = min(prev_trials, 40)
-                best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
-                self.n_trials = prev_trials
-            except Exception as e:
-                logger.error(f"Optimization for {name} failed: {e}")
-
-        if self._should_stop():
-            logger.info("Stop requested; skipping remaining optimization studies.")
-            return best_params
-
-        # Batch 3: Transformer + RL models - run SEQUENTIALLY
-        batch3_models = [("Transformer", self._optimize_transformer, 0)]
-        if hasattr(RLExpertPPO, "__init__") and "rl_ppo" in self.settings.models.ml_models:
-            batch3_models.append(("RL_PPO", self._optimize_rl_ppo, 0))
-        if hasattr(RLExpertSAC, "__init__") and "rl_sac" in self.settings.models.ml_models:
-            batch3_models.append(("RL_SAC", self._optimize_rl_sac, 0))
-        if EvoExpertCMA:
-            batch3_models.append(("Neuroevolution", self._optimize_neuroevolution, 0))
-
-        for name, func, _ in batch3_models:
-            if self._should_stop():
-                logger.info("Stop requested; skipping remaining optimization studies.")
-                return best_params
-            try:
-                import gc
-                gc.collect()
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-
-                logger.info(f"Starting {name} optimization (Sequential Mode)")
-                best_params[name] = func(X_train, y_train, X_val, y_val, meta_val)
-            except Exception as e:
-                logger.error(f"Optimization for {name} failed: {e}")
-
-        self._save_params(best_params)
-        return best_params
-
-    def _study_name(self, base: str) -> str:
-        if self.reuse_study:
-            return base  # Stable name; reuse across runs even if dataset signature shifts
-        if self._study_suffix:
-            return f"{base}_{self._study_suffix}"
-        return base
-
-    def _pick_device(self, trial_index: int) -> str:
-        # Check thread-local forced GPU first (set by parallel model optimization)
-        forced_gpu = getattr(_thread_local, "forced_gpu", None)
-        if forced_gpu is not None and self.device_pool:
-            return f"cuda:{forced_gpu}"
-        if self.device_pool:
-            return self.device_pool[trial_index % len(self.device_pool)]
-        return self.default_device or "cpu"
-
-    def _get_study(self, study_name: str) -> optuna.Study:
-        env_url = os.environ.get("OPTUNA_STORAGE_URL", "")
-        cfg_url = getattr(self.settings.models, "optuna_storage_url", "")
-        storage_url = env_url or cfg_url or "redis://localhost:6379/0"
-        storage_url = self._ensure_storage_backend(storage_url)
-        full_name = self._study_name(study_name)
-        pruner_name = str(getattr(self.settings.models, "optuna_pruner", "asha")).lower()
-        if pruner_name == "asha":
-            pruner = optuna.pruners.HyperbandPruner()
-        elif pruner_name == "hyperband":
-            pruner = optuna.pruners.HyperbandPruner()
-        else:
-            pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=10)
-
-        sampler_name = str(getattr(self.settings.models, "optuna_sampler", "tpe")).lower()
-        if sampler_name == "random":
-            sampler = optuna.samplers.RandomSampler()
-        elif sampler_name == "cmaes":
-            sampler = optuna.samplers.CmaEsSampler()
-        else:
-            # Avoid Optuna ExperimentalWarning spam from multivariate/group TPESampler options.
-            sampler = optuna.samplers.TPESampler()
-
-        if storage_url == _JOURNAL_STORAGE_SENTINEL:
-            # Journal storage is a simple, durable fallback that does not require SQL backends.
-            try:
-                from optuna.storages import JournalStorage
-                from optuna.storages.journal import JournalFileBackend
-
-                journal_path = Path(self.cache_dir) / "optuna.journal"
-                journal_path.parent.mkdir(parents=True, exist_ok=True)
-                storage = JournalStorage(JournalFileBackend(str(journal_path)))
-                return optuna.create_study(
-                    study_name=full_name,
-                    storage=storage,
-                    load_if_exists=True,
-                    direction="maximize",
-                    pruner=pruner,
-                    sampler=sampler,
-                )
-            except Exception as exc:
-                logger.warning(f"Optuna journal storage unavailable; falling back to in-memory (no persistence): {exc}")
-                return optuna.create_study(
-                    direction="maximize",
-                    pruner=pruner,
-                    sampler=sampler,
-                )
-
-        # Try Redis with new JournalRedisBackend (Optuna 3.1+)
-        if storage_url.startswith("redis://"):
-            try:
-                from optuna.storages import JournalStorage
-                from optuna.storages.journal import JournalRedisBackend
-
-                redis_backend = JournalRedisBackend(storage_url)
-                storage = JournalStorage(redis_backend)
-                logger.info(f"Using Redis JournalStorage for Optuna: {storage_url}")
-                return optuna.create_study(
-                    study_name=full_name,
-                    storage=storage,
-                    load_if_exists=True,
-                    direction="maximize",
-                    pruner=pruner,
-                    sampler=sampler,
-                )
-            except Exception as exc:
-                logger.info(f"Redis JournalStorage failed: {exc}, trying file journal")
-
-        try:
-            return optuna.create_study(
-                study_name=full_name,
-                storage=storage_url,
-                load_if_exists=True,
-                direction="maximize",
-                pruner=pruner,
-                sampler=sampler,
-            )
-        except Exception as exc:
-            logger.info(f"Optuna storage '{storage_url}' unavailable, trying journal storage: {exc}")
-
-            # Journal storage is a simple, durable fallback that does not require SQL backends.
-            try:
-                from optuna.storages import JournalStorage
-                from optuna.storages.journal import JournalFileBackend
-
-                journal_path = Path(self.cache_dir) / "optuna.journal"
-                journal_path.parent.mkdir(parents=True, exist_ok=True)
-                storage = JournalStorage(JournalFileBackend(str(journal_path)))
-                return optuna.create_study(
-                    study_name=full_name,
-                    storage=storage,
-                    load_if_exists=True,
-                    direction="maximize",
-                    pruner=pruner,
-                    sampler=sampler,
-                )
-            except Exception as exc2:
-                logger.warning(
-                    f"Optuna journal storage unavailable; falling back to in-memory (no persistence): {exc2}"
-                )
-                return optuna.create_study(
-                    direction="maximize",
-                    pruner=pruner,
-                    sampler=sampler,
-                )
-
-    def _ensure_storage_backend(self, url: str) -> str:
-        """
-        Best-effort bootstrap of a fast storage backend.
-        Priority: Redis (start local daemon if needed) -> DuckDB -> in-memory fallback.
-        """
-        # Redis path
-        if url.startswith("redis://"):
-            if not REDIS_PY_AVAILABLE:
-                if os.name == "nt":
-                    logger.info("redis-py not installed; using Optuna journal storage on Windows.")
-                    return _JOURNAL_STORAGE_SENTINEL
-                logger.info("redis-py not installed; switching storage to DuckDB.")
-                return self._duckdb_url()
-            try:
-                client = redis.from_url(url, socket_connect_timeout=1, socket_timeout=1)
-                client.ping()
-                return url
-            except Exception:
-                # Try to start local redis if host is localhost
-                try:
-                    from urllib.parse import urlparse
-
-                    parsed = urlparse(url)
-                    if parsed.hostname in ("127.0.0.1", "localhost"):
-                        if shutil.which("redis-server"):
-                            logger.info("Starting local redis-server for Optuna storage...")
-                            subprocess.check_call(
-                                ["redis-server", "--daemonize", "yes", "--save", "", "--appendonly", "no"]
-                            )
-                            client = redis.from_url(url, socket_connect_timeout=2, socket_timeout=2)
-                            client.ping()
-                            return url
-                        else:
-                            # Try apt-get install redis-server (Linux best-effort)
-                            if shutil.which("apt-get"):
-                                try:
-                                    subprocess.check_call(
-                                        ["sudo", "-n", "apt-get", "update"],
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL,
-                                    )
-                                    subprocess.check_call(
-                                        ["sudo", "-n", "apt-get", "install", "-y", "redis-server"],
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL,
-                                    )
-                                    if shutil.which("redis-server"):
-                                        subprocess.check_call(
-                                            ["redis-server", "--daemonize", "yes", "--save", "", "--appendonly", "no"]
-                                        )
-                                        client = redis.from_url(url, socket_connect_timeout=2, socket_timeout=2)
-                                        client.ping()
-                                        return url
-                                except Exception:
-                                    pass
-                            # Windows: attempt to start installed Redis service if present
-                            if os.name == "nt":
-                                try:
-                                    # common Redis installation paths; best effort
-                                    possible = [
-                                        r"C:\\Program Files\\Redis\\redis-server.exe",
-                                        r"C:\\Program Files (x86)\\Redis\\redis-server.exe",
-                                    ]
-                                    exe = next((p for p in possible if Path(p).exists()), None)
-                                    if exe:
-                                        logger.info("Starting local redis-server (Windows)...")
-                                        subprocess.Popen(
-                                            [exe, "--service-run"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                                        )
-                                        client = redis.from_url(url, socket_connect_timeout=3, socket_timeout=3)
-                                        client.ping()
-                                        return url
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
-                if os.name == "nt":
-                    logger.info("Redis storage unavailable; using Optuna journal storage on Windows.")
-                    return _JOURNAL_STORAGE_SENTINEL
-                logger.info("Redis storage unavailable; falling back to DuckDB.")
-                return self._duckdb_url()
-
-        # DuckDB path (keep for backward compat), but prefer SQLite to avoid dialect issues (SERIAL not supported).
-        if url.startswith("duckdb://"):
-            logger.info("DuckDB storage requested; switching to SQLite to avoid DuckDB dialect errors.")
-            return self._sqlite_url()
-
-        # Any other URL (Postgres/MySQL) – trust user
-        if "://" in url:
-            return url
-
-        # Default fallback to SQLite (portable and stable)
-        if os.name == "nt":
-            return _JOURNAL_STORAGE_SENTINEL
-        return self._sqlite_url()
-
-    def _sqlite_url(self) -> str:
-        db_path = Path(self.cache_dir) / "optuna.sqlite"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        # Use shared cache and read-write-create to reduce locking issues.
-        return f"sqlite:///{db_path}?cache=shared&mode=rwc"
-
-    # Backward compat for callers expecting _duckdb_url
-    def _duckdb_url(self) -> str:
-        # Redirect to SQLite to avoid DuckDB dialect issues.
-        return self._sqlite_url()
-
-    def _run_study(self, study_name: str, objective: Callable[[Trial], float], target_trials: int) -> optuna.Study:
-        """
-        Warm-start aware study runner. Resumes existing study and only runs remaining trials.
-        Runs trials in PARALLEL across all available GPUs for maximum speed.
-        """
-        study = self._get_study(study_name)
-
-        def _cb(study, trial):
-            if self._should_stop():
-                study.stop()
-
-        if self._should_stop():
-            logger.info(f"Optuna study {study_name}: stop requested before scheduling; skipping.")
-            return study
-        completed = sum(1 for t in study.trials if t.state == TrialState.COMPLETE)
-        remaining = max(0, target_trials - completed)
-        if remaining > 0:
-            # Parallel execution: use threading for Optuna trials
-            # Override with OPTUNA_N_JOBS env var for testing (default: use all GPUs)
-            n_parallel = int(os.environ.get("OPTUNA_N_JOBS", len(self.device_pool) if self.device_pool else 1))
-            n_parallel = max(1, n_parallel)
-
-            cpu_total = max(1, os.cpu_count() or 1)
-            cpu_override = 0
-            try:
-                cpu_override = int(os.environ.get("FOREX_BOT_OPTUNA_CPU_THREADS", "0") or 0)
-            except Exception:
-                cpu_override = 0
-
-            self._optuna_cpu_threads = cpu_override if cpu_override > 0 else max(1, cpu_total // n_parallel)
-
-            logger.info(
-                f"Optuna study {study_name}: running {remaining} new trials (completed={completed}) "
-                f"with n_jobs={n_parallel} and cpu_threads_per_trial={self._optuna_cpu_threads}"
-            )
-            study.optimize(
-                objective,
-                n_trials=remaining,
-                n_jobs=n_parallel,
-                callbacks=[_cb],
-                catch=(KeyboardInterrupt, MemoryError),
-            )
-        else:
-            logger.info(f"Optuna study {study_name}: using existing {completed} trials; no new trials scheduled.")
-        return study
-
-    @staticmethod
-    def _infer_meta_trading_days(meta: pd.DataFrame) -> float | None:
-        """
-        Best-effort estimate of how many trading days (Mon–Fri) are present in a metadata slice.
-
-        This uses timestamps present in the data, so missing holidays/sessions naturally reduce the count.
-        """
-        try:
-            if meta is None or len(meta) < 2:
-                return None
-
-            ts: pd.DatetimeIndex | None
-            idx = getattr(meta, "index", None)
-            if isinstance(idx, pd.DatetimeIndex):
-                ts = idx
-            else:
-                ts = None
-                for col in ("timestamp", "time", "datetime", "date"):
-                    if col in meta.columns:
-                        ts = pd.to_datetime(meta[col], utc=True, errors="coerce")
-                        break
-                if ts is None:
-                    return None
-                ts = pd.DatetimeIndex(ts)
-
-            if ts.tz is not None:
-                ts = ts.tz_convert("UTC")
-
-            ts = ts[~ts.isna()]
-            if len(ts) == 0:
-                return None
-
-            # Count unique weekday dates.
-            mask = ts.weekday < 5
-            if not np.any(mask):
-                return None
-            days = pd.unique(ts[mask].normalize())
-            return float(len(days))
-        except Exception:
-            return None
-
-    def _prop_required_trades(self, meta_val: pd.DataFrame | None) -> float:
-        """
-        Interpret `prop_min_trades` as a *monthly* requirement and scale it to the validation window length
-        using trading days (Mon–Fri) when datetime metadata is available.
-
-        Override the assumed trading days per month via `FOREX_BOT_TRADING_DAYS_PER_MONTH` (default: 21).
-        """
-        base = float(self.prop_min_trades)
-        if not bool(getattr(self.settings.risk, "prop_firm_rules", False)):
-            return base
-        if meta_val is None:
-            return base
-        trading_days = self._infer_meta_trading_days(meta_val)
-        if trading_days is None:
-            return base
-        days_per_month = 21.0
-        try:
-            days_per_month = float(os.environ.get("FOREX_BOT_TRADING_DAYS_PER_MONTH", "21") or 21.0)
-        except Exception:
-            days_per_month = 21.0
-        days_per_month = max(1.0, float(days_per_month))
-
-        required = base * (trading_days / days_per_month)
-        return max(1.0, float(required))
-
-    def _objective_base(self, y_true: np.ndarray, y_pred_proba: np.ndarray, meta_val: pd.DataFrame | None) -> float:
-        """
-        Prop-aware composite objective: prop PnL metric + small accuracy term.
-        Hard-rejects strategies that breach DD or have too few trades.
-        """
-        y_true_arr = np.asarray(y_true, dtype=int)
-        # Backward compat: some older pipelines used 2=sell.
-        y_true_arr = np.where(y_true_arr == 2, -1, y_true_arr).astype(int, copy=False)
-
-        probs = self._pad_probs(y_pred_proba)
-        n = min(len(y_true_arr), len(probs))
-        if n <= 0:
-            return 0.0
-        y_true_arr = y_true_arr[:n]
-        probs = probs[:n]
-        if meta_val is not None and len(meta_val) != n:
-            try:
-                meta_val = meta_val.iloc[:n]
-            except Exception:
-                meta_val = None
-
-        p_buy = probs[:, 1]
-        p_sell = probs[:, 2]
-        trade_prob = np.maximum(p_buy, p_sell)
-        direction = np.where(p_buy >= p_sell, 1, -1).astype(np.int8, copy=False)
-        signals = np.where(trade_prob >= self.prop_conf_threshold, direction, 0).astype(np.int8, copy=False)
-
-        acc = float(np.mean(signals.astype(int) == y_true_arr)) if len(y_true_arr) else 0.0
-
-        if meta_val is not None and {"close", "high", "low"}.issubset(set(meta_val.columns)):
-            sl_cfg = getattr(self.settings.risk, "meta_label_sl_pips", None)
-            tp_cfg = getattr(self.settings.risk, "meta_label_tp_pips", None)
-            rr = float(getattr(self.settings.risk, "min_risk_reward", 2.0))
-            spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
-            commission = float(getattr(self.settings.risk, "commission_per_lot", 7.0))
-            dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.08))
-
-            close_all = meta_val["close"].to_numpy()
-            high_all = meta_val["high"].to_numpy()
-            low_all = meta_val["low"].to_numpy()
-            atr_all = meta_val["atr"].to_numpy() if "atr" in meta_val.columns else None
-
-            # Month indices for consistency tracking (fast_backtest API).
-            month_indices_all = np.zeros(len(meta_val), dtype=np.int64)
-            try:
-                ts: pd.DatetimeIndex | None
-                idx = getattr(meta_val, "index", None)
-                if isinstance(idx, pd.DatetimeIndex):
-                    ts = idx
-                else:
-                    ts = None
-                    for col in ("timestamp", "time", "datetime", "date"):
-                        if col in meta_val.columns:
-                            ts = pd.DatetimeIndex(pd.to_datetime(meta_val[col], utc=True, errors="coerce"))
-                            break
-                if ts is not None and len(ts) == len(meta_val):
-                    if ts.tz is not None:
-                        ts = ts.tz_convert("UTC")
-                    raw = ts.year.to_numpy() * 12 + ts.month.to_numpy()
-                    month_indices_all = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
-            except Exception:
-                month_indices_all = np.zeros(len(meta_val), dtype=np.int64)
-
-            # Multi-symbol pooled validation: score profitability per symbol and aggregate.
-            sym_series = meta_val["symbol"] if "symbol" in meta_val.columns else None
-            if sym_series is not None:
-                sym_arr = np.asarray(sym_series)
-                uniq_syms = pd.unique(sym_arr)
-                total_trades = 0.0
-                weighted = 0.0
-                for sym in uniq_syms:
-                    mask = sym_arr == sym
-                    if not np.any(mask):
-                        continue
-                    close = close_all[mask]
-                    high = high_all[mask]
-                    low = low_all[mask]
-                    sig = signals[mask]
-                    month_idx = month_indices_all[mask]
-                    pip_size, pip_value_per_lot = infer_pip_metrics(str(sym))
-                    if sl_cfg is None or float(sl_cfg) <= 0:
-                        atr_vals = atr_all[mask] if atr_all is not None else None
-                        auto = infer_sl_tp_pips_auto(
-                            open_prices=meta_val["open"].to_numpy(dtype=np.float64)[mask]
-                            if "open" in meta_val.columns
-                            else close,
-                            high_prices=high,
-                            low_prices=low,
-                            close_prices=close,
-                            atr_values=atr_vals,
-                            pip_size=pip_size,
-                            atr_mult=float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5)),
-                            min_rr=rr,
-                            min_dist=float(getattr(self.settings.risk, "meta_label_min_dist", 0.0)),
-                            settings=self.settings,
-                        )
-                        if auto is None:
-                            continue
-                        sl_pips, tp_pips = auto
-                    else:
-                        sl_pips = float(sl_cfg)
-                        if tp_cfg is None or float(tp_cfg) <= 0:
-                            tp_pips = sl_pips * rr
-                        else:
-                            tp_pips = max(float(tp_cfg), sl_pips * rr)
-                    metrics = fast_evaluate_strategy(
-                        close_prices=close,
-                        high_prices=high,
-                        low_prices=low,
-                        signals=sig,
-                        month_indices=month_idx,
-                        sl_pips=sl_pips,
-                        tp_pips=tp_pips,
-                        pip_value=pip_size,
-                        spread_pips=spread,
-                        commission_per_trade=commission,
-                        pip_value_per_lot=pip_value_per_lot,
-                    )
-
-                    net_profit, sharpe, _sortino, max_dd, win_rate, profit_factor, _exp, _sqn, trades, _r2 = metrics
-                    if max_dd >= dd_limit:
-                        return -1e9
-                    if trades <= 0:
-                        continue
-                    monthly_ret = net_profit / 100000.0  # baseline equity in _fast_backtest
-                    prop_score = (
-                        monthly_ret * 100.0
-                        + 0.5 * sharpe
-                        + 0.2 * profit_factor
-                        + 0.1 * (win_rate * 100.0)
-                        - 50.0 * max(0.0, max_dd - 0.04)
-                    )
-                    total_trades += float(trades)
-                    weighted += float(trades) * float(prop_score)
-
-                required = float(self._prop_required_trades(meta_val))
-                if total_trades < required:
-                    return -1e9
-                agg = weighted / max(total_trades, 1.0)
-                return float(self.prop_weight * agg + self.acc_weight * acc)
-
-            pip_size, pip_value_per_lot = infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
-            if sl_cfg is None or float(sl_cfg) <= 0:
-                auto = infer_sl_tp_pips_auto(
-                    open_prices=meta_val["open"].to_numpy(dtype=np.float64)
-                    if "open" in meta_val.columns
-                    else close_all,
-                    high_prices=high_all,
-                    low_prices=low_all,
-                    close_prices=close_all,
-                    atr_values=atr_all,
-                    pip_size=pip_size,
-                    atr_mult=float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5)),
-                    min_rr=rr,
-                    min_dist=float(getattr(self.settings.risk, "meta_label_min_dist", 0.0)),
-                    settings=self.settings,
-                )
-                if auto is None:
-                    return -1e9
-                sl_pips, tp_pips = auto
-            else:
-                sl_pips = float(sl_cfg)
-                if tp_cfg is None or float(tp_cfg) <= 0:
-                    tp_pips = sl_pips * rr
-                else:
-                    tp_pips = max(float(tp_cfg), sl_pips * rr)
-            metrics = fast_evaluate_strategy(
-                close_prices=close_all,
-                high_prices=high_all,
-                low_prices=low_all,
-                signals=signals,
-                month_indices=month_indices_all,
-                sl_pips=sl_pips,
-                tp_pips=tp_pips,
-                pip_value=pip_size,
-                spread_pips=spread,
-                commission_per_trade=commission,
-                pip_value_per_lot=pip_value_per_lot,
-            )
-
-            net_profit, sharpe, sortino, max_dd, win_rate, profit_factor, expectancy, sqn, trades, _r2 = metrics
-            required = float(self._prop_required_trades(meta_val))
-            if trades < required or max_dd >= dd_limit:
-                return -1e9
-
-            monthly_ret = net_profit / 100000.0  # baseline equity in _fast_backtest
-            prop_score = (
-                monthly_ret * 100.0
-                + 0.5 * sharpe
-                + 0.2 * profit_factor
-                + 0.1 * (win_rate * 100.0)
-                - 50.0 * max(0.0, max_dd - 0.04)
-            )
-            return float(self.prop_weight * prop_score + self.acc_weight * acc)
-
-        return float(acc)
-
-    @staticmethod
-    def _pad_probs(probs: np.ndarray) -> np.ndarray:
-        """
-        Normalize probability outputs to shape (n,3) ordered as [neutral, buy, sell].
-
-        This matches the convention used by the live SignalEngine and all ExpertModel implementations.
-        """
-        if probs is None or len(probs) == 0:
-            return np.zeros((0, 3), dtype=float)
-        arr = np.asarray(probs, dtype=float)
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-        n = arr.shape[0]
-
-        if arr.shape[1] >= 3:
-            return arr[:, :3]
-
-        out = np.zeros((n, 3), dtype=float)
-        if arr.shape[1] == 2:
-            # Default binary mapping: [neutral, buy]
-            out[:, 0] = arr[:, 0]
-            out[:, 1] = arr[:, 1]
-            return out
-
-        # Single-column fallback: treat as p_buy (neutral vs buy)
-        out[:, 0] = 1.0 - arr[:, 0]
-        out[:, 1] = arr[:, 0]
-        return out
-
-    def _decode_predictions(self, y_true: np.ndarray, y_pred_proba: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Map predicted probabilities to labels using the project-wide proba convention.
-
-        Columns are interpreted as [neutral, buy, sell] and mapped to labels {0, 1, -1}.
-        """
-        y_true_arr = np.asarray(y_true, dtype=int)
-        y_true_arr = np.where(y_true_arr == 2, -1, y_true_arr).astype(int, copy=False)
-
-        p = self._pad_probs(y_pred_proba)
-        if p.ndim != 2 or p.shape[0] == 0:
-            return np.zeros_like(y_true_arr), np.zeros_like(y_true_arr, dtype=float)
-
-        idx = np.argmax(p, axis=1)
-        conf = np.max(p, axis=1)
-
-        mapped = np.zeros(len(idx), dtype=int)
-        mapped[idx == 1] = 1
-        mapped[idx == 2] = -1
-
-        # Avoid emitting unseen labels in binary edge cases (e.g. only {0,1} present).
-        present = set(np.unique(y_true_arr).astype(int).tolist())
-        if 1 not in present:
-            mapped[mapped == 1] = 0
-        if -1 not in present:
-            mapped[mapped == -1] = 0
-        return mapped, conf
-
-    def _optimize_lgbm(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            device = self._pick_device(trial.number)
-            device_id = None
-            if isinstance(device, str) and device.startswith("cuda:"):
-                try:
-                    device_id = int(device.split(":")[1])
-                except Exception:
-                    device_id = 0
-            params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
-                "num_leaves": trial.suggest_int("num_leaves", 20, 150),
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
-                "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
-                "objective": "binary" if y_train.nunique() == 2 else "multiclass",  # Adapt for Meta-Labeling
-                "num_class": y_train.nunique(),  # Adapt for Meta-Labeling
-                "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
-                "verbosity": -1,
-            }
-            # Explicitly pass GPU settings when device is CUDA
-            if device_id is not None:
-                params["device_type"] = "gpu"
-                params["gpu_device_id"] = device_id
-                params["max_bin"] = 63  # critical for LightGBM GPU speed
-            model = LightGBMExpert(params=params)
-            x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
-            if not model.fit(x_tr, y_tr):
-                logger.error("LightGBM fit failed; model=None. See previous logs for the root cause.")
-                raise optuna.TrialPruned("LightGBM fit failed")
-            if len(x_va) == 0:
-                return 0.0
-            try:
-                preds = model.predict_proba(x_va)
-            except Exception as exc:  # pragma: no cover - defensive for Optuna
-                raise optuna.TrialPruned(f"LightGBM predict failed: {exc}")
-            return self._objective_base(y_va, preds, None)
-
-        study = self._run_study("LightGBM_Opt", objective, self.n_trials)
-        logger.info(f"Optuna LightGBM completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        try:
-            return study.best_params
-        except ValueError:
-            # No completed trials; fall back to a safe default to keep pipeline running.
-            logger.error("LightGBM tuning produced no completed trials; using default params fallback.")
-            return {
-                "n_estimators": 200,
-                "num_leaves": 64,
-                "learning_rate": 0.05,
-                "feature_fraction": 0.8,
-                "bagging_fraction": 0.8,
-                "min_child_samples": 20,
-                "objective": "multiclass",
-                "num_class": y_train.nunique(),
-                "device_type": "cpu",
-                "max_bin": 255,
-            }
-
-    def _optimize_random_forest(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            # Get assigned GPU from _pick_device (uses thread-local if set)
-            device = self._pick_device(trial.number)
-            gpu_id = 0
-            if isinstance(device, str) and device.startswith("cuda:"):
-                try:
-                    gpu_id = int(device.split(":")[1])
-                except Exception:
-                    gpu_id = 0
-            params = {
-                "n_estimators": trial.suggest_int("n_estimators", 100, 300),
-                "max_depth": trial.suggest_int("max_depth", 8, 16),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
-                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 5),
-                "max_features": trial.suggest_float("max_features", 0.5, 1.0),
-                "bootstrap": True,
-                "random_state": 42,
-                "gpu_device_id": gpu_id,  # Pass GPU ID to cuML
-            }
-            model = RandomForestExpert(params=params)
-            x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
-            if not model.fit(x_tr, y_tr):
-                raise optuna.TrialPruned("RandomForest fit failed")
-            if len(x_va) == 0:
-                return 0.0
-            try:
-                preds = model.predict_proba(x_va)
-            except Exception as exc:
-                raise optuna.TrialPruned(f"RandomForest predict failed: {exc}")
-            return self._objective_base(y_va, preds, None)
-
-        # Run RF sequentially (n_jobs=1) to ensure cuML GPU works without multi-process conflicts
-        study = self._get_study("RandomForest_Opt")
-        completed = sum(1 for t in study.trials if t.state == TrialState.COMPLETE)
-        remaining = max(0, self.n_trials - completed)
-        if remaining > 0:
-            logger.info(f"Optuna study RandomForest_Opt: running {remaining} GPU trials sequentially (cuML)")
-            study.optimize(
-                objective,
-                n_trials=remaining,
-                n_jobs=1,  # Sequential for GPU - cuML doesn't support multi-process
-                callbacks=[lambda study, trial: study.stop() if self._should_stop() else None],
-                catch=(KeyboardInterrupt, MemoryError),
-            )
-        else:
-            logger.info(f"Optuna study RandomForest_Opt: using existing {completed} trials")
-        logger.info(f"Optuna RandomForest completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        try:
-            return study.best_params
-        except ValueError:
-            return {}
-
-    def _optimize_extra_trees(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            params = {
-                "n_estimators": trial.suggest_int("n_estimators", 200, 800),
-                "max_depth": trial.suggest_int("max_depth", 10, 24),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
-                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 6),
-                "max_features": trial.suggest_float("max_features", 0.4, 0.9),
-                "bootstrap": trial.suggest_categorical("bootstrap", [False, True]),
-                "n_jobs": int(self._optuna_cpu_threads) if self._optuna_cpu_threads > 0 else -1,
-                "random_state": 42,
-            }
-            model = ExtraTreesExpert(params=params)
-            x_tr, x_va, y_tr, y_va = self._time_series_holdout(x_train, y_train, n_splits=3, embargo=100)
-            if not model.fit(x_tr, y_tr):
-                raise optuna.TrialPruned("ExtraTrees fit failed")
-            if len(x_va) == 0:
-                return 0.0
-            try:
-                preds = model.predict_proba(x_va)
-            except Exception as exc:  # pragma: no cover - defensive for Optuna
-                raise optuna.TrialPruned(f"ExtraTrees predict failed: {exc}")
-            return self._objective_base(y_va, preds, None)
-
-        study = self._run_study("ExtraTrees_Opt", objective, self.n_trials)
-        logger.info(f"Optuna ExtraTrees completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        return study.best_params
-
-    def _optimize_tabnet(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            try:
-                params = {
-                    "hidden_dim": trial.suggest_int("hidden_dim", 32, 128),
-                    "batch_size": trial.suggest_categorical("batch_size", [64, 128, 256]),
-                    "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
-                }
-                device = self._pick_device(trial.number)
-                model = TabNetExpert(**params, max_time_sec=self.settings.models.tabnet_train_seconds, device=device)
-                model.fit(x_train, y_train)
-                preds = model.predict_proba(x_val)
-                return self._objective_base(y_val, preds, meta_val)
-            except optuna.TrialPruned:
-                raise
-            except Exception as exc:
-                logger.warning(f"TabNet Optuna trial {trial.number} failed: {exc}", exc_info=True)
-                raise optuna.TrialPruned(str(exc)) from exc
-
-        target_trials = max(5, self.n_trials // 2)
-        if self.default_device == "cpu" and not self.device_pool:
-            target_trials = min(target_trials, 3)
-        study = self._run_study("TabNet_Opt", objective, target_trials)
-        logger.info(f"Optuna TabNet completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        try:
-            return study.best_params
-        except Exception as exc:
-            logger.warning(f"Optuna TabNet produced no completed trials; using defaults: {exc}")
-            return {}
-
-    def _optimize_nbeats(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            try:
-                params = {
-                    "hidden_dim": trial.suggest_int("hidden_dim", 64, 256),
-                    "n_layers": trial.suggest_int("n_layers", 2, 6),
-                    "n_blocks": trial.suggest_int("n_blocks", 1, 4),
-                    "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
-                }
-                device = self._pick_device(trial.number)
-                model = NBeatsExpert(**params, max_time_sec=self.settings.models.nbeats_train_seconds, device=device)
-                model.fit(x_train, y_train)
-                preds = model.predict_proba(x_val)
-                return self._objective_base(y_val, preds, meta_val)
-            except optuna.TrialPruned:
-                raise
-            except Exception as exc:
-                logger.warning(f"N-BEATS Optuna trial {trial.number} failed: {exc}", exc_info=True)
-                raise optuna.TrialPruned(str(exc)) from exc
-
-        target_trials = max(5, self.n_trials // 2)
-        if self.default_device == "cpu" and not self.device_pool:
-            target_trials = min(target_trials, 3)
-        study = self._run_study("NBEATS_Opt", objective, target_trials)
-        logger.info(f"Optuna N-BEATS completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        try:
-            return study.best_params
-        except Exception as exc:
-            logger.warning(f"Optuna N-BEATS produced no completed trials; using defaults: {exc}")
-            return {}
-
-    def _optimize_tide(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            try:
-                params = {
-                    "hidden_dim": trial.suggest_int("hidden_dim", 64, 512),
-                    "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
-                    "batch_size": trial.suggest_categorical("batch_size", [64, 128, 256]),
-                }
-                device = self._pick_device(trial.number)
-                model = TiDEExpert(**params, max_time_sec=self.settings.models.tide_train_seconds, device=device)
-                model.fit(x_train, y_train)
-                preds = model.predict_proba(x_val)
-                score = self._objective_base(y_val, preds, meta_val)
-
-                del model
-                import gc
-
-                gc.collect()
-                try:
-                    import torch
-
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                return score
-            except optuna.TrialPruned:
-                raise
-            except Exception as exc:
-                logger.warning(f"TiDE Optuna trial {trial.number} failed: {exc}", exc_info=True)
-                raise optuna.TrialPruned(str(exc)) from exc
-
-        target_trials = max(5, self.n_trials // 2)
-        if self.default_device == "cpu" and not self.device_pool:
-            target_trials = min(target_trials, 3)
-        study = self._run_study("TiDE_Opt", objective, target_trials)
-        logger.info(f"Optuna TiDE completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        try:
-            return study.best_params
-        except Exception as exc:
-            logger.warning(f"Optuna TiDE produced no completed trials; using defaults: {exc}")
-            return {}
-
-    def _optimize_kan(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            try:
-                params = {
-                    "hidden_dim": trial.suggest_int("hidden_dim", 32, 128),
-                    "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
-                    "batch_size": trial.suggest_categorical("batch_size", [64, 128, 256]),
-                }
-                device = self._pick_device(trial.number)
-                model = KANExpert(**params, max_time_sec=self.settings.models.kan_train_seconds, device=device)
-                model.fit(x_train, y_train)
-                preds = model.predict_proba(x_val)
-                return self._objective_base(y_val, preds, meta_val)
-            except optuna.TrialPruned:
-                raise
-            except Exception as exc:
-                logger.warning(f"KAN Optuna trial {trial.number} failed: {exc}", exc_info=True)
-                raise optuna.TrialPruned(str(exc)) from exc
-
-        target_trials = max(5, self.n_trials // 2)
-        if self.default_device == "cpu" and not self.device_pool:
-            target_trials = min(target_trials, 3)
-        study = self._run_study("KAN_Opt", objective, target_trials)
-        logger.info(f"Optuna KAN completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        try:
-            return study.best_params
-        except Exception as exc:
-            logger.warning(f"Optuna KAN produced no completed trials; using defaults: {exc}")
-            return {}
-
-    def _optimize_transformer(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-        max_rows = int(getattr(self.settings.models, "optuna_max_rows", 200_000))
-        if max_rows > 0 and len(x_train) > max_rows:
-            idx_train = np.linspace(0, len(x_train) - 1, max_rows, dtype=int)
-            x_train = x_train.iloc[idx_train]
-            y_train = y_train.iloc[idx_train]
-        if max_rows > 0 and len(x_val) > max_rows:
-            idx_val = np.linspace(0, len(x_val) - 1, max_rows, dtype=int)
-            x_val = x_val.iloc[idx_val]
-            y_val = y_val.iloc[idx_val]
-            if meta_val is not None:
-                try:
-                    meta_val = meta_val.iloc[idx_val]
-                except Exception:
-                    meta_val = None
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            try:
-                params = {
-                    "d_model": trial.suggest_categorical("d_model", [64, 128, 256]),
-                    "n_heads": trial.suggest_categorical("n_heads", [4, 8]),
-                    "n_layers": trial.suggest_int("n_layers", 2, 4),
-                    "lr": trial.suggest_float("lr", 1e-5, 1e-3, log=True),
-                }
-                device = self._pick_device(trial.number)
-                model = TransformerExpertTorch(
-                    **params,
-                    max_time_sec=min(self.settings.models.transformer_train_seconds, 1800),  # hard cap per trial
-                    device=device,
-                )
-                model.fit(x_train, y_train)
-                preds = model.predict_proba(x_val)
-                score = self._objective_base(y_val, preds, meta_val)
-
-                # Cleanup to prevent OOM
-                del model
-                import gc
-
-                gc.collect()
-                try:
-                    import torch
-
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-
-                return score
-            except optuna.TrialPruned:
-                raise
-            except Exception as exc:
-                logger.warning(f"Transformer Optuna trial {trial.number} failed: {exc}", exc_info=True)
-                raise optuna.TrialPruned(str(exc)) from exc
-
-        target_trials = max(3, int(getattr(self.settings.models, "optuna_trials", 25)) // 3)
-        if self.default_device == "cpu" and not self.device_pool:
-            target_trials = min(target_trials, 2)
-        study = self._run_study("Transformer_Opt", objective, target_trials)
-        logger.info(f"Optuna Transformer completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        try:
-            return study.best_params
-        except Exception as exc:
-            logger.warning(f"Optuna Transformer produced no completed trials; using defaults: {exc}")
-            return {}
-
-    def _optimize_rl_ppo(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            net_arch_type = trial.suggest_categorical("net_arch", ["small", "medium"])
-            net_arch = [64, 64] if net_arch_type == "small" else [128, 128]
-            device = self._pick_device(trial.number)
-
-            model = RLExpertPPO(timesteps=10_000, max_time_sec=300, network_arch=net_arch, device=device)
-            model.fit(x_train, y_train)
-            preds = model.predict_proba(x_val)
-            return self._objective_base(y_val, preds, meta_val)
-
-        target_trials = max(3, self.n_trials // 3)
-        study = self._run_study("RL_PPO_Opt", objective, target_trials)
-        logger.info(f"Optuna RL PPO completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-
-        params = study.best_params
-        if params.get("net_arch") == "small":
-            params["rl_network_arch"] = [64, 64]
-        elif params.get("net_arch") == "medium":
-            params["rl_network_arch"] = [128, 128]
-        if "net_arch" in params:
-            del params["net_arch"]
-        return params
-
-    def _optimize_rl_sac(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            params = {
-                "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
-                "buffer_size": trial.suggest_categorical("buffer_size", [10000, 50000, 100000]),
-                "gamma": trial.suggest_float("gamma", 0.9, 0.999),
-                "tau": trial.suggest_float("tau", 0.005, 0.02),
-                "train_freq": trial.suggest_categorical("train_freq", [(1, "step"), (10, "step"), (1, "episode")]),
-                "gradient_steps": trial.suggest_categorical("gradient_steps", [1, 5, 10]),
-            }
-            device = self._pick_device(trial.number)
-            model = RLExpertSAC(
-                timesteps=int(self.settings.models.rl_timesteps / 10),  # short budget for HPO
-                network_arch=list(getattr(self.settings.models, "rl_network_arch", [256, 256])),
-                device=device,
-                parallel_envs=int(max(1, getattr(self.settings.models, "rl_parallel_envs", 1))),
-                **params,
-            )
-
-            def env_fn() -> Any:
-                return _build_continuous_env(x_train, y_train)
-
-            model.fit(x_train, y_train, env_fn=env_fn)
-            preds = model.predict_proba(x_val)
-            return self._objective_base(y_val, preds, meta_val)
-
-        target_trials = max(3, self.n_trials // 3)
-        study = self._run_study("RL_SAC_Opt", objective, target_trials)
-        logger.info(f"Optuna RL SAC completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})")
-        return study.best_params
-
-    def _optimize_neuroevolution(
-        self,
-        x_train: pd.DataFrame,
-        y_train: pd.Series,
-        x_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        start = time.perf_counter()
-
-        def objective(trial: Trial) -> float:
-            if self._should_stop():
-                raise optuna.TrialPruned("stop requested")
-            params = {
-                "hidden_size": trial.suggest_int("hidden_size", 32, 128),
-                "population": trial.suggest_int("population", 16, 64),
-                "num_islands": trial.suggest_int("num_islands", 2, 8),
-            }
-            device = self._pick_device(trial.number)
-            hpo_seconds = int(getattr(self.settings.models, "evo_optuna_train_seconds", 0) or 0)
-            if hpo_seconds <= 0:
-                hpo_seconds = min(int(getattr(self.settings.models, "evo_train_seconds", 3600)), 900)
-            max_rows = int(getattr(self.settings.models, "optuna_max_rows", 0) or 0)
-            model = EvoExpertCMA(
-                **params,
-                max_time_sec=hpo_seconds,
-                device=device,
-                MAX_TRAIN_ROWS=max_rows,
-                evo_multiproc_per_gpu=bool(getattr(self.settings.system, "evo_multiproc_per_gpu", True)),
-            )
-            try:
-                model.fit(x_train, y_train)
-                preds = model.predict_proba(x_val)
-                return self._objective_base(y_val, preds, meta_val)
-            except MemoryError as exc:
-                raise optuna.TrialPruned(f"Evo OOM: {exc}") from exc
-            except Exception as exc:
-                logger.warning(f"Evo Optuna trial failed: {exc}", exc_info=True)
-                raise optuna.TrialPruned(f"Evo failed: {exc}") from exc
-
-        target_trials = max(5, self.n_trials // 2)
-        study = self._run_study("Evo_Opt", objective, target_trials)
-        logger.info(
-            f"Optuna Neuroevolution completed in {time.perf_counter() - start:.1f}s (trials={len(study.trials)})"
+        best_params = self._optimize_all_ray_tune(
+            X_train, y_train, X_val, y_val, meta_val
         )
-        return study.best_params
+        return best_params
 
     def _save_params(self, params: dict[str, Any]) -> None:
         with open(self.cache_dir / "best_params.json", "w") as f:

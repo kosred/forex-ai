@@ -155,8 +155,33 @@ class RiskConfig(BaseModel):
     meta_label_fixed_tp: float = 0.0040  # Fallback TP distance when ATR is 0   
     # Stop/target engine (volatility + tail-risk blend, unsupervised)
     stop_target_mode: str = "blend"  # blend | fixed | gene
-    vol_estimator: str = "yang_zhang"  # yang_zhang | garman_klass | parkinson | rogers_satchell
+    vol_estimator: str = "ensemble"  # ensemble | yang_zhang | garman_klass | parkinson | rogers_satchell | ewma
+    vol_ensemble_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "yang_zhang": 1.0,
+            "garman_klass": 1.0,
+            "rogers_satchell": 1.0,
+            "parkinson": 1.0,
+        }
+    )
+    vol_ensemble_weights_trend: dict[str, float] | None = None
+    vol_ensemble_weights_range: dict[str, float] | None = None
+    vol_ensemble_weights_neutral: dict[str, float] | None = None
     vol_window: int = 50
+    ewma_lambda: float = 0.94
+    ewma_lambda_by_timeframe: dict[str, float] = Field(
+        default_factory=lambda: {
+            "M1": 0.90,
+            "M5": 0.92,
+            "M15": 0.94,
+            "M30": 0.95,
+            "H1": 0.96,
+            "H4": 0.97,
+            "D1": 0.98,
+            "W1": 0.985,
+            "MN1": 0.99,
+        }
+    )
     vol_horizon_bars: int = 5
     tail_window: int = 100
     tail_alpha: float = 0.975
@@ -197,8 +222,6 @@ class ModelsConfig(BaseModel):
     rl_parallel_envs: int = 1
     rl_train_seconds: int = 36000
     evo_train_seconds: int = 36000
-    # Shorter per-trial budget for Optuna HPO; keeps Evo_Opt from running for hours per trial.
-    evo_optuna_train_seconds: int = 900
     evo_hidden_size: int = 64
     evo_population: int = 32
     evo_islands: int = 4
@@ -216,14 +239,11 @@ class ModelsConfig(BaseModel):
     tabnet_train_seconds: int = 36000  # Increased for deeper training
     kan_train_seconds: int = 36000  # Increased for deeper training
     num_transformers: int = 2
-    optuna_trials: int = 25  # Default HPO trials; tree models may use fewer internally for stability
-    optuna_reuse_study: bool = True  # Warm-start: skip already-completed trials
-    optuna_max_rows: int = 500_000  # Cap rows for HPO speed; full data used for final training
-    optuna_storage_url: str = (
-        "redis://localhost:6379/0"  # default Redis for speed; override for your Redis/RDB endpoint
-    )
-    optuna_sampler: str = "tpe"  # tpe | random | cmaes
-    optuna_pruner: str = "asha"  # asha | median | hyperband
+    # HPO backend selection (Ray Tune + Ax/BoTorch by default).
+    hpo_backend: str = "ax"  # ax | none
+    hpo_trials: int = 0  # 0 = use default trial count
+    hpo_max_rows: int = 500_000  # Cap rows for HPO speed; full data used for final training
+    ray_tune_max_concurrency: int = 1  # Conservative default to avoid GPU OOM
     export_onnx: bool = False  # ONNX export is optional; disable by default for clean, portable runs
     symbol_hash_buckets: int = 32  # fixed-dim hashed one-hot for multi-symbol/global models
     global_train_ratio: float = 0.8  # time-based split for pooled multi-symbol training
@@ -255,6 +275,10 @@ class ModelsConfig(BaseModel):
     nbeats_hidden_dim: int = 256  # NBEATS/NBEATSx NF
     kan_hidden_dim: int = 256  # KAN
     tabnet_hidden_dim: int = 64  # TabNet (smaller footprint)
+    phase5_filter_meta_blender: bool = True  # Use core deep models for meta-blender
+    phase5_core_models: list[str] = Field(
+        default_factory=lambda: ["transformer", "nbeats", "tide", "tabnet", "kan"]
+    )
 
 
 class NewsConfig(BaseModel):

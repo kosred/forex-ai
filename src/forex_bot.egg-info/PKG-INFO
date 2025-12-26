@@ -21,7 +21,6 @@ Requires-Dist: TA-Lib>=0.4.32
 Requires-Dist: lightgbm>=4.6.0
 Requires-Dist: xgboost>=2.1.0
 Requires-Dist: catboost>=1.2.7
-Requires-Dist: optuna>=4.5.0
 Requires-Dist: tianshou>=0.5.0
 Requires-Dist: gymnasium>=0.29.1
 Requires-Dist: stable-baselines3>=2.7.0

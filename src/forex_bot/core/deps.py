@@ -38,7 +38,6 @@ IMPORT_TO_PYPI = {
     "stable_baselines3": "stable-baselines3[extra]",
     "sb3_contrib": "sb3-contrib",
     "ray": "ray[default,rllib]",
-    "optuna": "optuna",
     "lightgbm": "lightgbm",
     "xgboost": "xgboost",
     "catboost": "catboost",

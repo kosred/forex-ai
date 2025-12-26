@@ -55,14 +55,18 @@ class PropAwareStrategySearch:
         self.settings = settings
         self.df = df
         self._month_indices = np.zeros(len(self.df), dtype=np.int64)
+        self._day_indices = np.zeros(len(self.df), dtype=np.int64)
         try:
             idx = getattr(self.df, "index", None)
             if isinstance(idx, pd.DatetimeIndex) and len(idx) == len(self.df):
                 ts = idx.tz_convert("UTC") if idx.tz is not None else idx
                 raw = ts.year.to_numpy() * 12 + ts.month.to_numpy()
                 self._month_indices = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
+                day_raw = ts.year.to_numpy() * 10000 + ts.month.to_numpy() * 100 + ts.day.to_numpy()
+                self._day_indices = np.nan_to_num(day_raw, nan=0.0).astype(np.int64, copy=False)
         except Exception:
             self._month_indices = np.zeros(len(self.df), dtype=np.int64)
+            self._day_indices = np.zeros(len(self.df), dtype=np.int64)
         self.checkpoint_path = checkpoint_path
         self.max_time_hours = max_time_hours
         self.mixer = TALibStrategyMixer(
@@ -127,12 +131,31 @@ class PropAwareStrategySearch:
         """
         Prop-style fitness optimized for 4% monthly profit target.
         Uses actual MT5 balance, no hardcoded values.
-        metrics = [NetProfit, Sharpe, Sortino, MaxDD, WinRate, ProfitFactor, Expectancy, SQN, Trades, Consistency]
+        metrics = [
+            NetProfit, Sharpe, Sortino, MaxDD, WinRate, ProfitFactor,
+            Expectancy, SQN, Trades, Consistency, MaxDailyDD
+        ]
         """
-        # FIX: Handle 10 metrics (added ConsistencyScore)
-        net_profit, sharpe, sortino, max_dd, win_rate, profit_factor, expectancy, sqn, trades, consistency = metrics
+        # Handle 11 metrics (added ConsistencyScore + MaxDailyDD)
+        (
+            net_profit,
+            sharpe,
+            sortino,
+            max_dd,
+            win_rate,
+            profit_factor,
+            expectancy,
+            sqn,
+            trades,
+            consistency,
+            daily_dd,
+        ) = metrics
 
-        if max_dd >= self.settings.risk.total_drawdown_limit or max_dd >= 0.10:
+        if (
+            max_dd >= self.settings.risk.total_drawdown_limit
+            or max_dd >= 0.10
+            or daily_dd >= float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
+        ):
             return -1e9
         if trades < 30:
             return -1e6
@@ -176,6 +199,10 @@ class PropAwareStrategySearch:
         sl_pips = float(getattr(gene, "sl_pips", 20.0))
         spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
         commission = float(getattr(self.settings.risk, "commission_per_lot", 7.0))
+        max_hold = int(getattr(self.settings.risk, "triple_barrier_max_bars", 0) or 0)
+        trailing_enabled = bool(getattr(self.settings.risk, "trailing_enabled", False))
+        trailing_mult = float(getattr(self.settings.risk, "trailing_atr_multiplier", 1.0) or 1.0)
+        trailing_trigger_r = float(getattr(self.settings.risk, "trailing_be_trigger_r", 1.0) or 1.0)
         pip_size, pip_value_per_lot = infer_pip_metrics(self.symbol)
         mode = str(getattr(self.settings.risk, "stop_target_mode", "blend") or "blend").lower()
         if mode not in {"fixed", "gene"}:
@@ -188,8 +215,13 @@ class PropAwareStrategySearch:
             low_prices=low,
             signals=signals,
             month_indices=self._month_indices,
+            day_indices=self._day_indices,
             sl_pips=sl_pips,
             tp_pips=tp_pips,
+            max_hold_bars=max_hold,
+            trailing_enabled=trailing_enabled,
+            trailing_atr_multiplier=trailing_mult,
+            trailing_be_trigger_r=trailing_trigger_r,
             spread_pips=spread,
             commission_per_trade=commission,
             pip_value=pip_size,
@@ -207,6 +239,7 @@ class PropAwareStrategySearch:
             sqn,
             trades,
             _consistency,
+            daily_dd,
         ) = metrics
         fitness = self._prop_metric(metrics)
         res = FitnessResult(

@@ -3,13 +3,10 @@
 Multi-GPU Training Launcher
 
 Spawns one training process per visible GPU, each pinned via CUDA_VISIBLE_DEVICES.
-Optuna coordination works best with shared storage:
-  - Recommended: set OPTUNA_STORAGE_URL=redis://localhost:6379/0
-  - Fallback: Optuna journal file storage (handled by the app when Redis is unavailable)
 
 Examples:
   python scripts/train_multi_gpu.py
-  python scripts/train_multi_gpu.py --gpus 0,1,2,3 --storage-url redis://localhost:6379/0
+  python scripts/train_multi_gpu.py --gpus 0,1,2,3
 """
 
 from __future__ import annotations
@@ -57,7 +54,6 @@ def _parse_gpu_ids(raw: str | None) -> list[int]:
 def _launch_gpu_worker(
     gpu_id: int,
     *,
-    storage_url: str | None,
     verbose: bool,
     stagger_seconds: float,
     tree_device: str | None,
@@ -66,9 +62,6 @@ def _launch_gpu_worker(
     """Launch a training worker pinned to a specific GPU."""
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    env.setdefault("OPTUNA_N_JOBS", "1")  # one trial at a time per GPU worker
-    if storage_url:
-        env["OPTUNA_STORAGE_URL"] = storage_url
 
     LOGS_DIR.mkdir(exist_ok=True)
     log_file = LOGS_DIR / f"training_gpu{gpu_id}.log"
@@ -96,7 +89,6 @@ def _launch_gpu_worker(
 def main():
     parser = argparse.ArgumentParser(description="Launch one training worker per GPU.")
     parser.add_argument("--gpus", default="auto", help="Comma-separated GPU ids (e.g. 0,1,2) or 'auto'.")
-    parser.add_argument("--storage-url", default="", help="Optuna storage URL (e.g. redis://localhost:6379/0).")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose worker logging.")
     parser.add_argument("--stagger-seconds", type=float, default=2.0, help="Delay between worker launches.")
     parser.add_argument("--tree-device", choices=["auto", "cpu", "gpu"], default="cpu")
@@ -121,11 +113,9 @@ def main():
 
     # Launch workers
     workers = []
-    storage_url = str(args.storage_url).strip() or None
     for gpu_id in gpu_ids:
         proc = _launch_gpu_worker(
             gpu_id,
-            storage_url=storage_url,
             verbose=bool(args.verbose),
             stagger_seconds=float(args.stagger_seconds),
             tree_device=str(args.tree_device),

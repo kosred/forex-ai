@@ -860,6 +860,14 @@ class FeatureEngineer:
             except Exception as exc:
                 logger.debug(f"Stop-target distance series unavailable: {exc}")
 
+        if dist is None:
+            logger.debug(
+                "Meta-labeling skipped: no valid stop distance series for %s (%d rows).",
+                getattr(self.settings.system, "symbol", "n/a"),
+                len(df),
+            )
+            return pd.Series(np.zeros(len(df), dtype=np.int8), index=df.index)
+
         atr_used = atr
         stop_mult = float(self.settings.risk.atr_stop_multiplier)
         if dist is not None:

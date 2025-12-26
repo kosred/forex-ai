@@ -215,6 +215,19 @@ class GeneticStrategyEvolution:
             month_indices = np.zeros(len(df), dtype=np.int64)
         return month_indices
 
+    @staticmethod
+    def _day_indices(df: pd.DataFrame) -> np.ndarray:
+        day_indices = np.zeros(len(df), dtype=np.int64)
+        try:
+            idx = getattr(df, "index", None)
+            if isinstance(idx, pd.DatetimeIndex) and len(idx) == len(df):
+                ts = idx.tz_convert("UTC") if idx.tz is not None else idx
+                raw = ts.year.to_numpy() * 10000 + ts.month.to_numpy() * 100 + ts.day.to_numpy()
+                day_indices = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
+        except Exception:
+            day_indices = np.zeros(len(df), dtype=np.int64)
+        return day_indices
+
     def _evaluate_population(self, validation_data: Any, genes: list[GeneticGene]) -> None:
         """
         Evaluate genes across one or many slices.
@@ -268,7 +281,12 @@ class GeneticStrategyEvolution:
                     high = df["high"].to_numpy(dtype=np.float64)
                     low = df["low"].to_numpy(dtype=np.float64)
                     month_idx = self._month_indices(df)
+                    day_idx = self._day_indices(df)
                     pip_size, pip_value_per_lot = infer_pip_metrics("")
+                    max_hold = int(getattr(self.settings.risk, "triple_barrier_max_bars", 0) or 0)
+                    trailing_enabled = bool(getattr(self.settings.risk, "trailing_enabled", False))
+                    trailing_mult = float(getattr(self.settings.risk, "trailing_atr_multiplier", 1.0) or 1.0)
+                    trailing_trigger_r = float(getattr(self.settings.risk, "trailing_be_trigger_r", 1.0) or 1.0)
 
                     sig = self.mixer.compute_signals(df, gene).to_numpy(dtype=np.int8)
                     arr = fast_evaluate_strategy(
@@ -277,8 +295,13 @@ class GeneticStrategyEvolution:
                         low_prices=low,
                         signals=sig,
                         month_indices=month_idx,
+                        day_indices=day_idx,
                         sl_pips=float(getattr(gene, "sl_pips", 20.0)),
                         tp_pips=float(getattr(gene, "tp_pips", 40.0)),
+                        max_hold_bars=max_hold,
+                        trailing_enabled=trailing_enabled,
+                        trailing_atr_multiplier=trailing_mult,
+                        trailing_be_trigger_r=trailing_trigger_r,
                         pip_value=float(pip_size),
                         spread_pips=1.5,
                         commission_per_trade=0.0,
@@ -292,14 +315,16 @@ class GeneticStrategyEvolution:
                     profit_factor = float(arr[5])
                     expectancy = float(arr[6])
                     trades = int(arr[8]) if len(arr) > 8 else 0
+                    daily_dd = float(arr[10]) if len(arr) > 10 else 0.0
                     slice_metrics.append((net_profit, sharpe, max_dd, win_rate, profit_factor, expectancy, trades))
 
                     # Slice-level gates
                     min_trades = 30
                     dd_cap = 0.10
+                    daily_dd_cap = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
                     pfloor = 1.0
 
-                    if trades < min_trades or max_dd >= dd_cap or profit_factor <= pfloor:
+                    if trades < min_trades or max_dd >= dd_cap or daily_dd >= daily_dd_cap or profit_factor <= pfloor:
                         fail_count += 1
                         continue
                     dd_penalty = 10.0 * max(0.0, max_dd - 0.05)

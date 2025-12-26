@@ -259,6 +259,11 @@ async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> 
                 if not isinstance(idx, pd.DatetimeIndex):
                     idx = pd.to_datetime(idx, utc=True, errors="coerce")
                 month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
+                day_idx = (
+                    idx.year.astype(np.int32) * 10000
+                    + idx.month.astype(np.int32) * 100
+                    + idx.day.astype(np.int32)
+                ).to_numpy(dtype=np.int64)
 
                 pip_size, pip_value_per_lot = infer_pip_metrics(sym)
                 sl_cfg = getattr(base_settings.risk, "meta_label_sl_pips", None)
@@ -290,6 +295,10 @@ async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> 
 
                 spread = float(getattr(base_settings.risk, "backtest_spread_pips", 1.5))
                 commission = float(getattr(base_settings.risk, "commission_per_lot", 0.0))
+                max_hold = int(getattr(base_settings.risk, "triple_barrier_max_bars", 0) or 0)
+                trailing_enabled = bool(getattr(base_settings.risk, "trailing_enabled", False))
+                trailing_mult = float(getattr(base_settings.risk, "trailing_atr_multiplier", 1.0) or 1.0)
+                trailing_trigger_r = float(getattr(base_settings.risk, "trailing_be_trigger_r", 1.0) or 1.0)
 
                 arr = fast_evaluate_strategy(
                     close_prices=df["close"].to_numpy(dtype=np.float64),
@@ -297,8 +306,13 @@ async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> 
                     low_prices=df["low"].to_numpy(dtype=np.float64),
                     signals=sig.to_numpy(dtype=np.int8),
                     month_indices=month_idx,
+                    day_indices=day_idx,
                     sl_pips=sl_pips,
                     tp_pips=tp_pips,
+                    max_hold_bars=max_hold,
+                    trailing_enabled=trailing_enabled,
+                    trailing_atr_multiplier=trailing_mult,
+                    trailing_be_trigger_r=trailing_trigger_r,
                     pip_value=pip_size,
                     spread_pips=spread,
                     commission_per_trade=commission,
@@ -316,6 +330,7 @@ async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> 
                     "sqn",
                     "trades",
                     "consistency_score",
+                    "daily_dd",
                 ]
                 fast_metrics = {k: float(v) for k, v in zip(keys, arr.tolist(), strict=False)}
         except Exception as exc:

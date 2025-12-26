@@ -909,6 +909,11 @@ class ModelTrainer:
                                 month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(
                                     dtype=np.int64
                                 )
+                                day_idx = (
+                                    idx.year.astype(np.int32) * 10000
+                                    + idx.month.astype(np.int32) * 100
+                                    + idx.day.astype(np.int32)
+                                ).to_numpy(dtype=np.int64)
 
                                 pip_size, pip_value_per_lot = infer_pip_metrics(self.settings.system.symbol)
                                 sl_cfg = getattr(self.settings.risk, "meta_label_sl_pips", None)
@@ -946,6 +951,10 @@ class ModelTrainer:
 
                                 spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
                                 commission = float(getattr(self.settings.risk, "commission_per_lot", 0.0))
+                                max_hold = int(getattr(self.settings.risk, "triple_barrier_max_bars", 0) or 0)
+                                trailing_enabled = bool(getattr(self.settings.risk, "trailing_enabled", False))
+                                trailing_mult = float(getattr(self.settings.risk, "trailing_atr_multiplier", 1.0) or 1.0)
+                                trailing_trigger_r = float(getattr(self.settings.risk, "trailing_be_trigger_r", 1.0) or 1.0)
 
                                 arr = fast_evaluate_strategy(
                                     close_prices=meta_eval_models["close"].to_numpy(dtype=np.float64),
@@ -953,8 +962,13 @@ class ModelTrainer:
                                     low_prices=meta_eval_models["low"].to_numpy(dtype=np.float64),
                                     signals=sig_eval.to_numpy(dtype=np.int8),
                                     month_indices=month_idx,
+                                    day_indices=day_idx,
                                     sl_pips=sl_pips,
                                     tp_pips=tp_pips,
+                                    max_hold_bars=max_hold,
+                                    trailing_enabled=trailing_enabled,
+                                    trailing_atr_multiplier=trailing_mult,
+                                    trailing_be_trigger_r=trailing_trigger_r,
                                     pip_value=pip_size,
                                     spread_pips=spread,
                                     commission_per_trade=commission,
@@ -972,6 +986,7 @@ class ModelTrainer:
                                     "sqn",
                                     "trades",
                                     "consistency_score",
+                                    "daily_dd",
                                 ]
                                 fast_metrics = {k: float(v) for k, v in zip(keys, arr.tolist(), strict=False)}
                         except Exception as e:
@@ -1309,7 +1324,15 @@ class ModelTrainer:
             if len(X_m) < 200 or len(y_m) < 200:
                 return
             feats = pd.DataFrame(index=X_m.index)
-            for name, m in self.models.items():
+            use_filter = bool(getattr(self.settings.models, "phase5_filter_meta_blender", False))
+            core = set(getattr(self.settings.models, "phase5_core_models", []) or [])
+            selected = self.models
+            if use_filter and core:
+                filtered = {name: m for name, m in self.models.items() if name in core}
+                if len(filtered) >= 2:
+                    selected = filtered
+                    logger.info("MetaBlender: using Phase5 core models %s", sorted(filtered.keys()))
+            for name, m in selected.items():
                 p = self._pad_probs(m.predict_proba(X_m))
                 feats[f"{name}_buy"] = p[:, 1]
                 # ...
