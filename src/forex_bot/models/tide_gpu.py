@@ -150,12 +150,19 @@ class TiDEExpert(ExpertModel):
             multiprocessing_context='spawn' if num_workers > 0 else None,
             sampler=sampler,
         )
-        fused_ok = is_cuda and hasattr(optim, "AdamW") and "fused" in optim.AdamW.__init__.__code__.co_varnames
-        optimizer = (
-            optim.AdamW(self.model.parameters(), lr=self.lr, fused=fused_ok)
-            if fused_ok
-            else optim.Adam(self.model.parameters(), lr=self.lr)
+        has_adamw = hasattr(optim, "AdamW")
+        fused_ok = (
+            is_cuda
+            and has_adamw
+            and "fused" in optim.AdamW.__init__.__code__.co_varnames
         )
+        if has_adamw:
+            if fused_ok:
+                optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, fused=True)
+            else:
+                optimizer = optim.AdamW(self.model.parameters(), lr=self.lr)
+        else:
+            optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss()
         early_stopper = EarlyStopper(patience=8, min_delta=0.001)
         amp_dtype = preferred_amp_dtype(str(self.device))

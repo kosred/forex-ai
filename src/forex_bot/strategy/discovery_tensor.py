@@ -19,7 +19,12 @@ class TensorDiscoveryEngine:
     Cooperative Multi-GPU Architecture: Splits the population across all available GPUs.
     """
     
-    def __init__(self, device: str = "cuda", n_experts: int = 20):
+    def __init__(
+        self,
+        device: str = "cuda",
+        n_experts: int = 20,
+        timeframes: Optional[List[str]] = None,
+    ):
         # We detect all GPUs for the distributed evaluation
         from ..models.device import get_available_gpus
         self.gpu_list = get_available_gpus()
@@ -27,7 +32,7 @@ class TensorDiscoveryEngine:
         self.n_experts = n_experts
         self.data_cube = None 
         self.ohlc_cube = None
-        self.timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"]
+        self.timeframes = timeframes
         self.best_experts = []
 
     def _prepare_tensor_cube(self, frames: Dict[str, pd.DataFrame], news_map: Optional[Dict[str, pd.DataFrame]] = None):
@@ -39,6 +44,12 @@ class TensorDiscoveryEngine:
         
         cube_list, ohlc_list = [], []
         news_tensor_list = []
+
+        if self.timeframes:
+            self.timeframes = [tf for tf in self.timeframes if tf in frames]
+        else:
+            # Preserve insertion order from frames (caller can control order).
+            self.timeframes = list(frames.keys())
 
         for tf in self.timeframes:
             if tf in frames:

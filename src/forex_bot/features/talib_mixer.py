@@ -150,7 +150,7 @@ class TALibStrategyGene:
 
 
 class TALibStrategyMixer:
-    def __init__(self, device: str = "cpu") -> None:
+    def __init__(self, device: str = "cpu", use_volume_features: bool = False) -> None:
         """
         Args:
             device: 'cpu' or 'cuda'. When 'cuda' and CuPy is available, a
@@ -159,6 +159,8 @@ class TALibStrategyMixer:
         self.indicator_synergy_matrix: dict[tuple[str, str], float] = {}
         self.regime_performance: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
         self.available_indicators = []
+        self.use_volume_features = use_volume_features
+        self._volume_indicators = set(TALIB_INDICATORS.get("volume", []))
 
         # GPU flag is explicit to avoid surprise memory usage
         self.device = device.lower()
@@ -176,6 +178,8 @@ class TALibStrategyMixer:
 
         if TALIB_AVAILABLE:
             for ind in ALL_INDICATORS:
+                if (not self.use_volume_features) and ind in self._volume_indicators:
+                    continue
                 try:
                     _ = abstract.Function(ind).info
                     self.available_indicators.append(ind)
@@ -256,6 +260,8 @@ class TALibStrategyMixer:
             "CDL_MARUBOZU",
             "CDL_SPINNINGTOP",
         }
+        if not self.use_volume_features:
+            self._gpu_supported.difference_update(self._volume_indicators)
 
     # --------------------------- GPU helpers --------------------------- #
     def _ema_gpu(self, arr: "cp.ndarray", period: int) -> "cp.ndarray":

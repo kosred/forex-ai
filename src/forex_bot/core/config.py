@@ -26,6 +26,7 @@ class SystemConfig(BaseModel):
     mt5_dxy_symbol: str = "USDX"  # MT5 symbol for DXY (e.g., USDX, DXY, or broker-specific)
     mt5_eur_symbol: str = "EXY"  # MT5 symbol for EUR index if available
     base_timeframe: str = "M1"  # 1-minute base for multi-timeframe analysis
+    use_volume_features: bool = False  # Spot FX tick volume is unreliable; disable by default
     higher_timeframes: list[str] = Field(
         default_factory=lambda: [
             "M1",
@@ -275,7 +276,7 @@ class Settings(BaseSettings):
     news: NewsConfig = Field(default_factory=NewsConfig)
     secrets_file: str = "keys.txt"  # Optional local secrets file (git-ignored) to load API keys
 
-    model_config = SettingsConfigDict(env_nested_delimiter="__", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_nested_delimiter="__", env_file=None, extra="ignore")
 
     @classmethod
     def settings_customise_sources(
@@ -290,7 +291,6 @@ class Settings(BaseSettings):
             init_settings,
             YamlConfigSettingsSource(settings_cls),
             env_settings,
-            dotenv_settings,
             file_secret_settings,
         )
 

@@ -3,7 +3,8 @@ system:
   symbols: [EURUSD]
   data_dir: data
   base_timeframe: M1  # 1-minute base for multi-timeframe analysis
-  higher_timeframes: [M3, M5, M15, M30, H1, H4, D1, W1]
+  use_volume_features: false
+  higher_timeframes: [M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
   history_years: 10
   trading_session_start: "00:05"
   trading_session_end: "23:55"

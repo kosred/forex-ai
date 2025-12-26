@@ -38,6 +38,8 @@ if CUPY_AVAILABLE:
 else:
     cp = None
 
+VOLUME_TALIB_INDICATORS = {"AD", "ADOSC", "OBV", "MFI"}
+
 logger = logging.getLogger(__name__)
 pd.options.mode.copy_on_write = True
 EPSILON = 1e-10
@@ -84,6 +86,7 @@ class FeatureEngineer:
         self.cache_enabled = bool(getattr(settings.system, "cache_enabled", True))
         self.cache_dir = Path(getattr(settings.system, "cache_dir", "cache")) / "features"
         self.cache_ttl_minutes = int(getattr(settings.system, "cache_max_age_minutes", 60))
+        self.use_volume_features = bool(getattr(settings.system, "use_volume_features", False))
         if self.cache_enabled:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Feature caching enabled. Cache directory: {self.cache_dir}")
@@ -175,6 +178,7 @@ class FeatureEngineer:
     ) -> PreparedDataset:
         self._symbol = symbol or getattr(self.settings.system, "symbol", None)
         base_tf = self.settings.system.base_timeframe
+        use_volume = self.use_volume_features
 
         # Safe lookup for base dataframe (prevent "ambiguous truth value" error)
         base = frames.get(base_tf)
@@ -258,19 +262,20 @@ class FeatureEngineer:
             df = self._compute_comprehensive_talib_features(df)
         else:
             # Fallback for minimal viable features if TA-Lib missing
-            try:
-                if TALIB_AVAILABLE:
-                    df["mfi14"] = talib.MFI(df["high"], df["low"], df["close"], df["volume"], timeperiod=14)
-                else:
-                    df["mfi14"] = 50.0
-            except Exception:
-                df["mfi14"] = 50.0
+            df["mfi14"] = 50.0
 
         df = self._merge_indices(df)
 
 
         # 3. Multi-Timeframe Features (Optimized "Collect then Concat")
-        target_tfs = ["M1", "M3", "M5", "M15", "M30", "H1", "H2", "H4", "H12", "D1", "W1", "MN1"]
+        # Use config-driven timeframes for multi-TF features; fall back to frames if empty.
+        cfg_tfs = list(getattr(self.settings.system, "higher_timeframes", []) or [])
+        if not cfg_tfs:
+            cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
+        target_tfs = [base_tf] + cfg_tfs
+        target_tfs = [tf for tf in dict.fromkeys(target_tfs) if tf in frames]
+        if not target_tfs:
+            target_tfs = [base_tf] + [tf for tf in frames.keys() if tf != base_tf]
         htf_cols = []
         htf_feature_blocks = [] # Collect blocks here
         
@@ -293,8 +298,9 @@ class FeatureEngineer:
                             htf = htf.to_pandas()
 
                         htf = self._compute_volatility_features(htf)
-                        htf = self._compute_volume_profile_features(htf)
-                        htf = self._compute_obi_features(htf, use_gpu)
+                        if use_volume:
+                            htf = self._compute_volume_profile_features(htf)
+                            htf = self._compute_obi_features(htf, use_gpu)
 
                         key_feats = [
                             "rsi",
@@ -302,10 +308,13 @@ class FeatureEngineer:
                             "macd_hist",
                             "atr14",
                             "bb_width",
-                            "dist_to_poc",
-                            "in_value_area",
-                            "vol_imbalance",
                         ]
+                        if use_volume:
+                            key_feats += [
+                                "dist_to_poc",
+                                "in_value_area",
+                                "vol_imbalance",
+                            ]
                         subset = htf[[c for c in key_feats if c in htf.columns]].copy()
                         # Prevent lookahead leakage: align to the last *completed* HTF candle.
                         subset = subset.shift(1)
@@ -392,8 +401,10 @@ class FeatureEngineer:
         else:
             self._compute_atr_wicks_cpu(df)
 
-        df = self._compute_volume_profile_features(df)
-        df = self._compute_obi_features(df, use_gpu)
+        if use_volume:
+            df = self._compute_volume_profile_features(df)
+        if use_volume:
+            df = self._compute_obi_features(df, use_gpu)
 
         hours = df.index.hour
         df["session_asia"] = ((hours >= 0) & (hours < 8)).astype(int)
@@ -471,6 +482,12 @@ class FeatureEngineer:
             "mtf_confluence",
             "base_signal",
         ]
+        if not use_volume:
+            base_cols = [
+                c
+                for c in base_cols
+                if c not in {"dist_to_poc", "in_value_area", "vol_imbalance", "adl_slope"}
+            ]
 
         # Dynamically collect all generated features (Base + TA-Lib + SMC + HTF)
         # This ensures our 'Unsupervised' approach actually passes all data to the models.
@@ -495,7 +512,10 @@ class FeatureEngineer:
         X = self._clean_garbage_features(X)
         cols = list(X.columns)
 
-        meta = df[["open", "high", "low", "close", "volume"]].copy()
+        meta_cols = ["open", "high", "low", "close"]
+        if use_volume and "volume" in df.columns:
+            meta_cols.append("volume")
+        meta = df[meta_cols].copy()
 
         if self.cache_enabled and cache_meta:
             self._save_cached_dataset(cache_meta, X, labels, df.index, cols, meta)
@@ -523,14 +543,17 @@ class FeatureEngineer:
                 'high': df["high"].values.astype(np.float64),
                 'low': df["low"].values.astype(np.float64),
                 'close': df["close"].values.astype(np.float64),
-                'volume': df["volume"].values.astype(np.float64) if "volume" in df.columns else np.random.random(len(df))
             }
+            if self.use_volume_features and "volume" in df.columns:
+                inputs['volume'] = df["volume"].values.astype(np.float64)
 
             new_features = {}
 
             # 1. Standard "Kitchen Sink" (Defaults)
             for ind_name in ALL_INDICATORS:
                 try:
+                    if (not self.use_volume_features) and ind_name in VOLUME_TALIB_INDICATORS:
+                        continue
                     if ind_name in ["SMA", "EMA", "RSI", "BBANDS", "ADX", "CCI", "MOM", "ROC", "WILLR", "ATR"]:
                         continue
                     func = abstract.Function(ind_name)
@@ -646,6 +669,8 @@ class FeatureEngineer:
 
     def _compute_vwap(self, df: DataFrame, use_gpu: bool = False) -> Series:
         # TODO: Add GPU VWAP if needed, currently CPU Numba is very fast
+        if not self.use_volume_features or "volume" not in df.columns:
+            return pd.Series(df["close"].to_numpy(dtype=np.float64), index=df.index)
         if NUMBA_AVAILABLE:
             idx = df.index
             if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
@@ -762,9 +787,15 @@ class FeatureEngineer:
         return df
 
     def _compute_volume_profile_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not self.use_volume_features or "volume" not in df.columns:
+            return df
         return compute_volume_profile_features(df)
 
     def _compute_obi_features(self, df: pd.DataFrame, use_gpu: bool) -> pd.DataFrame:
+        if not self.use_volume_features or "volume" not in df.columns:
+            df["vol_imbalance"] = 0.0
+            df["adl_slope"] = 0.0
+            return df
         return compute_obi_features(df, prefer_gpu=use_gpu)
 
     def _add_smc_features(self, df: pd.DataFrame, use_gpu: bool) -> pd.DataFrame:

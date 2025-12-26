@@ -180,7 +180,7 @@ class TabNetExpert(ExpertModel):
 
     def load(self, path: str) -> None:
         p = Path(path) / "tabnet_gpu.zip"
-        tabnet_cls = _try_import_tabnet()
+        tabnet_cls, _ = _try_import_tabnet()
         if p.exists() and tabnet_cls is not None:
             device_name = "cuda" if str(self.device).startswith("cuda") else "cpu"
             self.model = tabnet_cls(device_name=device_name, verbose=0, **self.hyperparams)

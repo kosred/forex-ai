@@ -295,8 +295,17 @@ class TrainingService:
         print("DEBUG: Aligning all discovery frames to enriched feature space...")
         reference_df = discovery_frames[base_tf]
         aligned_frames = {}
-        
-        for tf in ["M1", "M5", "M15", "H1", "H4", "D1"]:
+
+        # Use config-driven timeframes (prefer higher_timeframes; fall back to required_timeframes)
+        cfg_tfs = list(getattr(self.settings.system, "higher_timeframes", []) or [])
+        if not cfg_tfs:
+            cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
+        timeframes = [base_tf] + cfg_tfs
+        timeframes = [tf for tf in dict.fromkeys(timeframes) if tf in frames]
+        if not timeframes:
+            timeframes = list(frames.keys())
+
+        for tf in timeframes:
             if tf in frames:
                 # Reindex reference (Rich Features) to target TF index
                 aligned = reference_df.reindex(frames[tf].index).ffill().fillna(0.0)
@@ -315,7 +324,11 @@ class TrainingService:
 
         # New Unsupervised Tensor Engine (Million-Search)
         # We increase experts to 100 to create a diverse "Council of 100" for the deep models
-        discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=100)
+        discovery_tensor = TensorDiscoveryEngine(
+            device="cuda",
+            n_experts=100,
+            timeframes=timeframes,
+        )
         
         # We need to pass the enriched multi-timeframe frames to the engine
         discovery_tensor.run_unsupervised_search(
@@ -981,13 +994,38 @@ class TrainingService:
             # Now that all symbols are loaded in raw_frames_map, find global experts
             logger.info("Launching GPU-Native Expert Discovery (Multi-Symbol)...")
             from ..strategy.discovery_tensor import TensorDiscoveryEngine
-            discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=20)
+            discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=100)
             
             # We pick the largest symbol's timeframe set as the candidate for multi-TF discovery
-            # (In Global mode, we look for experts that work universally)
             target_sym = "EURUSD" if "EURUSD" in raw_frames_map else next(iter(raw_frames_map.keys()))
+            
+            # ENRICHMENT: Locate the prepared dataset for the target symbol to get rich features
+            target_ds = next((ds for sym, ds in datasets if sym == target_sym), None)
+            discovery_frames = raw_frames_map[target_sym].copy()
+            
+            if target_ds:
+                print(f"DEBUG (Global): Enriching discovery with {target_ds.X.shape[1]} features.")
+                rich_df = target_ds.X.copy()
+                base_tf = self.settings.system.base_timeframe
+                if base_tf in discovery_frames:
+                    orig = discovery_frames[base_tf].reindex(rich_df.index).ffill()
+                    for col in ["open", "high", "low", "close"]:
+                        if col in orig.columns: rich_df[col] = orig[col]
+                    
+                    # Align all TFs to the rich feature space
+                    aligned_frames = {}
+                    for tf in ["M1", "M5", "M15", "H1", "H4", "D1"]:
+                        if tf in raw_frames_map[target_sym]:
+                            aligned = rich_df.reindex(raw_frames_map[target_sym][tf].index).ffill().fillna(0.0)
+                            aligned["open"] = raw_frames_map[target_sym][tf]["open"]
+                            aligned["high"] = raw_frames_map[target_sym][tf]["high"]
+                            aligned["low"] = raw_frames_map[target_sym][tf]["low"]
+                            aligned["close"] = raw_frames_map[target_sym][tf]["close"]
+                            aligned_frames[tf] = aligned
+                    discovery_frames = aligned_frames
+
             discovery_tensor.run_unsupervised_search(
-                raw_frames_map[target_sym],
+                discovery_frames,
                 news_features=news_map.get(target_sym) if news_map else None,
                 iterations=1000
             )
