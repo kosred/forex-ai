@@ -9,6 +9,9 @@
 source ~/forex-ai/venv/bin/activate
 cd ~/forex-ai
 
+# Force-update package link to ensure workers see latest source code
+pip install -e .
+
 # 2. Critical Stability Fixes
 # Disable torch.compile to prevent nvvmAddNVVMContainerToProgram/JIT errors
 export FOREX_BOT_DISABLE_COMPILE=1
