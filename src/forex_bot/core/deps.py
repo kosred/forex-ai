@@ -268,7 +268,14 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
     if not packages:
         return
 
-    cmd = [sys.executable, "-m", "pip", "install", "--timeout", "120", "--break-system-packages"]
+    # 2025 GLOBAL BOOTSTRAP: Use --user to keep system clean, --upgrade to avoid stale junk,
+    # and --break-system-packages to allow global pip usage on modern Linux (Debian/Ubuntu).
+    cmd = [
+        sys.executable, "-m", "pip", "install", 
+        "--user", "--upgrade", 
+        "--timeout", "120", 
+        "--break-system-packages"
+    ]
     if pre:
         cmd.append("--pre")
     if index_url:

@@ -18,14 +18,21 @@ import subprocess
 from pathlib import Path
 
 # --- 1. Path & Environment Bootstrap ---
+# 2025 ANTI-VENV POLICY: Purge environment variables that force virtual environments
+for env_var in ["VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"]:
+    if env_var in os.environ:
+        del os.environ[env_var]
+
 # Fix Python path for direct execution from source tree
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_DIR = SCRIPT_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
-# Ensure PYTHONPATH includes src for subprocesses (workers, DDP)
-os.environ["PYTHONPATH"] = str(SRC_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
+# FORCE DOMINANCE: Ensure local /src is ALWAYS index 0, overriding global installs
+sys.path.insert(0, str(SRC_DIR))
+os.environ["PYTHONPATH"] = str(SRC_DIR)
+
+# Ensure current working directory is project root
+os.chdir(str(SCRIPT_DIR))
 
 # --- 2. HPC / Stability Tuning ---
 # Disable torch.compile to prevent nvvmAddNVVMContainerToProgram/JIT errors on some drivers
