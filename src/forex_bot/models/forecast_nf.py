@@ -274,7 +274,11 @@ class _NFClsWrapper(ExpertModel):
                         nn.ReLU(),
                         nn.Linear(32, 3),
                     )
-                    head.load_state_dict(torch.load(head_path, map_location="cpu"))
+                    try:
+                        state = torch.load(head_path, map_location="cpu", weights_only=True)
+                    except TypeError as exc:
+                        raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
+                    head.load_state_dict(state)
                     mapping = joblib.load(map_path)
                     self.calibrator = (head, mapping)
             except Exception:

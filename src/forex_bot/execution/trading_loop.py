@@ -182,7 +182,11 @@ class TradingEngine:
                 self.risk.update_news_state(news_policy)
 
                 # 6. Feature Engineering & Signal
-                news_feats = self.news.get_news_features(frames[self.settings.system.base_timeframe].index)
+                base_df = frames.get(self.settings.system.base_timeframe)
+                if base_df is None:
+                    base_df = frames.get("M1")
+                base_idx = base_df.index if base_df is not None else pd.Index([])
+                news_feats = self.news.get_news_features(base_idx)
                 dataset = self.trainer.feature_engineer.prepare(
                     frames,
                     news_features=news_feats,

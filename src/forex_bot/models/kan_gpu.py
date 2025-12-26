@@ -65,10 +65,13 @@ class KANExpert(ExpertModel):
             return
 
         self.input_dim = X.shape[1]
+        y_vals = y.to_numpy()
+        if not np.all(np.isin(y_vals, [-1, 0, 1])):
+            raise ValueError(f"Labels must be in {{-1, 0, 1}}, got: {np.unique(y_vals)}")
 
         # Convert to tensors on CPU to avoid VRAM OOM
         X_t = torch.as_tensor(dataframe_to_float32_numpy(X), dtype=torch.float32, device="cpu")
-        y_t = torch.as_tensor(y.values + 1, dtype=torch.long, device="cpu")  # -1,0,1 -> 0,1,2
+        y_t = torch.as_tensor(y_vals + 1, dtype=torch.long, device="cpu")  # -1,0,1 -> 0,1,2
 
         # KAN library expects [Input -> Hidden -> Output] layers list
         # We construct a simple 2-layer KAN: Input -> Hidden -> 3 (Classes)
@@ -98,17 +101,18 @@ class KANExpert(ExpertModel):
         # GPU Optimization with spawn context to avoid CUDA fork issues
         is_cuda = str(self.device).startswith("cuda")
         num_workers = 4 if is_cuda else 0
-        loader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=(sampler is None),
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=is_cuda,
-            prefetch_factor=2 if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
-            multiprocessing_context='spawn' if num_workers > 0 else None,
-        )
+        loader_kwargs = {
+            "batch_size": self.batch_size,
+            "shuffle": (sampler is None),
+            "sampler": sampler,
+            "num_workers": num_workers,
+            "pin_memory": is_cuda,
+        }
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["multiprocessing_context"] = "spawn"
+        loader = DataLoader(dataset, **loader_kwargs)
 
         import time
 
@@ -138,6 +142,9 @@ class KANExpert(ExpertModel):
 
             if tensorboard_writer:
                 tensorboard_writer.add_scalar("Loss/train_KAN", total_loss / len(loader), epoch)
+
+        if is_cuda:
+            torch.cuda.empty_cache()
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         if self.model is None:
@@ -184,4 +191,8 @@ class KANExpert(ExpertModel):
                 scale_base=params["scale_base"],
                 scale_spline=params["scale_spline"],
             ).to(self.device)
-            self.model.load_state_dict(torch.load(p, map_location=self.device))
+            try:
+                state = torch.load(p, map_location=self.device, weights_only=True)
+            except TypeError as exc:
+                raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
+            self.model.load_state_dict(state)

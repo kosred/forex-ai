@@ -42,6 +42,14 @@ from .device import gpu_supports_bf16, maybe_init_distributed, select_device, tu
 logger = logging.getLogger(__name__)
 
 
+def _safe_load_state_dict(model: nn.Module, path: Path, device: str | torch.device) -> None:
+    try:
+        state = torch.load(path, map_location=device, weights_only=True)
+    except TypeError as exc:
+        raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
+    model.load_state_dict(state)
+
+
 def _compute_class_weight_tensor(y: np.ndarray, device: torch.device, num_classes: int = 3) -> torch.Tensor:
     """
     Compute class weights as a tensor for CrossEntropyLoss.
@@ -305,7 +313,7 @@ class NBeatsExpert(ExpertModel):
             self.hidden_dim = meta["hidden"]
             self.model = self._build_model()
             target = getattr(self.model, "module", self.model)
-            target.load_state_dict(torch.load(p, map_location=self.device, weights_only=True))
+            _safe_load_state_dict(target, p, self.device)
 
             if str(self.device) == "cpu":
                 self._optimize_for_cpu_inference()
@@ -533,7 +541,7 @@ class TiDEExpert(ExpertModel):
             self.hidden_dim = meta["hidden"]
             self.model = self._build_model()
             target = getattr(self.model, "module", self.model)
-            target.load_state_dict(torch.load(p, map_location=self.device, weights_only=True))
+            _safe_load_state_dict(target, p, self.device)
 
 
 class AttentiveTransformer(nn.Module):
@@ -758,7 +766,7 @@ class TabNetExpert(ExpertModel):
             self.n_steps = meta.get("n_steps", 3)
             self.model = self._build_model()
             target = getattr(self.model, "module", self.model)
-            target.load_state_dict(torch.load(p, map_location=self.device, weights_only=True))
+            _safe_load_state_dict(target, p, self.device)
 
 
 class KANLayerBSpline(nn.Module):
@@ -964,7 +972,7 @@ class KANExpert(ExpertModel):
             self.hidden_dim = meta["hidden"]
             self.model = self._build_model()
             target = getattr(self.model, "module", self.model)
-            target.load_state_dict(torch.load(p, map_location=self.device, weights_only=True))
+            _safe_load_state_dict(target, p, self.device)
 
             if str(self.device) == "cpu":
                 self._optimize_for_cpu_inference()

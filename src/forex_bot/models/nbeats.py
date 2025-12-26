@@ -237,5 +237,9 @@ class NBeatsExpert(ExpertModel):
 
         if p_std.exists():
             self.model = self._build_model()
-            self.model.load_state_dict(torch.load(p_std, map_location="cpu"))
+            try:
+                state = torch.load(p_std, map_location="cpu", weights_only=True)
+            except TypeError as exc:
+                raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
+            self.model.load_state_dict(state)
             self._optimize_for_cpu_inference()

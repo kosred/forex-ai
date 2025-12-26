@@ -151,4 +151,8 @@ class ExitAgent(ExpertModel):
     def load(self, path: str) -> None:
         p = Path(path) / "exit_agent.pt"
         if p.exists():
-            self.model.load_state_dict(torch.load(p, map_location=self.device))
+            try:
+                state = torch.load(p, map_location=self.device, weights_only=True)
+            except TypeError as exc:
+                raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
+            self.model.load_state_dict(state)

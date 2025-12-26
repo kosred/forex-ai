@@ -160,7 +160,7 @@ class TALibStrategyMixer:
         self.regime_performance: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
         self.available_indicators = []
         self.use_volume_features = use_volume_features
-        self._volume_indicators = set(TALIB_INDICATORS.get("volume", []))
+        self._volume_indicators = set(TALIB_INDICATORS.get("volume", [])) | {"VWAP"}
 
         # GPU flag is explicit to avoid surprise memory usage
         self.device = device.lower()
@@ -313,6 +313,8 @@ class TALibStrategyMixer:
         self, ind: str, params: dict[str, Any], df: pd.DataFrame, preloaded: dict | None = None
     ) -> np.ndarray | None:
         """Compute a limited set of indicators on GPU; return numpy array or None."""
+        if (not self.use_volume_features) and ind in self._volume_indicators:
+            return None
         if not self.use_gpu or ind not in self._gpu_supported or ind in self._gpu_blacklist:
             return None
         try:
@@ -321,13 +323,17 @@ class TALibStrategyMixer:
                 high = preloaded.get("high") or close
                 low = preloaded.get("low") or close
                 open_ = preloaded.get("open") or close
-                vol = preloaded.get("volume")
+                vol = preloaded.get("volume") if self.use_volume_features else None
             else:
                 close = cp.asarray(df["close"].to_numpy(), dtype=cp.float32)
                 high = cp.asarray(df["high"].to_numpy(), dtype=cp.float32) if "high" in df else close
                 low = cp.asarray(df["low"].to_numpy(), dtype=cp.float32) if "low" in df else close
                 open_ = cp.asarray(df["open"].to_numpy(), dtype=cp.float32) if "open" in df else close
-                vol = cp.asarray(df["volume"].to_numpy(), dtype=cp.float32) if "volume" in df else None
+                vol = (
+                    cp.asarray(df["volume"].to_numpy(), dtype=cp.float32)
+                    if self.use_volume_features and "volume" in df
+                    else None
+                )
 
             tp = int(params.get("timeperiod", params.get("period", 14)))
             tp = max(2, min(tp, 500))
@@ -956,6 +962,8 @@ class TALibStrategyMixer:
         unique_tasks = {}
         for gene in population:
             for ind in gene.indicators:
+                if (not self.use_volume_features) and ind in self._volume_indicators:
+                    continue
                 params = gene.params.get(ind, {})
                 # Create a stable key for caching
                 param_key = json.dumps(params, sort_keys=True)
@@ -1018,7 +1026,9 @@ class TALibStrategyMixer:
                     "high": cp.asarray(df["high"].to_numpy(dtype=np.float32)) if "high" in df else None,
                     "low": cp.asarray(df["low"].to_numpy(dtype=np.float32)) if "low" in df else None,
                     "open": cp.asarray(df["open"].to_numpy(dtype=np.float32)) if "open" in df else None,
-                    "volume": cp.asarray(df["volume"].to_numpy(dtype=np.float32)) if "volume" in df else None,
+                    "volume": cp.asarray(df["volume"].to_numpy(dtype=np.float32))
+                    if self.use_volume_features and "volume" in df
+                    else None,
                 }
             except Exception:
                 gpu_arrays = None

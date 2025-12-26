@@ -17,6 +17,8 @@ from ..models.onnx_exporter import ONNXInferenceEngine
 from ..models.rl import RLExpertPPO, RLExpertSAC
 from ..models.transformers import TransformerExpertTorch
 from ..training.ensemble import MetaBlender
+from ..strategy.fast_backtest import infer_pip_metrics
+from ..strategy.stop_target import infer_stop_target_pips
 
 try:
     from joblib import load
@@ -75,7 +77,14 @@ class SignalEngine:
         # Prop firm safety gates
         self._daily_dd_cutoff = float(getattr(settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
         self._total_dd_cutoff = float(getattr(settings.risk, "max_drawdown_limit", 0.07) or 0.07)
-        self._profit_target = float(getattr(settings.risk, "monthly_profit_target", 0.04) or 0.04)
+        self._profit_target = float(
+            getattr(
+                settings.risk,
+                "monthly_profit_target_pct",
+                getattr(settings.risk, "monthly_profit_target", 0.04),
+            )
+            or 0.04
+        )
         self._max_trades_per_day = int(getattr(settings.risk, "max_trades_per_day", 20) or 20)
 
     def prepare_dataset(
@@ -739,23 +748,32 @@ class SignalEngine:
 
         win_prob = np.where(signals == 1, p_up, np.where(signals == -1, p_dn, 0.0))
 
-        rr_values = np.full(n, 2.0)  # Default
-        sl_pips_values = np.full(n, 20.0)  # Default fallback
+        rr_base = float(getattr(self.config.risk, "min_risk_reward", 1.0) or 1.0)
+        rr_values = np.full(n, rr_base)
+        sl_pips_values = np.full(n, np.nan)
 
-        if "dist_liquidity" in X.columns and "atr" in X.columns:
-            dist = X["dist_liquidity"].abs().values
+        # Preferred: blended stop/target engine (range-vol + tail risk).
+        try:
+            pip_size, _pip_value = infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
+            res = infer_stop_target_pips(X, settings=self.settings, pip_size=pip_size)
+            if res is not None:
+                sl_pips, _tp_pips, rr = res
+                sl_pips_values[:] = float(sl_pips)
+                rr_values[:] = float(rr)
+        except Exception:
+            pass
+
+        # Fallback: ATR-based if stop engine failed
+        if np.isnan(sl_pips_values).all() and "atr" in X.columns:
             atr = X["atr"].values
-
-            safe_atr = np.maximum(atr, 1e-6)
-            est_stop_dist = 1.5 * safe_atr
-
-            dynamic_rr = dist / est_stop_dist
-
-            rr_values = np.clip(dynamic_rr, 1.0, 6.0)
-
             is_forex = np.nanmedian(atr) < 0.5
-            pip_size = 0.0001 if is_forex else 0.01  # Rough guess, refined in bot.py
-            sl_pips_values = est_stop_dist / pip_size
+            pip_size = 0.0001 if is_forex else 0.01
+            atr_mult = float(getattr(self.config.risk, "atr_stop_multiplier", 1.5))
+            min_dist = float(getattr(self.config.risk, "meta_label_min_dist", 0.0))
+            dist_sl = atr * max(atr_mult, 0.0)
+            if min_dist > 0:
+                dist_sl = np.maximum(dist_sl, min_dist)
+            sl_pips_values = np.where(dist_sl > 0, dist_sl / pip_size, np.nan)
 
         rr_series = pd.Series(rr_values, index=X.index)
         sl_pips = pd.Series(sl_pips_values, index=X.index)

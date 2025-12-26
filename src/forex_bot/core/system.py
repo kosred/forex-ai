@@ -69,6 +69,7 @@ class HardwareProfile:
     available_ram_gb: float
     gpu_names: list[str]
     num_gpus: int
+    gpu_mem_gb: list[float] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     platform_label: str = field(default_factory=platform.platform)
 
@@ -79,6 +80,7 @@ class HardwareProfile:
             "available_ram_gb": round(self.available_ram_gb, 2),
             "gpu_names": self.gpu_names,
             "num_gpus": self.num_gpus,
+            "gpu_mem_gb": [round(x, 2) for x in self.gpu_mem_gb],
             "timestamp": self.timestamp.isoformat(),
             "platform": self.platform_label,
         }
@@ -98,12 +100,14 @@ class HardwareProbe:
         cpu_cores = max(1, os.cpu_count() or 1)
         total_ram_gb, available_ram_gb = self._detect_ram_gb()
         gpu_names = self._detect_gpus()
+        gpu_mem_gb = self._detect_gpu_memory_gb()
         return HardwareProfile(
             cpu_cores=cpu_cores,
             total_ram_gb=total_ram_gb,
             available_ram_gb=available_ram_gb,
             gpu_names=gpu_names,
             num_gpus=len(gpu_names),
+            gpu_mem_gb=gpu_mem_gb,
             platform_label=platform.platform(),
         )
 
@@ -179,6 +183,42 @@ class HardwareProbe:
                     continue
         return []
 
+    def _detect_gpu_memory_gb(self) -> list[float]:
+        torch = self._torch
+        if torch is not None and torch.cuda.is_available():
+            try:
+                return [
+                    float(torch.cuda.get_device_properties(i).total_memory) / (1024**3)
+                    for i in range(torch.cuda.device_count())
+                ]
+            except Exception:
+                return []
+
+        # Fallback: nvidia-smi (if available)
+        smi_candidates = ["nvidia-smi"]
+        if platform.system() == "Windows":
+            smi_candidates.append(r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe")
+            smi_candidates.append(r"C:\Windows\System32\nvidia-smi.exe")
+        for cmd in smi_candidates:
+            if shutil.which(cmd) or os.path.exists(cmd):
+                try:
+                    result = subprocess.run(
+                        [cmd, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                        check=True,
+                        capture_output=True,
+                        encoding="utf-8",
+                    )
+                    vals = [
+                        float(line.strip()) / 1024.0
+                        for line in result.stdout.splitlines()
+                        if line.strip()
+                    ]
+                    if vals:
+                        return vals
+                except Exception:
+                    continue
+        return []
+
 
 @dataclass(slots=True)
 class AutoTuneHints:
@@ -190,6 +230,7 @@ class AutoTuneHints:
     inference_batch_size: int
     optuna_trials: int
     adaptive_training_budget: float
+    feature_workers: int
     is_hpc: bool = False  # New flag for High Performance Compute clusters
 
     def to_dict(self) -> dict[str, Any]:
@@ -202,6 +243,7 @@ class AutoTuneHints:
             "inference_batch_size": self.inference_batch_size,
             "optuna_trials": self.optuna_trials,
             "adaptive_training_budget": self.adaptive_training_budget,
+            "feature_workers": self.feature_workers,
             "is_hpc": self.is_hpc,
         }
 
@@ -278,6 +320,7 @@ class AutoTuner:
 
         try:
             self._apply_thread_env_defaults(hints)
+            self._apply_feature_workers(hints)
         except Exception as e:
             logger.error(f"System operation failed: {e}", exc_info=True)
         return hints
@@ -294,16 +337,25 @@ class AutoTuner:
 
         cpu_cores = max(1, self.profile.cpu_cores)
         ram_gb = getattr(self.profile, "available_ram_gb", self.profile.total_ram_gb)
+        gpu_mem_gb = getattr(self.profile, "gpu_mem_gb", []) or []
+        min_vram_gb = min(gpu_mem_gb) if gpu_mem_gb else 0.0
 
         is_hpc = False
 
-        # Detect Cloud/HPC Beast (e.g. 10x A4000, 56 Cores, 200GB RAM)
+        # Detect Cloud/HPC Beast (e.g. 8x A6000, 256GB+ RAM)
         if enable_gpu and self.profile.num_gpus >= 4 and ram_gb > 64:
             is_hpc = True
             n_jobs = max(1, min(cpu_cores - 2, 64))  # High, but bounded
-            # Per-process/per-GPU batch sizes; do not multiply by GPU count (model-parallel training).
-            train_batch = 512
-            infer_batch = 2048
+            # Per-process/per-GPU batch sizes; do not multiply by GPU count.
+            if min_vram_gb >= 48:
+                train_batch = 1024
+                infer_batch = 4096
+            elif min_vram_gb >= 24:
+                train_batch = 512
+                infer_batch = 2048
+            else:
+                train_batch = 256
+                infer_batch = 1024
             optuna_trials = max(int(getattr(self.settings.models, "optuna_trials", 25)), 50)
             adaptive_budget = 7200.0  # used only when a model budget is unset
             self.logger.info(
@@ -313,8 +365,12 @@ class AutoTuner:
         elif enable_gpu:
             # Standard GPU Workstation
             n_jobs = max(1, min(cpu_cores - 1, 16))
-            train_batch = 256
-            infer_batch = 1024
+            if min_vram_gb >= 24:
+                train_batch = 512
+                infer_batch = 2048
+            else:
+                train_batch = 256
+                infer_batch = 1024
             optuna_trials = max(int(getattr(self.settings.models, "optuna_trials", 25)), 25)
             adaptive_budget = 3600.0  # used only when a model budget is unset
         else:
@@ -335,6 +391,14 @@ class AutoTuner:
             optuna_trials = min(self.settings.models.optuna_trials, 10)
             adaptive_budget = 1800.0  # used only when a model budget is unset
 
+        # Feature worker scaling: higher on big RAM boxes.
+        if is_hpc and ram_gb >= 256:
+            feature_workers = min(max(64, cpu_cores * 2), 256)
+        elif enable_gpu:
+            feature_workers = min(max(8, cpu_cores), 64)
+        else:
+            feature_workers = min(max(4, cpu_cores // 2), 32)
+
         return AutoTuneHints(
             enable_gpu=enable_gpu,
             num_gpus=self.profile.num_gpus if enable_gpu else 0,
@@ -344,6 +408,7 @@ class AutoTuner:
             inference_batch_size=infer_batch,
             optuna_trials=optuna_trials,
             adaptive_training_budget=adaptive_budget,
+            feature_workers=feature_workers,
             is_hpc=is_hpc,
         )
 
@@ -373,3 +438,8 @@ class AutoTuner:
             pass  # Optional
         except Exception as e:
             logger.warning(f"NumExpr configuration failed: {e}")
+
+    def _apply_feature_workers(self, hints: AutoTuneHints) -> None:
+        """Set feature-engineering worker count if not explicitly provided."""
+        if not os.environ.get("FEATURE_WORKERS"):
+            os.environ["FEATURE_WORKERS"] = str(max(1, hints.feature_workers))

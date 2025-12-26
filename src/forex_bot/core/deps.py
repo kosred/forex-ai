@@ -80,6 +80,22 @@ IMPORT_TO_PYPI = {
     "neuralforecast": "neuralforecast",
     "tslib": "tslib",
     "evotorch": "evotorch",
+    "ax": "ax-platform",
+    "botorch": "botorch",
+    "cma": "cma",
+    "cudf": "cudf-cu12",
+    "cuml": "cuml-cu12",
+    "cupy": "cupy-cuda12x",
+    "flash_attn": "flash-attn",
+    "onnx": "onnx",
+    "onnxmltools": "onnxmltools",
+    "onnxruntime": "onnxruntime-gpu",
+    "openai": "openai",
+    "polars": "polars",
+    "pytorch_tabnet": "pytorch-tabnet",
+    "skl2onnx": "skl2onnx",
+    "threadpoolctl": "threadpoolctl",
+    "transformer_engine": "transformer-engine",
 }
 
 # Known Standard Library modules to exclude (Python 3.10+)

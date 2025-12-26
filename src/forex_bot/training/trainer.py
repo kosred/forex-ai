@@ -20,7 +20,11 @@ import yaml
 from ..core.config import Settings
 from ..domain.events import PreparedDataset
 from ..models.base import ExpertModel, detect_feature_drift
-from ..strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+from ..strategy.fast_backtest import (
+    fast_evaluate_strategy,
+    infer_pip_metrics,
+    infer_sl_tp_pips_auto,
+)
 from .ensemble import MetaBlender
 from .evaluation import probs_to_signals, prop_backtest
 from .optimization import HyperparameterOptimizer
@@ -393,13 +397,20 @@ class ModelTrainer:
                 ]
 
                 log_f = open(log_path, "w", encoding="utf-8")
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(entry.parent),
-                    env=env,
-                    stdout=log_f,
-                    stderr=subprocess.STDOUT,
-                )
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=str(entry.parent),
+                        env=env,
+                        stdout=log_f,
+                        stderr=subprocess.STDOUT,
+                    )
+                except Exception:
+                    try:
+                        log_f.close()
+                    except Exception:
+                        pass
+                    raise
                 procs.append((wid, out_dir, proc, log_f))
                 logger.info(f"Worker {wid}: models={models} log={log_path}")
 
@@ -900,10 +911,38 @@ class ModelTrainer:
                                 )
 
                                 pip_size, pip_value_per_lot = infer_pip_metrics(self.settings.system.symbol)
-                                sl_pips = float(getattr(self.settings.risk, "meta_label_sl_pips", 20.0))
+                                sl_cfg = getattr(self.settings.risk, "meta_label_sl_pips", None)
+                                tp_cfg = getattr(self.settings.risk, "meta_label_tp_pips", None)
                                 rr = float(getattr(self.settings.risk, "min_risk_reward", 2.0))
-                                tp_pips_cfg = float(getattr(self.settings.risk, "meta_label_tp_pips", sl_pips * rr))
-                                tp_pips = max(tp_pips_cfg, sl_pips * rr)
+                                if sl_cfg is None or float(sl_cfg) <= 0:
+                                    atr_vals = (
+                                        meta_eval_models["atr"].to_numpy(dtype=np.float64)
+                                        if "atr" in meta_eval_models.columns
+                                        else None
+                                    )
+                                    auto = infer_sl_tp_pips_auto(
+                                        open_prices=meta_eval_models["open"].to_numpy(dtype=np.float64)
+                                        if "open" in meta_eval_models.columns
+                                        else meta_eval_models["close"].to_numpy(dtype=np.float64),
+                                        high_prices=meta_eval_models["high"].to_numpy(dtype=np.float64),
+                                        low_prices=meta_eval_models["low"].to_numpy(dtype=np.float64),
+                                        close_prices=meta_eval_models["close"].to_numpy(dtype=np.float64),
+                                        atr_values=atr_vals,
+                                        pip_size=pip_size,
+                                        atr_mult=float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5)),
+                                        min_rr=rr,
+                                        min_dist=float(getattr(self.settings.risk, "meta_label_min_dist", 0.0)),
+                                        settings=self.settings,
+                                    )
+                                    if auto is None:
+                                        raise RuntimeError("Cannot infer SL/TP pips from metadata.")
+                                    sl_pips, tp_pips = auto
+                                else:
+                                    sl_pips = float(sl_cfg)
+                                    if tp_cfg is None or float(tp_cfg) <= 0:
+                                        tp_pips = sl_pips * rr
+                                    else:
+                                        tp_pips = max(float(tp_cfg), sl_pips * rr)
 
                                 spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
                                 commission = float(getattr(self.settings.risk, "commission_per_lot", 0.0))

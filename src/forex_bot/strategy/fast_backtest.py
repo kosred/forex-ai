@@ -1,5 +1,6 @@
 import numpy as np
 from numba import njit
+from typing import Any
 
 
 def infer_pip_metrics(symbol: str) -> tuple[float, float]:
@@ -12,6 +13,76 @@ def infer_pip_metrics(symbol: str) -> tuple[float, float]:
     if sym.endswith("JPY") or sym.startswith("JPY"):
         return 0.01, 9.0
     return 0.0001, 10.0
+
+
+def infer_sl_tp_pips_auto(
+    *,
+    open_prices: np.ndarray | None = None,
+    high_prices: np.ndarray | None,
+    low_prices: np.ndarray | None,
+    close_prices: np.ndarray | None = None,
+    atr_values: np.ndarray | None,
+    pip_size: float,
+    atr_mult: float,
+    min_rr: float,
+    min_dist: float,
+    settings: Any | None = None,
+) -> tuple[float, float] | None:
+    """
+    Derive SL/TP pips from market data when fixed pip targets are disabled.
+
+    Returns None if no reliable distance can be inferred.
+    """
+    if settings is not None and open_prices is not None and close_prices is not None:
+        try:
+            import pandas as pd
+            from .stop_target import infer_stop_target_pips
+
+            df = pd.DataFrame(
+                {
+                    "open": open_prices,
+                    "high": high_prices if high_prices is not None else close_prices,
+                    "low": low_prices if low_prices is not None else close_prices,
+                    "close": close_prices,
+                }
+            )
+            res = infer_stop_target_pips(df, settings=settings, pip_size=pip_size)
+            if res is not None:
+                sl_pips, tp_pips, _rr = res
+                return float(sl_pips), float(tp_pips)
+        except Exception:
+            pass
+
+    base_dist = 0.0
+    if atr_values is not None:
+        try:
+            atr_vals = atr_values[np.isfinite(atr_values) & (atr_values > 0)]
+            if atr_vals.size > 0:
+                base_dist = float(np.nanmedian(atr_vals)) * max(atr_mult, 0.0)
+        except Exception:
+            base_dist = 0.0
+
+    if base_dist <= 0.0 and high_prices is not None and low_prices is not None:
+        try:
+            tr = high_prices - low_prices
+            tr_vals = tr[np.isfinite(tr) & (tr > 0)]
+            if tr_vals.size > 0:
+                base_dist = float(np.nanmedian(tr_vals))
+        except Exception:
+            base_dist = 0.0
+
+    if base_dist <= 0.0:
+        return None
+
+    if min_dist and min_dist > 0:
+        base_dist = max(base_dist, float(min_dist))
+
+    pip_size = max(float(pip_size), 1e-9)
+    sl_pips = base_dist / pip_size
+
+    rr = float(min_rr) if min_rr and min_rr > 0 else 1.0
+    tp_pips = sl_pips * rr
+    return float(sl_pips), float(tp_pips)
 
 
 @njit(cache=True, fastmath=True)

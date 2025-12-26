@@ -30,10 +30,12 @@ class TensorDiscoveryEngine:
         self.gpu_list = get_available_gpus()
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.n_experts = n_experts
-        self.data_cube = None 
+        self.data_cube = None
         self.ohlc_cube = None
         self.timeframes = timeframes
         self.best_experts = []
+        self.month_ids_cpu = None
+        self.month_count = 0
 
     def _prepare_tensor_cube(self, frames: Dict[str, pd.DataFrame], news_map: Optional[Dict[str, pd.DataFrame]] = None):
         logger.info("Aligning Multi-Timeframe Data for Cooperative Discovery...")
@@ -41,6 +43,42 @@ class TensorDiscoveryEngine:
         if master_tf not in frames:
             master_tf = next(iter(frames.keys()))
         master_idx = frames[master_tf].index
+
+        # Adaptive downsampling to avoid CPU OOM on massive datasets.
+        try:
+            max_rows_env = int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_ROWS", "0") or 0)
+        except Exception:
+            max_rows_env = 0
+        max_rows = max_rows_env
+        if max_rows <= 0:
+            try:
+                from ..core.system import HardwareProbe
+
+                profile = HardwareProbe().detect()
+                avail_bytes = max(0.0, float(profile.available_ram_gb)) * (1024**3)
+                if avail_bytes > 0:
+                    bytes_per_row = 0
+                    for tf_name, tf_df in frames.items():
+                        try:
+                            num_cols = int(tf_df.select_dtypes(include=[np.number]).shape[1])
+                        except Exception:
+                            num_cols = int(tf_df.shape[1])
+                        # Data cube includes all numeric cols plus a separate OHLC cube.
+                        bytes_per_row += int((num_cols + 4) * 4)
+                    if bytes_per_row > 0:
+                        auto_rows = int((avail_bytes * 0.55) / bytes_per_row)
+                        max_rows = max(0, auto_rows)
+            except Exception:
+                max_rows = 0
+
+        if max_rows > 0 and len(master_idx) > max_rows:
+            logger.warning(f"Discovery: downsampling to last {max_rows} rows to avoid OOM.")
+            for tf in list(frames.keys()):
+                try:
+                    frames[tf] = frames[tf].iloc[-max_rows:]
+                except Exception:
+                    pass
+            master_idx = frames[master_tf].index
         
         cube_list, ohlc_list = [], []
         news_tensor_list = []
@@ -84,6 +122,20 @@ class TensorDiscoveryEngine:
         self.data_cube_cpu = torch.stack(cube_list)
         self.ohlc_cube_cpu = torch.stack(ohlc_list)
         self.n_features = self.data_cube_cpu.shape[2]
+        self.month_ids_cpu = None
+        self.month_count = 0
+        try:
+            if isinstance(master_idx, pd.DatetimeIndex):
+                idx = master_idx
+                if idx.tz is not None:
+                    idx = idx.tz_convert("UTC")
+                month_keys = idx.to_period("M")
+                month_ids, uniques = pd.factorize(month_keys)
+                self.month_ids_cpu = torch.as_tensor(month_ids, dtype=torch.long)
+                self.month_count = int(len(uniques))
+        except Exception:
+            self.month_ids_cpu = None
+            self.month_count = 0
         
         # News Tensor (Sentiment, Impact)
         self.news_tensor_cpu = None
@@ -103,17 +155,54 @@ class TensorDiscoveryEngine:
 
     def run_unsupervised_search(self, frames: Dict[str, pd.DataFrame], news_features: Optional[pd.DataFrame] = None, iterations: int = 1000):
         self._prepare_tensor_cube(frames, news_features)
-        
+
         # 1. Setup GPU Contexts for all workers
         # Pre-load data to each GPU once to avoid transfer bottlenecks
-        gpu_data_cubes = [self.data_cube_cpu.to(gpu) for gpu in self.gpu_list]
-        gpu_ohlc_cubes = [self.ohlc_cube_cpu.to(gpu) for gpu in self.gpu_list]
-        
-        gpu_news = []
-        if self.news_tensor_cpu is not None:
-            gpu_news = [self.news_tensor_cpu.to(gpu) for gpu in self.gpu_list]
-            
+        preload_mode = os.environ.get("FOREX_BOT_DISCOVERY_PRELOAD", "auto").strip().lower()
+        preload = preload_mode in {"1", "true", "yes", "on"}
+        if preload_mode in {"0", "false", "no", "off"}:
+            preload = False
+        if preload_mode == "auto":
+            try:
+                bytes_per_gpu = 0
+                bytes_per_gpu += int(self.data_cube_cpu.numel() * self.data_cube_cpu.element_size())
+                bytes_per_gpu += int(self.ohlc_cube_cpu.numel() * self.ohlc_cube_cpu.element_size())
+                if self.news_tensor_cpu is not None:
+                    bytes_per_gpu += int(self.news_tensor_cpu.numel() * self.news_tensor_cpu.element_size())
+                if self.month_ids_cpu is not None:
+                    bytes_per_gpu += int(self.month_ids_cpu.numel() * self.month_ids_cpu.element_size())
+                min_mem = min(torch.cuda.get_device_properties(g).total_memory for g in self.gpu_list)
+                preload = bytes_per_gpu < (min_mem * 0.60)
+            except Exception:
+                preload = False
+
+        if preload:
+            logger.info("Discovery: preloading data cubes to all GPUs.")
+            gpu_data_cubes = [self.data_cube_cpu.to(gpu) for gpu in self.gpu_list]
+            gpu_ohlc_cubes = [self.ohlc_cube_cpu.to(gpu) for gpu in self.gpu_list]
+            gpu_news = [self.news_tensor_cpu.to(gpu) for gpu in self.gpu_list] if self.news_tensor_cpu is not None else []
+            gpu_month_ids = [self.month_ids_cpu.to(gpu) for gpu in self.gpu_list] if self.month_ids_cpu is not None else []
+        else:
+            logger.info("Discovery: streaming data per-batch to avoid VRAM exhaustion.")
+            gpu_data_cubes = []
+            gpu_ohlc_cubes = []
+            gpu_news = []
+            gpu_month_ids = []
+
         num_gpus = len(self.gpu_list)
+
+        # Estimate per-row GPU footprint for safe batch sizing.
+        try:
+            tf_count = int(self.data_cube_cpu.shape[0])
+            feat_count = int(self.data_cube_cpu.shape[2])
+            bytes_per_row = tf_count * feat_count * int(self.data_cube_cpu.element_size())
+            bytes_per_row += tf_count * 4 * int(self.ohlc_cube_cpu.element_size())
+            if self.news_tensor_cpu is not None:
+                bytes_per_row += 2 * int(self.news_tensor_cpu.element_size())
+            if self.month_ids_cpu is not None:
+                bytes_per_row += int(self.month_ids_cpu.element_size())
+        except Exception:
+            bytes_per_row = 0
         
         @torch.no_grad()
         def fitness_func(genomes_all: torch.Tensor) -> torch.Tensor:
@@ -127,137 +216,169 @@ class TensorDiscoveryEngine:
             
             # Using ThreadPool to launch GPU evaluations in parallel
             import concurrent.futures
-            
             def _eval_on_gpu(chunk: torch.Tensor, gpu_idx: int):
                 dev = torch.device(self.gpu_list[gpu_idx])
-                with torch.cuda.device(dev):
-                    genomes = chunk.clone().detach().to(dev)
-                    local_pop = genomes.shape[0]
-                    n_samples = gpu_data_cubes[gpu_idx].shape[1]
-                    has_news = len(gpu_news) > gpu_idx
-                    
-                    # Auto-scale batch size based on VRAM (A4000=16GB -> 100k, A6000=48GB -> 400k+)
-                    try:
-                        total_mem = torch.cuda.get_device_properties(dev).total_memory
-                        # Conservative heuristic: 100k rows per 8GB of VRAM safe zone
-                        # Reserve 4GB overhead
-                        usable_gb = max(1, (total_mem / (1024**3)) - 4)
-                        batch_size = int(usable_gb * 15000) 
-                        batch_size = min(n_samples, max(50000, batch_size))
-                    except Exception:
-                        batch_size = 100000 # Fallback
-                
-                tf_count = gpu_data_cubes[gpu_idx].shape[0]
-                tf_weights = F.softmax(genomes[:, :tf_count], dim=1)
-                logic_weights = genomes[:, tf_count : tf_count+self.n_features]
-                thresholds = genomes[:, -2:]
-                
-                # Cumulative Metrics
-                sum_ret = torch.zeros(local_pop, device=dev)
-                sum_sq_ret = torch.zeros(local_pop, device=dev)
-                running_cum_ret = torch.zeros(local_pop, device=dev)
-                running_peak = torch.zeros(local_pop, device=dev)
-                max_dd = torch.zeros(local_pop, device=dev)
-                max_daily_dd = torch.zeros(local_pop, device=dev)
-                
-                # Daily DD Tracking (Approximate via 1440 min window)
-                day_window = 1440
-                
-                chunk_size = n_samples // 10
-                profitable_chunks = torch.zeros(local_pop, device=dev)
-                current_chunk_ret = torch.zeros(local_pop, device=dev)
+                try:
+                    with torch.cuda.device(dev):
+                        if chunk.numel() == 0:
+                            return torch.empty((0,), dtype=torch.float32)
+                        n_samples = self.data_cube_cpu.shape[1]
+                        has_news = self.news_tensor_cpu is not None
+                        month_ids = None
+                        if self.month_ids_cpu is not None:
+                            month_ids = (
+                                gpu_month_ids[gpu_idx]
+                                if preload and gpu_month_ids
+                                else self.month_ids_cpu.to(dev, non_blocking=True)
+                            )
 
-                for start_idx in range(0, n_samples, batch_size):
-                    end_idx = min(start_idx + batch_size, n_samples)
-                    data_slice = gpu_data_cubes[gpu_idx][:, start_idx:end_idx, :]
-                    
-                    signals = torch.zeros((local_pop, end_idx - start_idx), device=dev)
-                    for i in range(tf_count):
-                        with torch.amp.autocast('cuda', enabled=True):
-                            tf_sig = torch.matmul(data_slice[i], logic_weights.t())
-                        signals = signals + (tf_weights[:, i].unsqueeze(1) * tf_sig.t())
-                    
-                    # Incorporate News Sentiment into Signal (if available)
-                    if has_news:
-                        # shape: (batch, 2) -> (batch) sentiment
-                        news_slice = gpu_news[gpu_idx][start_idx:end_idx, 0] 
-                        # Simple additive bias: if sentiment is strong positive, boost signal
-                        # We use a fixed weight for now, or could evolve it. 
-                        # Here we simply add it to the signal logic.
-                        signals = signals + (news_slice.unsqueeze(0) * 0.5) 
+                        # Auto-scale batch size based on VRAM and footprint.
+                        try:
+                            total_mem = torch.cuda.get_device_properties(dev).total_memory
+                            reserve = 4 * 1024**3
+                            usable = max(512 * 1024**2, total_mem - reserve)
+                            if bytes_per_row > 0:
+                                batch_size = int((usable * 0.60) / bytes_per_row)
+                            else:
+                                batch_size = int((usable / (1024**3)) * 75000)
+                            batch_size = int(max(10000, min(n_samples, batch_size)))
+                        except Exception:
+                            batch_size = min(n_samples, 100000)
 
-                    actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
-                    actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
-                    
-                    close = gpu_ohlc_cubes[gpu_idx][0, start_idx:end_idx, 3]
-                    rets = torch.zeros_like(close)
-                    rets[1:] = (close[1:] - close[:-1]) / (close[:-1] + 1e-9)
-                    
-                    # Slippage Penalty: If news impact is high, apply penalty
-                    if has_news:
-                        impact_slice = gpu_news[gpu_idx][start_idx:end_idx, 1]
-                        # Assume impact > 0.7 implies high volatility/spread
-                        # Penalty: 2.0 pips (approx 0.0002 price impact) per trade
-                        is_news_event = (impact_slice > 0.7).float()
-                        trade_cost = is_news_event * 0.0002 
-                        # Apply cost only when position changes (approx via abs(action))
-                        # For simple vectorization, we just penalize holding during news
-                        # Better: penalize entry.
-                        # cost = cost * |action|
-                        rets = rets - (trade_cost * torch.abs(actions).mean(dim=0)) # simplified
+                        genome_dim = int(self.n_features + len(self.timeframes) + 2)
+                        try:
+                            total_mem = torch.cuda.get_device_properties(dev).total_memory
+                            genome_budget = max(128 * 1024**2, int(total_mem * 0.05))
+                            max_genomes = max(64, int(genome_budget / (genome_dim * 4)))
+                        except Exception:
+                            max_genomes = 1024
 
-                    batch_rets = actions * rets.unsqueeze(0)
-                    
-                    sum_ret = sum_ret + batch_rets.sum(dim=1)
-                    sum_sq_ret = sum_sq_ret + (batch_rets**2).sum(dim=1)
-                    current_chunk_ret = current_chunk_ret + batch_rets.sum(dim=1)
-                    
-                    if (end_idx // chunk_size) > (start_idx // chunk_size):
-                        profitable_chunks = profitable_chunks + (current_chunk_ret > 0).float()
-                        current_chunk_ret = torch.zeros_like(current_chunk_ret)
+                        fitness_all = []
+                        for g_start in range(0, chunk.shape[0], max_genomes):
+                            g_end = min(g_start + max_genomes, chunk.shape[0])
+                            genomes = chunk[g_start:g_end].clone().detach().to(dev)
+                            local_pop = genomes.shape[0]
 
-                    batch_cum = batch_rets.cumsum(dim=1)
-                    abs_cum = batch_cum + running_cum_ret.unsqueeze(1)
-                    batch_peaks = torch.maximum(torch.cummax(abs_cum, dim=1)[0], running_peak.unsqueeze(1))
-                    max_dd = torch.maximum((batch_peaks - abs_cum).max(dim=1)[0], max_dd)
-                    
-                    # Daily Drawdown Approximation
-                    # We compute min rolling return over 'day_window'
-                    # Efficient sliding window min is hard, so we check "start of day" vs "current"
-                    # Reset peak every 1440 steps?
-                    # Vectorized approach: reshape to (Days, 1440) -> cumsum -> max_dd per day
-                    # Here we are in a batch loop. We can track "daily_peak".
-                    # For simplicity/speed in fitness loop:
-                    # We just penalize large single-batch drops heavily if batch >= 1 day
-                    
-                    running_cum_ret = abs_cum[:, -1]
-                    running_peak = batch_peaks[:, -1]
+                            tf_count = self.data_cube_cpu.shape[0]
+                            tf_weights = F.softmax(genomes[:, :tf_count], dim=1)
+                            logic_weights = genomes[:, tf_count : tf_count + self.n_features]
+                            thresholds = genomes[:, -2:]
 
-                    del signals, actions, rets, batch_rets, batch_cum, abs_cum, batch_peaks
-                
-                # We only clear cache after the full sample pass, not per batch
-                torch.cuda.empty_cache()
-                
-                mean_ret = sum_ret / n_samples
-                std_ret = torch.sqrt(torch.clamp((sum_sq_ret / n_samples) - mean_ret**2, min=1e-9)) + 1e-6
-                sharpe = (mean_ret / std_ret) * (252 * 1440)**0.5
-                
-                # Prop Firm Constraints (ULTRA-CONSERVATIVE)
-                fitness = sharpe * (profitable_chunks / 10.0)
-                
-                # 1. Hard Max Total Drawdown Limit (7% instead of 8% for safety)
-                fitness = torch.where(max_dd > 0.07, torch.tensor(-1e9, device=dev), fitness)
-                
-                # 2. Daily Drawdown Penalty (Soft limit 4% instead of 4.5% for safety)
-                # Penalize any gene where volatility projects a >4% daily move
-                fitness = torch.where(std_ret * np.sqrt(1440) > 0.04, fitness * 0.1, fitness)
+                            sum_ret = torch.zeros(local_pop, device=dev)
+                            sum_sq_ret = torch.zeros(local_pop, device=dev)
+                            running_cum_ret = torch.zeros(local_pop, device=dev)
+                            running_peak = torch.zeros(local_pop, device=dev)
+                            max_dd = torch.zeros(local_pop, device=dev)
+                            month_returns = None
+                            if month_ids is not None and self.month_count > 0:
+                                month_returns = torch.zeros((local_pop, self.month_count), device=dev)
 
-                return fitness.cpu()
+                            chunk_size = max(1, n_samples // 10)
+                            profitable_chunks = torch.zeros(local_pop, device=dev)
+                            current_chunk_ret = torch.zeros(local_pop, device=dev)
+
+                            for start_idx in range(0, n_samples, batch_size):
+                                end_idx = min(start_idx + batch_size, n_samples)
+                                if preload:
+                                    data_slice = gpu_data_cubes[gpu_idx][:, start_idx:end_idx, :]
+                                    ohlc_slice = gpu_ohlc_cubes[gpu_idx][:, start_idx:end_idx, :]
+                                else:
+                                    data_slice = self.data_cube_cpu[:, start_idx:end_idx, :].to(dev, non_blocking=True)
+                                    ohlc_slice = self.ohlc_cube_cpu[:, start_idx:end_idx, :].to(dev, non_blocking=True)
+
+                                signals = torch.zeros((local_pop, end_idx - start_idx), device=dev)
+                                for i in range(tf_count):
+                                    with torch.amp.autocast("cuda", enabled=True):
+                                        tf_sig = torch.matmul(data_slice[i], logic_weights.t())
+                                    signals = signals + (tf_weights[:, i].unsqueeze(1) * tf_sig.t())
+
+                                if has_news:
+                                    if preload:
+                                        news_slice = gpu_news[gpu_idx][start_idx:end_idx, 0]
+                                    else:
+                                        news_slice = self.news_tensor_cpu[start_idx:end_idx, 0].to(dev, non_blocking=True)
+                                    signals = signals + (news_slice.unsqueeze(0) * 0.5)
+
+                                actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
+                                actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
+
+                                close = ohlc_slice[0, :, 3]
+                                rets = torch.zeros_like(close)
+                                rets[1:] = (close[1:] - close[:-1]) / (close[:-1] + 1e-9)
+
+                                if has_news:
+                                    if preload:
+                                        impact_slice = gpu_news[gpu_idx][start_idx:end_idx, 1]
+                                    else:
+                                        impact_slice = self.news_tensor_cpu[start_idx:end_idx, 1].to(dev, non_blocking=True)
+                                    is_news_event = (impact_slice > 0.7).float()
+                                    trade_cost = is_news_event * 0.0002
+                                    rets = rets - (trade_cost * torch.abs(actions).mean(dim=0))
+
+                                batch_rets = actions * rets.unsqueeze(0)
+                                if month_returns is not None and month_ids is not None:
+                                    month_ids_batch = month_ids[start_idx:end_idx]
+                                    month_returns.scatter_add_(
+                                        1,
+                                        month_ids_batch.unsqueeze(0).expand(local_pop, -1),
+                                        batch_rets,
+                                    )
+
+                                sum_ret = sum_ret + batch_rets.sum(dim=1)
+                                sum_sq_ret = sum_sq_ret + (batch_rets**2).sum(dim=1)
+                                current_chunk_ret = current_chunk_ret + batch_rets.sum(dim=1)
+
+                                if (end_idx // chunk_size) > (start_idx // chunk_size):
+                                    profitable_chunks = profitable_chunks + (current_chunk_ret > 0).float()
+                                    current_chunk_ret = torch.zeros_like(current_chunk_ret)
+
+                                batch_cum = batch_rets.cumsum(dim=1)
+                                abs_cum = batch_cum + running_cum_ret.unsqueeze(1)
+                                batch_peaks = torch.maximum(
+                                    torch.cummax(abs_cum, dim=1)[0],
+                                    running_peak.unsqueeze(1),
+                                )
+                                max_dd = torch.maximum((batch_peaks - abs_cum).max(dim=1)[0], max_dd)
+
+                                running_cum_ret = abs_cum[:, -1]
+                                running_peak = batch_peaks[:, -1]
+
+                                del signals, actions, rets, batch_rets, batch_cum, abs_cum, batch_peaks, data_slice, ohlc_slice
+
+                            torch.cuda.empty_cache()
+
+                            mean_ret = sum_ret / n_samples
+                            std_ret = torch.sqrt(torch.clamp((sum_sq_ret / n_samples) - mean_ret**2, min=1e-9)) + 1e-6
+                            sharpe = (mean_ret / std_ret) * (252 * 1440) ** 0.5
+
+                            fitness = sharpe * (profitable_chunks / 10.0)
+                            fitness = torch.where(max_dd > 0.07, torch.tensor(-1e9, device=dev), fitness)
+                            fitness = torch.where(std_ret * (1440**0.5) > 0.04, fitness * 0.1, fitness)
+
+                            if month_returns is not None:
+                                negative_months = (month_returns < 0).sum(dim=1).float()
+                                consistency = torch.clamp(1.0 - (negative_months * 0.1), min=0.0)
+                                fitness = fitness * consistency
+
+                            fitness_all.append(fitness.detach().cpu())
+
+                        return torch.cat(fitness_all, dim=0)
+                except Exception as e:
+                    logger.error(f"GPU {gpu_idx} eval failed: {e}", exc_info=True)
+                    return torch.full((chunk.shape[0],), -1e9)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_gpus) as executor:
-                futures = [executor.submit(_eval_on_gpu, pop_chunks[i], i) for i in range(num_gpus)]
+                futures = {
+                    executor.submit(_eval_on_gpu, pop_chunks[i], i): pop_chunks[i].shape[0]
+                    for i in range(num_gpus)
+                }
                 for future in concurrent.futures.as_completed(futures):
-                    all_fitness_scores.append(future.result())
+                    try:
+                        all_fitness_scores.append(future.result())
+                    except Exception as e:
+                        chunk_size = futures.get(future, 0)
+                        logger.error(f"GPU worker failed: {e}", exc_info=True)
+                        all_fitness_scores.append(torch.full((chunk_size,), -1e9))
             
             # Re-assemble and return to EvoTorch master
             return torch.cat(all_fitness_scores, dim=0)
@@ -267,16 +388,95 @@ class TensorDiscoveryEngine:
         problem = Problem("max", fitness_func, initial_bounds=(-1.0, 1.0), 
                          solution_length=genome_dim, device="cpu", vectorized=True)
         
-        # cooperative population of 4000 (default) or scaled by env
-        pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 4000))
+        # Tournament of 50,000 Default for High-End Clusters
+        pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 50000))
         searcher = CMAES(problem, popsize=pop_size, stdev_init=0.5)
-        
+
         logger.info(f"Starting COOPERATIVE {len(self.gpu_list)}-GPU Discovery (Pop: {pop_size})...")
-        for i in range(iterations):
+        plateau_gens = int(os.environ.get("FOREX_BOT_DISCOVERY_PLATEAU", "10000") or 10000)
+        score_target = float(os.environ.get("FOREX_BOT_DISCOVERY_SCORE_TARGET", "0") or 0.0)
+        ckpt_every = int(os.environ.get("FOREX_BOT_DISCOVERY_CHECKPOINT_EVERY", "10") or 10)
+        ckpt_dir = Path(
+            os.environ.get(
+                "FOREX_BOT_DISCOVERY_CHECKPOINT_DIR",
+                os.environ.get("FOREX_BOT_CACHE_DIR", "cache"),
+            )
+        ) / "discovery"
+        ckpt_path = ckpt_dir / "tensor_discovery_ckpt.pt"
+
+        def _truthy(value: str | None, default: bool) -> bool:
+            if value is None:
+                return default
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+        best_val = -1e9
+        last_improve = 0
+        start_gen = 0
+        resume_flag = os.environ.get("FOREX_BOT_DISCOVERY_RESUME")
+        resume_enabled = _truthy(resume_flag, default=True)
+        if resume_enabled and ckpt_path.exists():
+            try:
+                ckpt = torch.load(ckpt_path, map_location="cpu")
+                if ckpt.get("genome_dim") == genome_dim and ckpt.get("n_features") == self.n_features:
+                    if "state" in ckpt and hasattr(searcher, "load_state_dict"):
+                        searcher.load_state_dict(ckpt["state"])
+                    elif "population" in ckpt and hasattr(searcher, "population"):
+                        try:
+                            searcher.population.values = ckpt["population"]
+                            if "evaluations" in ckpt:
+                                searcher.population.evaluations = ckpt["evaluations"]
+                        except Exception as exc:
+                            logger.warning(f"Discovery resume population load failed: {exc}")
+                    start_gen = int(ckpt.get("generation", 0)) + 1
+                    best_val = float(ckpt.get("best_val", best_val))
+                    last_improve = int(ckpt.get("last_improve", last_improve))
+                    logger.info(f"Resuming discovery from generation {start_gen}.")
+                else:
+                    logger.warning("Discovery checkpoint incompatible with current genome; starting fresh.")
+            except Exception as exc:
+                logger.warning(f"Discovery resume failed; starting fresh: {exc}")
+
+        def _save_checkpoint(gen_idx: int) -> None:
+            try:
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "generation": int(gen_idx),
+                    "best_val": float(best_val),
+                    "last_improve": int(last_improve),
+                    "genome_dim": int(genome_dim),
+                    "n_features": int(self.n_features),
+                    "time": float(time.time()),
+                }
+                if hasattr(searcher, "state_dict"):
+                    payload["state"] = searcher.state_dict()
+                elif hasattr(searcher, "population"):
+                    payload["population"] = searcher.population.values.detach().cpu()
+                    payload["evaluations"] = searcher.population.evaluations.detach().cpu()
+                torch.save(payload, ckpt_path)
+            except Exception as exc:
+                logger.warning(f"Discovery checkpoint save failed: {exc}")
+
+        if start_gen >= iterations:
+            logger.info("Discovery resume indicates iterations already complete; skipping search.")
+            return
+
+        for i in range(start_gen, iterations):
             searcher.step()
             if i % 10 == 0:
-                best_val = searcher.status.get("best_eval", 0.0)
-                logger.info(f"Generation {i}: Global Best Fitness = {float(best_val):.4f}")
+                current_best = searcher.status.get("best_eval", 0.0)
+                if current_best > best_val + 1e-9:
+                    best_val = float(current_best)
+                    last_improve = i
+                logger.info(f"Generation {i}: Global Best Fitness = {float(current_best):.4f}")
+                if plateau_gens > 0 and (i - last_improve) >= plateau_gens and best_val >= score_target:
+                    logger.info(
+                        f"Plateau reached ({plateau_gens} gens, best={best_val:.4f} >= {score_target}). Stopping early."
+                    )
+                    if ckpt_every > 0:
+                        _save_checkpoint(i)
+                    break
+            if ckpt_every > 0 and (i % ckpt_every == 0) and i > start_gen:
+                _save_checkpoint(i)
 
         # Final survivor extraction
         final_pop = searcher.population.values.detach().cpu()

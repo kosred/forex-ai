@@ -30,7 +30,11 @@ from forex_bot.data.loader import DataLoader
 from forex_bot.data.news.client import get_sentiment_analyzer
 from forex_bot.features.engine import SignalEngine
 from forex_bot.features.pipeline import FeatureEngineer
-from forex_bot.strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+from forex_bot.strategy.fast_backtest import (
+    fast_evaluate_strategy,
+    infer_pip_metrics,
+    infer_sl_tp_pips_auto,
+)
 from forex_bot.training.evaluation import prop_backtest
 
 
@@ -138,10 +142,32 @@ def _fast_backtest_dict(symbol: str, df: pd.DataFrame, signals: pd.Series, setti
 
     pip_size, pip_value_per_lot = infer_pip_metrics(symbol)
 
-    sl_pips = float(getattr(settings.risk, "meta_label_sl_pips", 20.0))
+    sl_cfg = getattr(settings.risk, "meta_label_sl_pips", None)
+    tp_cfg = getattr(settings.risk, "meta_label_tp_pips", None)
     rr = float(getattr(settings.risk, "min_risk_reward", 2.0))
-    tp_pips_cfg = float(getattr(settings.risk, "meta_label_tp_pips", sl_pips * rr))
-    tp_pips = max(tp_pips_cfg, sl_pips * rr)
+    if sl_cfg is None or float(sl_cfg) <= 0:
+        atr_vals = df["atr"].to_numpy(dtype=np.float64) if "atr" in df.columns else None
+        auto = infer_sl_tp_pips_auto(
+            open_prices=df["open"].to_numpy(dtype=np.float64) if "open" in df.columns else close,
+            high_prices=high,
+            low_prices=low,
+            close_prices=close,
+            atr_values=atr_vals,
+            pip_size=pip_size,
+            atr_mult=float(getattr(settings.risk, "atr_stop_multiplier", 1.5)),
+            min_rr=rr,
+            min_dist=float(getattr(settings.risk, "meta_label_min_dist", 0.0)),
+            settings=settings,
+        )
+        if auto is None:
+            return {}
+        sl_pips, tp_pips = auto
+    else:
+        sl_pips = float(sl_cfg)
+        if tp_cfg is None or float(tp_cfg) <= 0:
+            tp_pips = sl_pips * rr
+        else:
+            tp_pips = max(float(tp_cfg), sl_pips * rr)
 
     spread = float(getattr(settings.risk, "backtest_spread_pips", 1.5))
     commission = float(getattr(settings.risk, "commission_per_lot", 0.0))

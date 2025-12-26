@@ -61,6 +61,7 @@ class NBeatsExpert(ExpertModel):
         hidden_dim: int = 256,
         n_layers: int = 3,
         n_blocks: int = 2,
+        stack_types: list[str] | None = None,
         lr: float = 1e-3,
         max_time_sec: int = 1800,
         device: str = "cuda",
@@ -73,6 +74,15 @@ class NBeatsExpert(ExpertModel):
         self.max_time_sec = max_time_sec
         self.device = select_device(device)
         self.batch_size = batch_size
+        if stack_types:
+            self.stack_types = list(stack_types)
+        elif n_blocks and n_blocks > 0:
+            if n_blocks == 2:
+                self.stack_types = ["trend", "seasonality"]
+            else:
+                self.stack_types = [f"stack_{i}" for i in range(n_blocks)]
+        else:
+            self.stack_types = ["trend", "seasonality"]
         self.input_dim = 0
         self.is_ddp = False
         self.rank = 0
@@ -81,9 +91,11 @@ class NBeatsExpert(ExpertModel):
 
     def _build_model(self) -> nn.Module:
         class NBeatsNet(nn.Module):
-            def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3) -> None:
+            def __init__(self, input_dim: int, hidden_dim: int, stack_types: list[str], output_dim: int = 3) -> None:
                 super().__init__()
-                self.blocks = nn.ModuleList([NBeatsBlock(hidden_dim, hidden_dim) for _ in range(3)])
+                self.blocks = nn.ModuleList(
+                    [NBeatsBlock(hidden_dim, hidden_dim) for _ in range(len(stack_types))]
+                )
                 self.final = nn.Linear(hidden_dim, output_dim)
                 self.embed = nn.Linear(input_dim, hidden_dim)
 
@@ -100,7 +112,7 @@ class NBeatsExpert(ExpertModel):
         if ddp_device:
             self.device = ddp_device
 
-        model = NBeatsNet(self.input_dim, self.hidden_dim).to(self.device)
+        model = NBeatsNet(self.input_dim, self.hidden_dim, self.stack_types).to(self.device)
         model, self.device, self.is_ddp, self.rank, self.world_size = wrap_ddp(model, self.device)
         return model
 
@@ -120,18 +132,22 @@ class NBeatsExpert(ExpertModel):
             except Exception as e:
                 logger.warning(f"torch.compile failed for NBeats GPU: {e}")
 
+        y_vals = y.to_numpy()
+        if not np.all(np.isin(y_vals, [-1, 0, 1])):
+            raise ValueError(f"Labels must be in {{-1, 0, 1}}, got: {np.unique(y_vals)}")
+
         split = int(len(X) * 0.85)
         X_train, X_val = X.iloc[:split], X.iloc[split:]
-        y_train, y_val = y.iloc[:split], y.iloc[split:]
+        y_train, y_val = y_vals[:split], y_vals[split:]
 
         # Keep data on CPU initially to avoid VRAM OOM (22M rows > 16GB VRAM)
         # Batches will be moved to GPU in the loop
         X_t = torch.as_tensor(dataframe_to_float32_numpy(X_train), dtype=torch.float32, device="cpu")
-        y_t = torch.as_tensor(y_train.values + 1, dtype=torch.long, device="cpu")
+        y_t = torch.as_tensor(y_train + 1, dtype=torch.long, device="cpu")
         
         # Validation set can be on GPU if small enough, but safer on CPU for consistency
         X_v = torch.as_tensor(dataframe_to_float32_numpy(X_val), dtype=torch.float32, device="cpu")
-        y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device="cpu")
+        y_v = torch.as_tensor(y_val + 1, dtype=torch.long, device="cpu")
 
         dataset = TensorDataset(X_t, y_t)
 
@@ -152,17 +168,18 @@ class NBeatsExpert(ExpertModel):
         num_workers = max(1, min(os.cpu_count() or 4, 8)) if is_cuda else 0
         if world_size > 1:
             num_workers = max(1, num_workers // world_size)
-        loader = DataLoader(
-            dataset,
-            batch_size=max(1, eff_batch // max(1, world_size)),
-            shuffle=(sampler is None),
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=is_cuda,
-            prefetch_factor=2 if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
-            multiprocessing_context='spawn' if num_workers > 0 else None,
-        )
+        loader_kwargs = {
+            "batch_size": max(1, eff_batch // max(1, world_size)),
+            "shuffle": (sampler is None),
+            "sampler": sampler,
+            "num_workers": num_workers,
+            "pin_memory": is_cuda,
+        }
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["multiprocessing_context"] = "spawn"
+        loader = DataLoader(dataset, **loader_kwargs)
 
         fused_ok = is_cuda and hasattr(optim.AdamW, "fused") and "fused" in optim.AdamW.__init__.__code__.co_varnames
         optimizer = (
@@ -194,6 +211,17 @@ class NBeatsExpert(ExpertModel):
             scaler.update()
             return loss.detach()
 
+        val_loader = None
+        if len(X_val) > 0:
+            val_dataset = TensorDataset(X_v, y_v)
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=max(1, eff_batch // max(1, world_size)),
+                shuffle=False,
+                num_workers=0,
+                pin_memory=is_cuda,
+            )
+
         for epoch in range(100):
             if time.time() - start > self.max_time_sec:
                 break
@@ -210,7 +238,9 @@ class NBeatsExpert(ExpertModel):
                         graph = torch.cuda.CUDAGraph()
                         _ = _step(static_bx, static_by)
                         torch.cuda.synchronize()
-                        scaler._lazy_init_scale_growth_tracker()
+                        if hasattr(scaler, "_lazy_init_scale_growth_tracker"):
+                            scaler._lazy_init_scale_growth_tracker()
+                        torch.cuda.synchronize()
                         with torch.cuda.graph(graph):
                             _step(static_bx, static_by)
                         logger.info("CUDA Graph captured for NBeats GPU step.")
@@ -225,19 +255,23 @@ class NBeatsExpert(ExpertModel):
                 else:
                     _step(bx, by)
 
-            if len(X_val) > 0:
+            if val_loader is not None:
                 self.model.eval()
                 with torch.no_grad():
-                    # Move val data to GPU in chunks or just handle it if it fits (likely fits if < 2GB)
-                    # But to be safe, we should probably batch it too. For now, we assume X_v fits or we risk OOM.
-                    # Given X_v is 15% of 17GB ~ 2.5GB, it fits easily in 16GB VRAM.
-                    X_v_gpu = X_v.to(self.device)
-                    y_v_gpu = y_v.to(self.device)
-                    val_out = self.model(X_v_gpu)
-                    val_loss = criterion(val_out, y_v_gpu).item()
+                    val_losses = []
+                    for vbx, vby in val_loader:
+                        vbx = vbx.to(self.device, non_blocking=is_cuda)
+                        vby = vby.to(self.device, non_blocking=is_cuda)
+                        val_out = self.model(vbx)
+                        val_losses.append(criterion(val_out, vby).item())
+                        del vbx, vby, val_out
+                    val_loss = float(np.mean(val_losses)) if val_losses else 0.0
                 self.model.train()
                 if early_stopper(val_loss):
                     break
+
+        if is_cuda:
+            torch.cuda.empty_cache()
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         if self.model is None:
@@ -266,7 +300,14 @@ class NBeatsExpert(ExpertModel):
                 target = target._orig_mod
             # Save as standard .pt for compatibility with CPU loader
             torch.save(target.state_dict(), Path(path) / "nbeats.pt")
-            joblib.dump({"input_dim": self.input_dim, "hidden": self.hidden_dim}, Path(path) / "nbeats_meta.pkl")
+            joblib.dump(
+                {
+                    "input_dim": self.input_dim,
+                    "hidden": self.hidden_dim,
+                    "stack_types": self.stack_types,
+                },
+                Path(path) / "nbeats_meta.pkl",
+            )
 
     def load(self, path: str) -> None:
         # GPU loader can just load the standard PT
@@ -276,6 +317,11 @@ class NBeatsExpert(ExpertModel):
             meta = joblib.load(m)
             self.input_dim = meta["input_dim"]
             self.hidden_dim = meta["hidden"]
+            self.stack_types = meta.get("stack_types", self.stack_types)
             self.model = self._build_model()
             target = getattr(self.model, "module", self.model)
-            target.load_state_dict(torch.load(p, map_location=self.device))
+            try:
+                state = torch.load(p, map_location=self.device, weights_only=True)
+            except TypeError as exc:
+                raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
+            target.load_state_dict(state)

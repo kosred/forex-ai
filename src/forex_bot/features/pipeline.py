@@ -274,6 +274,10 @@ class FeatureEngineer:
             cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
         target_tfs = [base_tf] + cfg_tfs
         target_tfs = [tf for tf in dict.fromkeys(target_tfs) if tf in frames]
+        # Include any additional frames we have on disk/runtime (e.g. custom TFs)
+        for tf in frames.keys():
+            if tf not in target_tfs:
+                target_tfs.append(tf)
         if not target_tfs:
             target_tfs = [base_tf] + [tf for tf in frames.keys() if tf != base_tf]
         htf_cols = []
@@ -321,7 +325,7 @@ class FeatureEngineer:
                         subset.columns = [f"{tf_name}_{c}" for c in subset.columns]
                         
                         # Reindex is still heavy, but now we store just the small subset, not the full df
-                        merged = subset.reindex(df.index, method="ffill").fillna(0.0)
+                        merged = subset.reindex(df.index).ffill().fillna(0.0)
                         
                         # Optimization: Downcast to float32 to save RAM
                         merged = merged.astype(np.float32)
@@ -370,7 +374,7 @@ class FeatureEngineer:
                 if len(nf) > 0:
                     if not isinstance(nf.index, pd.DatetimeIndex):
                         nf.index = pd.to_datetime(nf.index, utc=True, errors="coerce")
-                    nf = nf.sort_index().reindex(df.index, method="ffill").fillna(0.0)
+                    nf = nf.sort_index().reindex(df.index).ffill().fillna(0.0)
                     for col in ["news_sentiment", "news_confidence", "news_count", "news_recency_minutes"]:
                         if col in nf.columns:
                             df[col] = nf[col].astype(np.float32)
@@ -845,19 +849,35 @@ class FeatureEngineer:
         low = to_numpy_safe(df["low"].values).astype(np.float64)
         atr = to_numpy_safe(df["atr"].values).astype(np.float64)
         sigs = to_numpy_safe(base_signals.values).astype(np.int8)
-        
+
+        dist = None
+        stop_mode = str(getattr(self.settings.risk, "stop_target_mode", "blend")).lower()
+        if stop_mode in {"blend", "auto"}:
+            try:
+                from ..strategy.stop_target import compute_stop_distance_series
+
+                dist = compute_stop_distance_series(df, settings=self.settings)
+            except Exception as exc:
+                logger.debug(f"Stop-target distance series unavailable: {exc}")
+
+        atr_used = atr
+        stop_mult = float(self.settings.risk.atr_stop_multiplier)
+        if dist is not None:
+            atr_used = to_numpy_safe(dist).astype(np.float64)
+            stop_mult = 1.0
+
         labels_arr = compute_meta_labels_atr_numba(
             close,
             high,
             low,
-            atr,
+            atr_used,
             sigs,
             int(self.settings.risk.meta_label_max_hold_bars),
-            float(self.settings.risk.atr_stop_multiplier),
+            stop_mult,
             float(self.settings.risk.min_risk_reward),
-            0.0005,
-            0.0020,
-            0.0040,
+            float(getattr(self.settings.risk, "meta_label_min_dist", 0.0005)),
+            float(getattr(self.settings.risk, "meta_label_fixed_sl", 0.0020)),
+            float(getattr(self.settings.risk, "meta_label_fixed_tp", 0.0040)),
         )
         return pd.Series(labels_arr, index=df.index)
 
@@ -919,7 +939,7 @@ class FeatureEngineer:
                 genes_data = data.get("best_genes", [])
                 
                 if genes_data:
-                    mixer = TALibStrategyMixer()
+                    mixer = TALibStrategyMixer(use_volume_features=self.use_volume_features)
                     all_signals = []
                     genes = [GeneFactory.from_dict(g) for g in genes_data]
                     cache = mixer.bulk_calculate_indicators(df, genes)

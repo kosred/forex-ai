@@ -26,6 +26,8 @@ system:
   cache_enabled: true
   cache_dir: cache
   cache_max_age_minutes: 0
+  deep_purge_mode: off  # off | cache | all
+  deep_purge_on_train: true
   # Hardware is detected automatically (CPU/GPU/RAM)
   # Set preference to "auto", "true" (force GPU), or "false" (force CPU)
   enable_gpu_preference: auto
@@ -72,10 +74,32 @@ risk:
   conformal_alpha: 0.10
   volatility_stop_sigma: 0.02
   volatility_lookback: 50
-  meta_label_tp_pips: 20.0
-  meta_label_sl_pips: 20.0
+  meta_label_tp_pips: null
+  meta_label_sl_pips: null
   meta_label_max_hold_bars: 100
   meta_label_min_prob_threshold: 0.55
+  meta_label_min_dist: 0.0005
+  meta_label_fixed_sl: 0.0020
+  meta_label_fixed_tp: 0.0040
+  # Stop/target engine (unsupervised blend of volatility + tail risk)
+  stop_target_mode: blend
+  vol_estimator: yang_zhang
+  vol_window: 50
+  vol_horizon_bars: 5
+  tail_window: 100
+  tail_alpha: 0.975
+  tail_step: 5
+  tail_max_bars: 300000
+  stop_k_vol: 1.0
+  stop_k_tail: 1.25
+  rr_trend: 2.5
+  rr_range: 1.5
+  rr_neutral: 2.0
+  regime_adx_trend: 25.0
+  regime_adx_range: 20.0
+  hurst_window: 100
+  hurst_trend: 0.55
+  hurst_range: 0.45
 
 models:
   ml_models: [lightgbm, xgboost, catboost, random_forest, extra_trees]

@@ -17,11 +17,49 @@ import sys
 import subprocess
 from pathlib import Path
 
+def _is_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ensure_global_python() -> None:
+    """Enforce global Python (no venv/conda) to avoid stale env junk."""
+    in_venv = bool(os.environ.get("VIRTUAL_ENV")) or (
+        hasattr(sys, "real_prefix") or sys.base_prefix != sys.prefix
+    )
+    if not in_venv:
+        return
+    if _is_truthy(os.environ.get("FOREX_BOT_ALLOW_VENV")):
+        return
+    if _is_truthy(os.environ.get("FOREX_BOT_VENV_REEXEC")):
+        print("[FATAL] Virtual env detected and re-exec already attempted.")
+        print("        Please run with global/system Python (no .venv).")
+        raise SystemExit(2)
+
+    base_prefix = Path(sys.base_prefix)
+    if os.name == "nt":
+        candidates = [base_prefix / "python.exe"]
+    else:
+        candidates = [base_prefix / "bin" / "python3", base_prefix / "bin" / "python"]
+
+    base_python = next((p for p in candidates if p.exists()), None)
+    if base_python is None:
+        print("[FATAL] Virtual env detected but global Python not found.")
+        print("        Please run with system Python or set FOREX_BOT_ALLOW_VENV=1.")
+        raise SystemExit(2)
+
+    # Prevent infinite recursion and re-exec using the base interpreter.
+    os.environ["FOREX_BOT_VENV_REEXEC"] = "1"
+    print(f"[INIT] Virtual env detected. Re-launching with {base_python}...")
+    os.execv(str(base_python), [str(base_python), *sys.argv])
+
+
 # --- 1. Path & Environment Bootstrap ---
 # 2025 ANTI-VENV POLICY: Purge environment variables that force virtual environments
 for env_var in ["VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"]:
     if env_var in os.environ:
         del os.environ[env_var]
+
+_ensure_global_python()
 
 # Fix Python path for direct execution from source tree
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -109,11 +147,7 @@ if __name__ == "__main__":
             threads_per_worker = max(2, min(16, cpu_cores // max(1, gpu_count)))
             os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(threads_per_worker))
             
-            # Feature Workers: Scale with CPU cores but cap to avoid OOM
-            if not os.environ.get("FEATURE_WORKERS"):
-                # A4000/A6000 nodes usually have high core counts
-                rec_workers = max(1, min(32, cpu_cores // 2))
-                os.environ["FEATURE_WORKERS"] = str(rec_workers)
+            # Feature workers are auto-tuned later in core.system.AutoTuner.
 
             # Auto-DDP: If > 1 GPU and running on Linux, relaunch with torchrun
             # We skip this if already launched or on Windows (DDP issues)

@@ -252,9 +252,12 @@ def maybe_init_distributed(force: bool = False) -> str | None:
 
     rank, local_rank, world_size = _ddp_env()
     if world_size > 1 or force:
+        if rank < 0:
+            logger.error("RANK environment variable not set for DDP; skipping init.")
+            return None
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         try:
-            dist.init_process_group(backend=backend, init_method="env://", world_size=world_size, rank=max(rank, 0))
+            dist.init_process_group(backend=backend, init_method="env://", world_size=world_size, rank=rank)
             if local_rank >= 0 and torch.cuda.is_available():
                 torch.cuda.set_device(local_rank)
                 return f"cuda:{local_rank}"

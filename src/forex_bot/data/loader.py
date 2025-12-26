@@ -70,22 +70,25 @@ class MT5Adapter:
         self.connection = self._Connection()
 
     class _Connection:
+        async def _call(self, func, *args, **kwargs):
+            return await asyncio.to_thread(func, *args, **kwargs)
+
         async def get_account_information(self) -> dict:
             if MT5 is None:
                 return {}
-            info = MT5.account_info()
+            info = await self._call(MT5.account_info)
             return info._asdict() if info else {}
 
         async def positions_get(self) -> list[dict]:
             if MT5 is None:
                 return []
-            positions = MT5.positions_get()
+            positions = await self._call(MT5.positions_get)
             return [p._asdict() for p in positions] if positions else []
 
         async def close_position(self, symbol: str) -> None:
             if MT5 is None:
                 return
-            positions = MT5.positions_get(symbol=symbol)
+            positions = await self._call(MT5.positions_get, symbol=symbol)
             if positions:
                 for p in positions:
                     req = {
@@ -99,14 +102,14 @@ class MT5Adapter:
                         "type_time": MT5.ORDER_TIME_GTC,
                         "type_filling": MT5.ORDER_FILLING_IOC,
                     }
-                    MT5.order_send(req)
+                    await self._call(MT5.order_send, req)
 
         async def close_position_by_ticket(self, ticket: int, symbol: str, volume: float | None = None) -> dict:
             if MT5 is None:
                 return {"retcode": -1, "comment": "MT5 unavailable"}
             try:
                 # Prefer the native MT5 close API when available
-                positions = MT5.positions_get(symbol=symbol)
+                positions = await self._call(MT5.positions_get, symbol=symbol)
                 target = None
                 if positions:
                     for p in positions:
@@ -127,7 +130,7 @@ class MT5Adapter:
                     "type_time": MT5.ORDER_TIME_GTC,
                     "type_filling": MT5.ORDER_FILLING_IOC,
                 }
-                res = MT5.order_send(req)
+                res = await self._call(MT5.order_send, req)
                 return res._asdict() if res else {"retcode": -1, "comment": "order_send returned None"}
             except Exception as exc:
                 return {"retcode": -1, "comment": f"close failed: {exc}"}
@@ -135,7 +138,7 @@ class MT5Adapter:
         async def get_symbol_price(self, symbol: str) -> dict:
             if MT5 is None:
                 return {}
-            tick = MT5.symbol_info_tick(symbol)
+            tick = await self._call(MT5.symbol_info_tick, symbol)
             return {"bid": tick.bid, "ask": tick.ask} if tick else {}
 
         async def history_deals_total(self, from_timestamp: int, to_timestamp: int) -> int:
@@ -143,14 +146,14 @@ class MT5Adapter:
             if MT5 is None:
                 return 0
             try:
-                return MT5.history_deals_total(from_timestamp, to_timestamp) or 0
+                return await self._call(MT5.history_deals_total, from_timestamp, to_timestamp) or 0
             except Exception:
                 return 0
 
         async def get_symbol_info(self, symbol: str) -> dict:
             if MT5 is None:
                 return {}
-            info = MT5.symbol_info(symbol)
+            info = await self._call(MT5.symbol_info, symbol)
             return info._asdict() if info else {}
 
         async def create_market_buy_order(
@@ -173,7 +176,7 @@ class MT5Adapter:
                     req["magic"] = kwargs.get("magic")
                 if "comment" in kwargs:
                     req["comment"] = kwargs.get("comment")
-                res = MT5.order_send(req)
+                res = await self._call(MT5.order_send, req)
                 return res._asdict() if res else {"retcode": -1, "comment": "order_send returned None"}
             except Exception as exc:
                 return {"retcode": -1, "comment": f"buy order failed: {exc}"}
@@ -198,7 +201,7 @@ class MT5Adapter:
                     req["magic"] = kwargs.get("magic")
                 if "comment" in kwargs:
                     req["comment"] = kwargs.get("comment")
-                res = MT5.order_send(req)
+                res = await self._call(MT5.order_send, req)
                 return res._asdict() if res else {"retcode": -1, "comment": "order_send returned None"}
             except Exception as exc:
                 return {"retcode": -1, "comment": f"sell order failed: {exc}"}
@@ -212,11 +215,11 @@ class MT5Adapter:
             """
             if MT5 is None:
                 return 0
-            positions = MT5.positions_get(symbol=symbol)
+            positions = await self._call(MT5.positions_get, symbol=symbol)
             if not positions:
                 return 0
             updated = 0
-            tick = MT5.symbol_info_tick(symbol)
+            tick = await self._call(MT5.symbol_info_tick, symbol)
             if not tick:
                 return 0
             bid = float(tick.bid)
@@ -238,7 +241,7 @@ class MT5Adapter:
                                 "sl": desired_sl,
                                 "tp": pos.tp,
                             }
-                            result = MT5.order_send(req)
+                            result = await self._call(MT5.order_send, req)
                             if result and result.retcode == MT5.TRADE_RETCODE_DONE:
                                 updated += 1
                     else:
@@ -251,7 +254,7 @@ class MT5Adapter:
                                 "sl": desired_sl,
                                 "tp": pos.tp,
                             }
-                            result = MT5.order_send(req)
+                            result = await self._call(MT5.order_send, req)
                             if result and result.retcode == MT5.TRADE_RETCODE_DONE:
                                 updated += 1
                 except Exception:
@@ -263,7 +266,7 @@ class MT5Adapter:
             if MT5 is None:
                 return []
             try:
-                deals = MT5.history_deals_get(from_timestamp, to_timestamp)
+                deals = await self._call(MT5.history_deals_get, from_timestamp, to_timestamp)
                 if not deals:
                     return []
                 return [d._asdict() for d in deals]
@@ -279,11 +282,17 @@ class DataLoader:
         self.mt5_adapter = MT5Adapter(settings)
         self._connected = False
         self._mt5_shared = False
-        self.required_tfs = list(dict.fromkeys(MANDATORY_TFS + self.settings.system.required_timeframes))
+        cfg_required = list(getattr(self.settings.system, "required_timeframes", []) or [])
+        cfg_higher = list(getattr(self.settings.system, "higher_timeframes", []) or [])
+        cfg_base = [getattr(self.settings.system, "base_timeframe", "M1")]
+        self.required_tfs = list(dict.fromkeys(MANDATORY_TFS + cfg_required + cfg_higher + cfg_base))
         # Optional in-memory cache for training frames; guarded by size limit to avoid OOM.
         self.cache_training_frames = bool(getattr(settings.system, "cache_training_frames", False))
         self.training_cache_max_bytes = int(getattr(settings.system, "training_cache_max_bytes", 2_000_000_000))
         self._training_frames_cache: dict[str, dict[str, pd.DataFrame]] = {}
+
+    async def _mt5_call(self, func, *args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
 
     async def connect(self) -> bool:
         if not self.settings.system.mt5_required:
@@ -330,17 +339,20 @@ class DataLoader:
                 try:
                     if attempt > 1:
                         try:
-                            MT5.shutdown()
+                            await self._mt5_call(MT5.shutdown)
                         except Exception:
                             pass
                         await asyncio.sleep(0.5 * attempt)
 
-                    ok = MT5.initialize(terminal_path) if terminal_path else MT5.initialize()
+                    if terminal_path:
+                        ok = await self._mt5_call(MT5.initialize, terminal_path)
+                    else:
+                        ok = await self._mt5_call(MT5.initialize)
                 except Exception as exc:
                     ok = False
                     err = f"initialize raised: {exc!r}"
                 else:
-                    err = MT5.last_error()
+                    err = await self._mt5_call(MT5.last_error)
                 last_err = err
 
                 if ok:
@@ -394,11 +406,11 @@ class DataLoader:
         password = self.settings.system.mt5_password
         server = self.settings.system.mt5_server
         if login and password and server:
-            authorized = MT5.login(login, password=password, server=server)
+            authorized = await self._mt5_call(MT5.login, login, password=password, server=server)
             if not authorized:
-                logger.error(f"MT5 login failed: {_format_mt5_error(MT5.last_error())}")
+                logger.error(f"MT5 login failed: {_format_mt5_error(await self._mt5_call(MT5.last_error))}")
                 try:
-                    MT5.shutdown()
+                    await self._mt5_call(MT5.shutdown)
                 except Exception:
                     pass
                 return False
@@ -414,15 +426,15 @@ class DataLoader:
 
         try:
             ref_symbol = self.settings.system.symbol or "EURUSD"
-            if not MT5.symbol_select(ref_symbol, True):
-                infos = MT5.symbols_get()
+            if not await self._mt5_call(MT5.symbol_select, ref_symbol, True):
+                infos = await self._mt5_call(MT5.symbols_get)
                 if infos and len(infos) > 0:
                     ref_symbol = infos[0].name
                 else:
                     logger.error("No MT5 symbols available for broker offset detection")
                     return 0
 
-            tick = MT5.symbol_info_tick(ref_symbol)
+            tick = await self._mt5_call(MT5.symbol_info_tick, ref_symbol)
             if tick:
                 server_ts = datetime.fromtimestamp(tick.time, tz=UTC)
                 now_utc = datetime.now(UTC)
@@ -468,7 +480,7 @@ class DataLoader:
                 _MT5_GLOBAL_REFCOUNT = max(0, int(_MT5_GLOBAL_REFCOUNT) - 1)
                 if _MT5_GLOBAL_REFCOUNT == 0 and _MT5_GLOBAL_CONNECTED:
                     try:
-                        MT5.shutdown()
+                        await self._mt5_call(MT5.shutdown)
                     except Exception as exc:
                         logger.warning(f"MT5 shutdown failed: {exc!r}")
                     _MT5_GLOBAL_CONNECTED = False
@@ -587,7 +599,7 @@ class DataLoader:
                     if self._connected:
                         logger.info("Fetching available symbols from MT5...")
                         try:
-                            info = MT5.symbols_get()
+                            info = await self._mt5_call(MT5.symbols_get)
                             available = [getattr(s, "name", "") for s in info if getattr(s, "name", "")] if info else []
                             if available:
                                 selection = await self.prompt_symbol_selection(available)
@@ -626,7 +638,7 @@ class DataLoader:
         """Download M1 data from MT5."""
         if MT5 is None:
             return None
-        if not MT5.symbol_select(symbol, True):
+        if not await self._mt5_call(MT5.symbol_select, symbol, True):
             logger.error(f"Symbol {symbol} not found in MT5.")
             return None
 
@@ -635,10 +647,10 @@ class DataLoader:
         start_date = end_date - timedelta(days=365 * years)
 
         logger.info(f"Downloading M1 history for {symbol} from {start_date.date()}...")
-        rates = MT5.copy_rates_range(symbol, MT5.TIMEFRAME_M1, start_date, end_date)
+        rates = await self._mt5_call(MT5.copy_rates_range, symbol, MT5.TIMEFRAME_M1, start_date, end_date)
 
         if rates is None or len(rates) == 0:
-            logger.error(f"MT5 download failed for {symbol}: {MT5.last_error()}")
+            logger.error(f"MT5 download failed for {symbol}: {await self._mt5_call(MT5.last_error)}")
             return None
 
         df = pd.DataFrame(rates)
@@ -740,7 +752,12 @@ class DataLoader:
                 return cached
 
         frames: dict[str, pd.DataFrame] = {}
-        tfs = [self.settings.system.base_timeframe] + self.settings.system.higher_timeframes + ["M1"]
+        tfs = (
+            [self.settings.system.base_timeframe]
+            + self.settings.system.higher_timeframes
+            + self.settings.system.required_timeframes
+            + ["M1"]
+        )
         tfs = list(dict.fromkeys(tfs))  # dedupe while preserving order
 
         for tf in tfs:
@@ -843,7 +860,7 @@ class DataLoader:
                 continue
             # Use only fully closed candles for feature stability (avoid "repainting" on the forming bar).
             # In MT5, start_pos=0 is the current forming candle; start_pos=1 is the last closed candle.
-            rates = MT5.copy_rates_from_pos(symbol, mt5_tf, 1, lookback)
+            rates = await self._mt5_call(MT5.copy_rates_from_pos, symbol, mt5_tf, 1, lookback)
             if rates is not None and len(rates) > 0:
                 df = pd.DataFrame(rates)
                 df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)

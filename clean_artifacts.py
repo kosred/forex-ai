@@ -112,6 +112,53 @@ def clean_artifacts(
     return 0
 
 
+def deep_purge(*, mode: str = "cache") -> int:
+    """
+    Deep purge generated artifacts to avoid data leakage between runs.
+
+    mode:
+      - "cache": wipe cache/logs/tool caches + __pycache__ + sqlite/pkl in cache/root
+      - "all": everything in "cache" plus models and all sqlite/pkl under project
+    """
+    mode = str(mode or "cache").strip().lower()
+    if mode not in {"cache", "all"}:
+        print(f"[SKIP] Unknown deep purge mode: {mode}")
+        return 0
+
+    # Base cleanup (safe directories only).
+    clean_artifacts(
+        cache=True,
+        models=(mode == "all"),
+        ruff_cache=True,
+        pytest_cache=True,
+        catboost_info=True,
+        logs=True,
+        pycache=True,
+    )
+
+    root = _project_root()
+
+    def _purge_ext(root_dir: Path, exts: set[str]) -> None:
+        if not root_dir.exists():
+            return
+        for p in root_dir.rglob("*"):
+            if p.is_file() and p.suffix.lower() in exts:
+                _safe_unlink(p)
+
+    # Always drop sqlite/pkl in cache dir if it exists.
+    _purge_ext(root / "cache", {".pkl", ".sqlite", ".pyc"})
+
+    # Remove top-level sqlite files (metrics, ledgers) to avoid stale state.
+    for name in ("metrics.sqlite", "strategy_ledger.sqlite"):
+        _safe_unlink(root / name)
+
+    if mode == "all":
+        _purge_ext(root, {".pkl", ".sqlite", ".pyc"})
+
+    print("[OK] Deep purge complete.")
+    return 0
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Safely delete generated artifacts (cache/models/logs) in this project."

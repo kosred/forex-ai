@@ -410,6 +410,9 @@ class RiskManager:
         self._update_monthly_metrics(equity)
         self._update_recovery_state(equity)
 
+        if self.monthly_target_hit:
+            return False, "Monthly profit target reached"
+
         if self.reflection_mode:
             if self.reflection_cooldown_until and timestamp < self.reflection_cooldown_until:
                 return False, "reflection_mode_cooldown"

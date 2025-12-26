@@ -92,6 +92,41 @@ class GeneticStrategyEvolution:
         self.best_gene: GeneticGene | None = None
         self.mixer = mixer
 
+    def _indicator_pool(self) -> list[str]:
+        if self.mixer and self.mixer.available_indicators:
+            return list(self.mixer.available_indicators)
+        return ALL_INDICATORS
+
+    def _random_params_for(self, indicator: str) -> dict[str, Any]:
+        if not self.mixer:
+            return {}
+        try:
+            from talib import abstract
+
+            info = abstract.Function(indicator).info
+            default_params = info.get("parameters", {})
+            return self.mixer._randomize_indicator_params(indicator, default_params)
+        except Exception:
+            return {}
+
+    def _sync_indicator_maps(self, gene: GeneticGene) -> None:
+        if gene.params is None:
+            gene.params = {}
+        if gene.weights is None:
+            gene.weights = {}
+        for ind in gene.indicators:
+            if ind not in gene.params:
+                gene.params[ind] = self._random_params_for(ind)
+            if ind not in gene.weights:
+                gene.weights[ind] = random.random()
+        # Remove stale entries
+        for ind in list(gene.params.keys()):
+            if ind not in gene.indicators:
+                gene.params.pop(ind, None)
+        for ind in list(gene.weights.keys()):
+            if ind not in gene.indicators:
+                gene.weights.pop(ind, None)
+
     def initialize_population(self, regime: str = "any", validation_data: pd.DataFrame | None = None) -> None:
         if not self.mixer:
             raise ValueError("TALibStrategyMixer must be provided to GeneticStrategyEvolution")
@@ -141,9 +176,11 @@ class GeneticStrategyEvolution:
             # Enforce a minimum of 4 confluences (indicators)
             if len(gene.indicators) < 4:
                 missing = 4 - len(gene.indicators)
-                available_inds = [ind for ind in ALL_INDICATORS if ind not in gene.indicators]
+                pool = self._indicator_pool()
+                available_inds = [ind for ind in pool if ind not in gene.indicators]
                 if available_inds:
                     gene.indicators.extend(random.sample(available_inds, k=min(missing, len(available_inds))))
+            self._sync_indicator_maps(gene)
 
             if gauntlet:
                 if gauntlet.run(gene):
@@ -378,11 +415,14 @@ class GeneticStrategyEvolution:
         # Ensure minimum confluences after crossover
         if len(child_dict["indicators"]) < 4:
             missing = 4 - len(child_dict["indicators"])
-            available_inds = [ind for ind in ALL_INDICATORS if ind not in child_dict["indicators"]]
+            pool = self._indicator_pool()
+            available_inds = [ind for ind in pool if ind not in child_dict["indicators"]]
             if available_inds:
                 child_dict["indicators"].extend(random.sample(available_inds, k=min(missing, len(available_inds))))
 
-        return GeneticGene(**child_dict)
+        child = GeneticGene(**child_dict)
+        self._sync_indicator_maps(child)
+        return child
 
     def _mutate(self, gene: GeneticGene) -> GeneticGene:
         mutated_gene = GeneticGene(**asdict(gene))
@@ -428,17 +468,21 @@ class GeneticStrategyEvolution:
             if random.random() < 0.5 and gene.indicators:
                 mutated_gene.indicators.pop(random.randrange(len(gene.indicators)))
             else:
-                available_inds = [ind for ind in ALL_INDICATORS if ind not in gene.indicators]
+                pool = self._indicator_pool()
+                available_inds = [ind for ind in pool if ind not in gene.indicators]
                 if available_inds:
                     mutated_gene.indicators.append(random.choice(available_inds))
             if not mutated_gene.indicators:
-                mutated_gene.indicators.append(random.choice(ALL_INDICATORS))
+                pool = self._indicator_pool()
+                mutated_gene.indicators.append(random.choice(pool))
             # Enforce minimum confluences
             if len(mutated_gene.indicators) < 4:
                 missing = 4 - len(mutated_gene.indicators)
-                available_inds = [ind for ind in ALL_INDICATORS if ind not in mutated_gene.indicators]
+                pool = self._indicator_pool()
+                available_inds = [ind for ind in pool if ind not in mutated_gene.indicators]
                 if available_inds:
                     mutated_gene.indicators.extend(random.sample(available_inds, k=min(missing, len(available_inds))))
+            self._sync_indicator_maps(mutated_gene)
 
         elif mutation_type == "params" and gene.indicators:
             target_ind = random.choice(gene.indicators)

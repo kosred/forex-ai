@@ -105,6 +105,26 @@ class GenesisLibrary:
         - 20% Institutional Flow
         - 20% Pure Random (Novelty Search)
         """
+        def _sanitize_volume(gene: TALibStrategyGene) -> TALibStrategyGene:
+            if getattr(mixer, "use_volume_features", False):
+                return gene
+            vol_inds = set(getattr(mixer, "_volume_indicators", set()))
+            if not vol_inds:
+                return gene
+            gene.indicators = [ind for ind in gene.indicators if ind not in vol_inds]
+            for ind in list(getattr(gene, "params", {}).keys()):
+                if ind in vol_inds:
+                    gene.params.pop(ind, None)
+            for ind in list(getattr(gene, "weights", {}).keys()):
+                if ind in vol_inds:
+                    gene.weights.pop(ind, None)
+            # Ensure minimum confluences
+            if len(gene.indicators) < 4:
+                pool = [ind for ind in mixer.available_indicators if ind not in vol_inds]
+                missing = 4 - len(gene.indicators)
+                if pool:
+                    gene.indicators.extend(random.sample(pool, k=min(missing, len(pool))))
+            return gene
         pop = []
 
         counts = {
@@ -118,20 +138,20 @@ class GenesisLibrary:
             clone = TALibStrategyGene(**asdict(base))
             clone.strategy_id = f"gen_trend_{random.randint(1000, 9999)}"
             clone.tp_pips *= random.uniform(0.9, 1.1)
-            pop.append(clone)
+            pop.append(_sanitize_volume(clone))
 
         base = GenesisLibrary.get_mean_reversion_archetype()
         for _ in range(counts["mean_rev"]):
             clone = TALibStrategyGene(**asdict(base))
             clone.strategy_id = f"gen_mean_{random.randint(1000, 9999)}"
             clone.sl_pips *= random.uniform(0.9, 1.1)
-            pop.append(clone)
+            pop.append(_sanitize_volume(clone))
 
         base = GenesisLibrary.get_institutional_flow_archetype()
         for _ in range(counts["inst_flow"]):
             clone = TALibStrategyGene(**asdict(base))
             clone.strategy_id = f"gen_flow_{random.randint(1000, 9999)}"
-            pop.append(clone)
+            pop.append(_sanitize_volume(clone))
 
         remaining = population_size - len(pop)
         for _ in range(remaining):

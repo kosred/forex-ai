@@ -1,8 +1,10 @@
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 import pandas as pd
 
 from .base import ExpertModel
@@ -16,10 +18,17 @@ TabNetClassifier = None  # type: ignore
 def _try_import_tabnet() -> tuple[Any, Any] | tuple[None, None]:
     try:
         from pytorch_tabnet.tab_model import TabNetClassifier as _TabNetClassifier
-        from pytorch_tabnet.callbacks import Callback
-        return _TabNetClassifier, Callback
-    except Exception:
+    except Exception as exc:
+        logger.error(f"Failed to import TabNetClassifier: {exc}")
         return None, None
+
+    try:
+        from pytorch_tabnet.callbacks import Callback
+    except Exception as exc:
+        logger.warning(f"TabNet callbacks unavailable: {exc}. Time-limit callback disabled.")
+        Callback = None
+
+    return _TabNetClassifier, Callback
 
 
 class TabNetExpert(ExpertModel):
@@ -111,10 +120,14 @@ class TabNetExpert(ExpertModel):
         if self.model is None:
             self.model = tabnet_cls(device_name=device_name, verbose=0, **self.hyperparams)
 
+        y_vals = y.to_numpy()
+        if not np.all(np.isin(y_vals, [-1, 0, 1])):
+            raise ValueError(f"Labels must be in {{-1, 0, 1}}, got: {np.unique(y_vals)}")
+
         x = X.to_numpy(dtype=np.float32, copy=False)
         if not x.flags.writeable:
             x = x.copy()
-        y_arr = y.to_numpy(dtype=int, copy=False)
+        y_arr = y_vals.astype(int, copy=False)
 
         split = int(len(x) * 0.85)
         split = max(0, min(len(x), split))
@@ -132,28 +145,41 @@ class TabNetExpert(ExpertModel):
                 super().__init__()
                 self.limit_sec = limit_sec
                 self.start_time = time.time()
-            
+
             def on_epoch_end(self, epoch, logs=None):
                 if (time.time() - self.start_time) > self.limit_sec:
                     logger.info(f"TabNet stopping early due to time limit ({self.limit_sec}s)")
-                    self.trainer.max_epochs = 0 # Force stop
+                    if hasattr(self, "trainer") and self.trainer is not None:
+                        self.trainer.max_epochs = epoch
+                    raise KeyboardInterrupt("TabNet time limit reached")
 
-        callbacks = [TimeLimitCallback(self.max_time_sec)]
+        callbacks = []
+        if callback_cls is not None:
+            callbacks = [TimeLimitCallback(self.max_time_sec)]
+        else:
+            logger.warning("TabNet callbacks unavailable; time-limit enforcement disabled.")
 
-        self.model.fit(
-            X_train=x_train,
-            y_train=y_train,
-            eval_set=[(x_val, y_val)] if len(x_val) else [(x_train, y_train)],
-            eval_name=["val"] if len(x_val) else ["train"],
-            eval_metric=["logloss"],
-            max_epochs=max_epochs,
-            patience=patience,
-            batch_size=self.batch_size,
-            virtual_batch_size=min(self.batch_size, 128),
-            num_workers=0,
-            drop_last=False,
-            callbacks=callbacks
-        )
+        num_workers = min(os.cpu_count() or 4, 8) if device_name == "cuda" else 0
+        try:
+            self.model.fit(
+                X_train=x_train,
+                y_train=y_train,
+                eval_set=[(x_val, y_val)] if len(x_val) else [(x_train, y_train)],
+                eval_name=["val"] if len(x_val) else ["train"],
+                eval_metric=["logloss"],
+                max_epochs=max_epochs,
+                patience=patience,
+                batch_size=self.batch_size,
+                virtual_batch_size=min(self.batch_size, 128),
+                num_workers=num_workers,
+                drop_last=False,
+                callbacks=callbacks,
+            )
+        except KeyboardInterrupt:
+            logger.info("TabNet training stopped due to time limit.")
+
+        if str(self.device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         if self.model is None:

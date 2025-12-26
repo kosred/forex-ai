@@ -13,6 +13,7 @@ import torch.distributed as dist
 from ..core.config import Settings
 from ..features.talib_mixer import TALIB_AVAILABLE, TALibStrategyMixer
 from .fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+from .stop_target import infer_stop_target_pips
 from .genetic import GeneticGene, GeneticStrategyEvolution
 
 logger = logging.getLogger(__name__)
@@ -64,7 +65,10 @@ class PropAwareStrategySearch:
             self._month_indices = np.zeros(len(self.df), dtype=np.int64)
         self.checkpoint_path = checkpoint_path
         self.max_time_hours = max_time_hours
-        self.mixer = TALibStrategyMixer(device=getattr(settings.system, "device", "cpu"))
+        self.mixer = TALibStrategyMixer(
+            device=getattr(settings.system, "device", "cpu"),
+            use_volume_features=bool(getattr(settings.system, "use_volume_features", False)),
+        )
         self.evolver = GeneticStrategyEvolution(
             population_size=population, mutation_rate=mutation_rate, mixer=self.mixer
         )
@@ -173,6 +177,11 @@ class PropAwareStrategySearch:
         spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
         commission = float(getattr(self.settings.risk, "commission_per_lot", 7.0))
         pip_size, pip_value_per_lot = infer_pip_metrics(self.symbol)
+        mode = str(getattr(self.settings.risk, "stop_target_mode", "blend") or "blend").lower()
+        if mode not in {"fixed", "gene"}:
+            res = infer_stop_target_pips(self.df, settings=self.settings, pip_size=pip_size)
+            if res is not None:
+                sl_pips, tp_pips, _rr = res
         metrics = fast_evaluate_strategy(
             close_prices=close,
             high_prices=high,

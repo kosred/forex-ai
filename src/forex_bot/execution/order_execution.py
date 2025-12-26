@@ -9,6 +9,7 @@ from ..core.config import Settings
 from ..core.storage import RiskLedger, StrategyLedger
 from ..execution.mt5_state_manager import MT5StateManager
 from ..execution.risk import RiskManager
+from ..strategy.stop_target import infer_stop_target_pips
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class OrderExecutor:
         self.mt5 = mt5_manager
         self.strategy_ledger = strategy_ledger
         self.risk_ledger = risk_ledger
+        self._last_rr: float | None = None
 
     async def close_position(self, ticket: int, volume: float, reason: str | None = None) -> None:
         """
@@ -98,19 +100,24 @@ class OrderExecutor:
         if sl is None or tp is None:
             return
 
-        base_df = frames[self.settings.system.base_timeframe]
-        try:
-            if "timestamp" in getattr(base_df, "columns", []):
-                current_bar_time = base_df["timestamp"].iloc[-1]
-            else:
-                current_bar_time = base_df.index[-1]
-            # Normalize to python datetime where possible
-            if hasattr(current_bar_time, "to_pydatetime"):
-                current_bar_time = current_bar_time.to_pydatetime()
-            if isinstance(current_bar_time, str):
-                current_bar_time = datetime.fromisoformat(current_bar_time)
-        except Exception:
+        base_df = frames.get(self.settings.system.base_timeframe)
+        if base_df is None:
+            base_df = frames.get("M1")
+        if base_df is None or getattr(base_df, "empty", True):
             current_bar_time = datetime.now(UTC)
+        else:
+            try:
+                if "timestamp" in getattr(base_df, "columns", []):
+                    current_bar_time = base_df["timestamp"].iloc[-1]
+                else:
+                    current_bar_time = base_df.index[-1]
+                # Normalize to python datetime where possible
+                if hasattr(current_bar_time, "to_pydatetime"):
+                    current_bar_time = current_bar_time.to_pydatetime()
+                if isinstance(current_bar_time, str):
+                    current_bar_time = datetime.fromisoformat(current_bar_time)
+            except Exception:
+                current_bar_time = datetime.now(UTC)
         order_type = "buy" if signal_result.signal == 1 else "sell"
 
         logger.info(f"Executing {order_type.upper()} {size} lots (SL={sl:.5f}, TP={tp:.5f})...")
@@ -187,29 +194,60 @@ class OrderExecutor:
         if result.recommended_sl is not None:
             try:
                 val = float(result.recommended_sl.iloc[-1])
-                if val > 0:
+                if val > 0 and np.isfinite(val):
+                    self._last_rr = None
                     return val
             except Exception as e:
                 logger.debug(f"Could not extract recommended_sl: {e}")
 
         # Fallback to ATR
         try:
-            base_df = frames[self.settings.system.base_timeframe]
+            base_df = frames.get(self.settings.system.base_timeframe)
+            if base_df is None:
+                base_df = frames.get("M1")
+            if base_df is None or base_df.empty:
+                raise RuntimeError("Missing base timeframe data for ATR SL")
             atr = base_df["atr"].iloc[-1] if "atr" in base_df.columns else None
             pip_size = self._get_pip_size()
 
             if atr and atr > 0:
-                return max(5.0, float((atr * 1.5) / pip_size))
+                atr_mult = float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5))
+                min_dist = float(getattr(self.settings.risk, "meta_label_min_dist", 0.0))
+                dist = float(atr) * max(atr_mult, 0.0)
+                if min_dist > 0:
+                    dist = max(dist, min_dist)
+                if dist > 0:
+                    self._last_rr = None
+                    return float(dist / pip_size)
         except Exception as e:
             logger.debug(f"ATR-based SL calculation failed: {e}")
 
-        return 20.0  # Ultimate fallback
+        # Blend stop engine (range-vol + tail risk)
+        try:
+            base_df = frames.get(self.settings.system.base_timeframe)
+            if base_df is None:
+                base_df = frames.get("M1")
+            if base_df is None or base_df.empty:
+                raise RuntimeError("Missing base timeframe data for stop engine")
+            res = infer_stop_target_pips(base_df, settings=self.settings, pip_size=self._get_pip_size())
+            if res is not None:
+                sl_pips, _tp_pips, rr = res
+                self._last_rr = rr
+                return sl_pips
+        except Exception as e:
+            logger.debug(f"Stop-target engine failed: {e}")
+
+        return None
 
     def _calculate_prices(
         self, result, frames, sl_pips, info, tick_price: dict[str, float]
     ) -> tuple[float, float] | tuple[None, None]:
         try:
-            base_df = frames[self.settings.system.base_timeframe]
+            base_df = frames.get(self.settings.system.base_timeframe)
+            if base_df is None:
+                base_df = frames.get("M1")
+            if base_df is None or base_df.empty:
+                raise RuntimeError("Missing base timeframe data for price calc")
             close_price = float(base_df["close"].iloc[-1])
             bid = float(tick_price.get("bid", 0.0) or 0.0)
             ask = float(tick_price.get("ask", 0.0) or 0.0)
@@ -222,12 +260,22 @@ class OrderExecutor:
             pip_size = self._get_pip_size(info)
             sl_dist = sl_pips * pip_size
 
-            rr = 2.0
+            rr = None
             if result.recommended_rr is not None:
                 try:
-                    rr = float(result.recommended_rr.iloc[-1])
+                    val = float(result.recommended_rr.iloc[-1])
+                    if val > 0 and np.isfinite(val):
+                        rr = val
                 except Exception as e:
                     logger.debug(f"Could not extract recommended_rr: {e}")
+            if rr is None and self._last_rr is not None:
+                rr = float(self._last_rr)
+            if rr is None:
+                rr_cfg = float(getattr(self.settings.risk, "min_risk_reward", 0.0) or 0.0)
+                if rr_cfg > 0:
+                    rr = rr_cfg
+            if rr is None:
+                return None, None
 
             if result.signal == 1:
                 return entry_price - sl_dist, entry_price + (rr * sl_dist)

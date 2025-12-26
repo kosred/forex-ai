@@ -9,11 +9,50 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+def _is_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ensure_global_python() -> None:
+    """Enforce global Python (no venv/conda) to avoid stale env junk."""
+    in_venv = bool(os.environ.get("VIRTUAL_ENV")) or (
+        hasattr(sys, "real_prefix") or sys.base_prefix != sys.prefix
+    )
+    if not in_venv:
+        return
+    if _is_truthy(os.environ.get("FOREX_BOT_ALLOW_VENV")):
+        return
+    if _is_truthy(os.environ.get("FOREX_BOT_VENV_REEXEC")):
+        print("[FATAL] Virtual env detected and re-exec already attempted.")
+        print("        Please run with global/system Python (no .venv).")
+        raise SystemExit(2)
+
+    base_prefix = Path(sys.base_prefix)
+    if os.name == "nt":
+        candidates = [base_prefix / "python.exe"]
+    else:
+        candidates = [base_prefix / "bin" / "python3", base_prefix / "bin" / "python"]
+
+    base_python = next((p for p in candidates if p.exists()), None)
+    if base_python is None:
+        print("[FATAL] Virtual env detected but global Python not found.")
+        print("        Please run with system Python or set FOREX_BOT_ALLOW_VENV=1.")
+        raise SystemExit(2)
+
+    os.environ["FOREX_BOT_VENV_REEXEC"] = "1"
+    print(f"[INIT] Virtual env detected. Re-launching with {base_python}...")
+    os.execv(str(base_python), [str(base_python), *sys.argv])
+
+
 if __name__ == "__main__" and __package__ is None:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     __package__ = "forex_bot"
 
 if __name__ == "__main__":
+    _ensure_global_python()
+    src_root = Path(__file__).resolve().parent.parent
+    if str(src_root) not in sys.path:
+        sys.path.insert(0, str(src_root))
     try:
         print("[INIT] Checking and auto-installing dependencies (Hardware-Aware)...", flush=True)
         from forex_bot.core.deps import ensure_dependencies
@@ -161,7 +200,11 @@ async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> 
 
     from forex_bot.features.engine import SignalEngine
     from forex_bot.features.pipeline import FeatureEngineer
-    from forex_bot.strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+    from forex_bot.strategy.fast_backtest import (
+        fast_evaluate_strategy,
+        infer_pip_metrics,
+        infer_sl_tp_pips_auto,
+    )
     from forex_bot.training.evaluation import prop_backtest
 
     models_dir = Path(os.environ.get("FOREX_BOT_MODELS_DIR", "models"))
@@ -218,10 +261,32 @@ async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> 
                 month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
 
                 pip_size, pip_value_per_lot = infer_pip_metrics(sym)
-                sl_pips = float(getattr(base_settings.risk, "meta_label_sl_pips", 20.0))
+                sl_cfg = getattr(base_settings.risk, "meta_label_sl_pips", None)
+                tp_cfg = getattr(base_settings.risk, "meta_label_tp_pips", None)
                 rr = float(getattr(base_settings.risk, "min_risk_reward", 2.0))
-                tp_pips_cfg = float(getattr(base_settings.risk, "meta_label_tp_pips", sl_pips * rr))
-                tp_pips = max(tp_pips_cfg, sl_pips * rr)
+                if sl_cfg is None or float(sl_cfg) <= 0:
+                    atr_vals = df["atr"].to_numpy(dtype=np.float64) if "atr" in df.columns else None
+                    auto = infer_sl_tp_pips_auto(
+                        open_prices=df["open"].to_numpy(dtype=np.float64) if "open" in df.columns else df["close"].to_numpy(dtype=np.float64),
+                        high_prices=df["high"].to_numpy(dtype=np.float64),
+                        low_prices=df["low"].to_numpy(dtype=np.float64),
+                        close_prices=df["close"].to_numpy(dtype=np.float64),
+                        atr_values=atr_vals,
+                        pip_size=pip_size,
+                        atr_mult=float(getattr(base_settings.risk, "atr_stop_multiplier", 1.5)),
+                        min_rr=rr,
+                        min_dist=float(getattr(base_settings.risk, "meta_label_min_dist", 0.0)),
+                        settings=base_settings,
+                    )
+                    if auto is None:
+                        raise RuntimeError("Cannot infer SL/TP pips from data.")
+                    sl_pips, tp_pips = auto
+                else:
+                    sl_pips = float(sl_cfg)
+                    if tp_cfg is None or float(tp_cfg) <= 0:
+                        tp_pips = sl_pips * rr
+                    else:
+                        tp_pips = max(float(tp_cfg), sl_pips * rr)
 
                 spread = float(getattr(base_settings.risk, "backtest_spread_pips", 1.5))
                 commission = float(getattr(base_settings.risk, "commission_per_lot", 0.0))
@@ -395,6 +460,11 @@ def parse_args():
         choices=["cache", "models", "all"],
         help="Delete generated artifacts before starting (cache/models/tool caches).",
     )
+    parser.add_argument(
+        "--deep-purge",
+        choices=["off", "cache", "all"],
+        help="Deep purge generated artifacts before training (off/cache/all).",
+    )
     parser.add_argument("--clean-only", action="store_true", help="Run cleanup then exit.")
     parser.add_argument(
         "--device",
@@ -484,6 +554,26 @@ async def main_async():
         os.environ["FOREX_BOT_TREE_DEVICE"] = str(args.tree_device)
     if getattr(args, "features_device", None):
         os.environ["FOREX_BOT_FEATURES_DEVICE"] = str(args.features_device)
+
+    # Optional deep purge before training to prevent stale artifacts.
+    try:
+        deep_mode = getattr(args, "deep_purge", None) or getattr(
+            base_settings.system, "deep_purge_mode", "off"
+        )
+        deep_mode = str(deep_mode or "off").strip().lower()
+        if deep_mode not in {"off", "cache", "all"}:
+            deep_mode = "off"
+        deep_on_train = bool(getattr(base_settings.system, "deep_purge_on_train", True))
+        will_train = bool(getattr(args, "train", False)) or (
+            not getattr(args, "run", False) and not _global_models_exist()
+        )
+        if deep_mode != "off" and (not deep_on_train or will_train):
+            import clean_artifacts as cleaner
+
+            logger.info(f"[CLEAN] Deep purge requested (mode={deep_mode})...")
+            cleaner.deep_purge(mode=deep_mode)
+    except Exception as exc:
+        logger.warning(f"Deep purge failed: {exc}", exc_info=True)
 
     # Hardware auto-tune (single source of truth).
     try:

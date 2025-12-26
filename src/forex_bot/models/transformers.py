@@ -609,7 +609,11 @@ class TransformerExpertTorch(ExpertModel):
 
             self.model = self._build_model()
             target = getattr(self.model, "module", self.model)
-            target.load_state_dict(torch.load(p, map_location=self.device))
+            try:
+                state = torch.load(p, map_location=self.device, weights_only=True)
+            except TypeError as exc:
+                raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
+            target.load_state_dict(state)
             self.model = target.to(self.device)
 
             if str(self.device) == "cpu":

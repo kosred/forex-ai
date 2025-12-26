@@ -109,15 +109,19 @@ class TiDEExpert(ExpertModel):
             except Exception as e:
                 logger.warning(f"torch.compile failed for TiDE GPU: {e}")
 
+        y_vals = y.to_numpy()
+        if not np.all(np.isin(y_vals, [-1, 0, 1])):
+            raise ValueError(f"Labels must be in {{-1, 0, 1}}, got: {np.unique(y_vals)}")
+
         split = int(len(X) * 0.85)
         X_train, X_val = X.iloc[:split], X.iloc[split:]
-        y_train, y_val = y.iloc[:split], y.iloc[split:]
+        y_train, y_val = y_vals[:split], y_vals[split:]
 
         # Force CPU initialization to avoid VRAM OOM
         X_t = torch.as_tensor(dataframe_to_float32_numpy(X_train), dtype=torch.float32, device="cpu")
-        y_t = torch.as_tensor(y_train.values + 1, dtype=torch.long, device="cpu")
+        y_t = torch.as_tensor(y_train + 1, dtype=torch.long, device="cpu")
         X_v = torch.as_tensor(dataframe_to_float32_numpy(X_val), dtype=torch.float32, device="cpu")
-        y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device="cpu")
+        y_v = torch.as_tensor(y_val + 1, dtype=torch.long, device="cpu")
 
         # Removed eager move to GPU for validation data
         
@@ -139,30 +143,27 @@ class TiDEExpert(ExpertModel):
         if world_size > 1:
             num_workers = max(1, num_workers // world_size)
         sampler = torch.utils.data.distributed.DistributedSampler(dataset) if world_size > 1 else None
-        loader = DataLoader(
-            dataset,
-            batch_size=max(1, eff_batch // max(1, world_size)),  # Divide batch by GPU count
-            shuffle=(world_size == 1),  # Only shuffle if not using DistributedSampler
-            num_workers=num_workers,
-            pin_memory=is_cuda,
-            prefetch_factor=2 if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
-            multiprocessing_context='spawn' if num_workers > 0 else None,
-            sampler=sampler,
+        loader_kwargs = {
+            "batch_size": max(1, eff_batch // max(1, world_size)),  # Divide batch by GPU count
+            "shuffle": (world_size == 1),  # Only shuffle if not using DistributedSampler
+            "num_workers": num_workers,
+            "pin_memory": is_cuda,
+            "sampler": sampler,
+        }
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["multiprocessing_context"] = "spawn"
+        loader = DataLoader(dataset, **loader_kwargs)
+
+        if not hasattr(optim, "AdamW"):
+            raise RuntimeError("AdamW optimizer not available; upgrade PyTorch.")
+        fused_ok = is_cuda and "fused" in optim.AdamW.__init__.__code__.co_varnames
+        optimizer = (
+            optim.AdamW(self.model.parameters(), lr=self.lr, fused=True)
+            if fused_ok
+            else optim.AdamW(self.model.parameters(), lr=self.lr)
         )
-        has_adamw = hasattr(optim, "AdamW")
-        fused_ok = (
-            is_cuda
-            and has_adamw
-            and "fused" in optim.AdamW.__init__.__code__.co_varnames
-        )
-        if has_adamw:
-            if fused_ok:
-                optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, fused=True)
-            else:
-                optimizer = optim.AdamW(self.model.parameters(), lr=self.lr)
-        else:
-            optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss()
         early_stopper = EarlyStopper(patience=8, min_delta=0.001)
         amp_dtype = preferred_amp_dtype(str(self.device))
@@ -187,6 +188,17 @@ class TiDEExpert(ExpertModel):
             scaler.update()
             return loss.detach()
 
+        val_loader = None
+        if len(X_val) > 0:
+            val_dataset = TensorDataset(X_v, y_v)
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=max(1, eff_batch // max(1, world_size)),
+                shuffle=False,
+                num_workers=0,
+                pin_memory=is_cuda,
+            )
+
         for epoch in range(100):
             if time.time() - start > self.max_time_sec:
                 break
@@ -204,7 +216,9 @@ class TiDEExpert(ExpertModel):
                         graph = torch.cuda.CUDAGraph()
                         _ = _step(static_bx, static_by)
                         torch.cuda.synchronize()
-                        scaler._lazy_init_scale_growth_tracker()
+                        if hasattr(scaler, "_lazy_init_scale_growth_tracker"):
+                            scaler._lazy_init_scale_growth_tracker()
+                        torch.cuda.synchronize()
                         with torch.cuda.graph(graph):
                             _step(static_bx, static_by)
                         logger.info("CUDA Graph captured for TiDE GPU step.")
@@ -219,17 +233,23 @@ class TiDEExpert(ExpertModel):
                 else:
                     _step(bx, by)
 
-            if len(X_val) > 0:
+            if val_loader is not None:
                 self.model.eval()
                 with torch.no_grad():
-                    # Move to GPU explicitly for validation
-                    X_v_gpu = X_v.to(self.device)
-                    y_v_gpu = y_v.to(self.device)
-                    val_out = self.model(X_v_gpu)
-                    val_loss = criterion(val_out, y_v_gpu).item()
+                    val_losses = []
+                    for vbx, vby in val_loader:
+                        vbx = vbx.to(self.device, non_blocking=is_cuda)
+                        vby = vby.to(self.device, non_blocking=is_cuda)
+                        val_out = self.model(vbx)
+                        val_losses.append(criterion(val_out, vby).item())
+                        del vbx, vby, val_out
+                    val_loss = float(np.mean(val_losses)) if val_losses else 0.0
                 self.model.train()
                 if early_stopper(val_loss):
                     break
+
+        if is_cuda:
+            torch.cuda.empty_cache()
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         if self.model is None:
@@ -268,4 +288,8 @@ class TiDEExpert(ExpertModel):
             self.hidden_dim = meta["hidden"]
             self.model = self._build_model()
             target = getattr(self.model, "module", self.model)
-            target.load_state_dict(torch.load(p, map_location=self.device))
+            try:
+                state = torch.load(p, map_location=self.device, weights_only=True)
+            except TypeError as exc:
+                raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
+            target.load_state_dict(state)

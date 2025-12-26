@@ -81,6 +81,8 @@ class SystemConfig(BaseModel):
     cache_enabled: bool = True
     cache_dir: str = "cache"
     cache_max_age_minutes: int = 60
+    deep_purge_mode: str = "off"  # off | cache | all
+    deep_purge_on_train: bool = True
     n_jobs: int = 2
     enable_gpu_preference: str = "auto"
     enable_gpu: bool = False
@@ -144,10 +146,32 @@ class RiskConfig(BaseModel):
     conformal_alpha: float = 0.10
     volatility_stop_sigma: float = 0.02  # if recent returns std exceeds, pause trading
     volatility_lookback: int = 50  # bars to compute realized volatility
-    meta_label_tp_pips: float = 20.0
-    meta_label_sl_pips: float = 20.0
+    meta_label_tp_pips: float | None = None
+    meta_label_sl_pips: float | None = None
     meta_label_max_hold_bars: int = 100  # Equivalent to 100 * 5 min = ~8 hours on M5
     meta_label_min_prob_threshold: float = 0.55  # Only meta-label signals with this probability
+    meta_label_min_dist: float = 0.0005  # Min absolute barrier distance        
+    meta_label_fixed_sl: float = 0.0020  # Fallback SL distance when ATR is 0   
+    meta_label_fixed_tp: float = 0.0040  # Fallback TP distance when ATR is 0   
+    # Stop/target engine (volatility + tail-risk blend, unsupervised)
+    stop_target_mode: str = "blend"  # blend | fixed | gene
+    vol_estimator: str = "yang_zhang"  # yang_zhang | garman_klass | parkinson | rogers_satchell
+    vol_window: int = 50
+    vol_horizon_bars: int = 5
+    tail_window: int = 100
+    tail_alpha: float = 0.975
+    tail_step: int = 5
+    tail_max_bars: int = 300_000
+    stop_k_vol: float = 1.0
+    stop_k_tail: float = 1.25
+    rr_trend: float = 2.5
+    rr_range: float = 1.5
+    rr_neutral: float = 2.0
+    regime_adx_trend: float = 25.0
+    regime_adx_range: float = 20.0
+    hurst_window: int = 100
+    hurst_trend: float = 0.55
+    hurst_range: float = 0.45
 
 
 class ModelsConfig(BaseModel):

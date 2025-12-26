@@ -272,8 +272,8 @@ class TrainingService:
         discovery_frames = frames.copy()
         base_tf = self.settings.system.base_timeframe
         
-        print(f"DEBUG: Base TF: {base_tf}. Dataset Shape: {dataset.X.shape}")
-        print(f"DEBUG: Dataset Columns (first 10): {list(dataset.X.columns)[:10]}")
+        logger.debug(f"Base TF: {base_tf}. Dataset Shape: {dataset.X.shape}")
+        logger.debug(f"Dataset Columns (first 10): {list(dataset.X.columns)[:10]}")
         
         if base_tf in discovery_frames:
              # Merge dataset.X (features) with original OHLC (needed for PnL)
@@ -285,14 +285,14 @@ class TrainingService:
                      if col in orig.columns:
                          rich_df[col] = orig[col]
              discovery_frames[base_tf] = rich_df
-             print(f"DEBUG: Enriched {base_tf} with {rich_df.shape[1]} columns.")
+             logger.debug(f"Enriched {base_tf} with {rich_df.shape[1]} columns.")
         else:
-             print(f"DEBUG: Base TF {base_tf} not found in frames keys: {list(discovery_frames.keys())}")
+             logger.debug(f"Base TF {base_tf} not found in frames keys: {list(discovery_frames.keys())}")
 
         # CRITICAL FIX: Tensor Discovery expects UNIFORM feature sets across timeframes.
         # ...
         
-        print("DEBUG: Aligning all discovery frames to enriched feature space...")
+        logger.debug("Aligning all discovery frames to enriched feature space...")
         reference_df = discovery_frames[base_tf]
         aligned_frames = {}
 
@@ -302,6 +302,10 @@ class TrainingService:
             cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
         timeframes = [base_tf] + cfg_tfs
         timeframes = [tf for tf in dict.fromkeys(timeframes) if tf in frames]
+        # Always include any additional frames discovered at runtime.
+        for tf in frames.keys():
+            if tf not in timeframes:
+                timeframes.append(tf)
         if not timeframes:
             timeframes = list(frames.keys())
 
@@ -318,9 +322,10 @@ class TrainingService:
         
         # Update discovery frames to the aligned set
         discovery_frames = aligned_frames
-        print(f"DEBUG: Alignment complete. Frames: {list(discovery_frames.keys())}")
+        logger.debug(f"Alignment complete. Frames: {list(discovery_frames.keys())}")
         # Validate one frame
-        print(f"DEBUG: M1 Columns: {len(discovery_frames['M1'].columns)}")
+        if "M1" in discovery_frames:
+            logger.debug(f"M1 Columns: {len(discovery_frames['M1'].columns)}")
 
         # New Unsupervised Tensor Engine (Million-Search)
         # We increase experts to 100 to create a diverse "Council of 100" for the deep models
@@ -717,6 +722,11 @@ class TrainingService:
 
         X_train = pd.concat(X_parts, axis=0, copy=False)
         y_train = pd.concat(y_parts, axis=0, copy=False).astype(int, copy=False)
+        if not X_train.index.equals(y_train.index):
+            raise ValueError(
+                f"Training data index misalignment: X has {len(X_train)} rows, "
+                f"y has {len(y_train)} rows, indices don't match"
+            )
         X_train = X_train.astype(np.float32, copy=False)
 
         meta_train: pd.DataFrame | None = None
@@ -766,7 +776,11 @@ class TrainingService:
         try:
             import inspect
 
-            from ..strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+            from ..strategy.fast_backtest import (
+                fast_evaluate_strategy,
+                infer_pip_metrics,
+                infer_sl_tp_pips_auto,
+            )
             from ..training.evaluation import probs_to_signals, prop_backtest
 
             model_metrics: dict[str, Any] = {}
@@ -808,10 +822,34 @@ class TrainingService:
                         )
 
                         pip_size, pip_value_per_lot = infer_pip_metrics(sym)
-                        sl_pips = float(getattr(self.settings.risk, "meta_label_sl_pips", 20.0))
+                        sl_cfg = getattr(self.settings.risk, "meta_label_sl_pips", None)
+                        tp_cfg = getattr(self.settings.risk, "meta_label_tp_pips", None)
                         rr = float(getattr(self.settings.risk, "min_risk_reward", 2.0))
-                        tp_pips_cfg = float(getattr(self.settings.risk, "meta_label_tp_pips", sl_pips * rr))
-                        tp_pips = max(tp_pips_cfg, sl_pips * rr)
+                        if sl_cfg is None or float(sl_cfg) <= 0:
+                            atr_vals = meta_e["atr"].to_numpy(dtype=np.float64) if "atr" in meta_e.columns else None
+                            auto = infer_sl_tp_pips_auto(
+                                open_prices=meta_e["open"].to_numpy(dtype=np.float64)
+                                if "open" in meta_e.columns
+                                else meta_e["close"].to_numpy(dtype=np.float64),
+                                high_prices=meta_e["high"].to_numpy(dtype=np.float64),
+                                low_prices=meta_e["low"].to_numpy(dtype=np.float64),
+                                close_prices=meta_e["close"].to_numpy(dtype=np.float64),
+                                atr_values=atr_vals,
+                                pip_size=pip_size,
+                                atr_mult=float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5)),
+                                min_rr=rr,
+                                min_dist=float(getattr(self.settings.risk, "meta_label_min_dist", 0.0)),
+                                settings=self.settings,
+                            )
+                            if auto is None:
+                                raise RuntimeError("Cannot infer SL/TP pips from metadata.")
+                            sl_pips, tp_pips = auto
+                        else:
+                            sl_pips = float(sl_cfg)
+                            if tp_cfg is None or float(tp_cfg) <= 0:
+                                tp_pips = sl_pips * rr
+                            else:
+                                tp_pips = max(float(tp_cfg), sl_pips * rr)
 
                         spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
                         commission = float(getattr(self.settings.risk, "commission_per_lot", 0.0))
