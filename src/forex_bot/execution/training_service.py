@@ -1196,9 +1196,20 @@ def _hpc_feature_worker(settings, frames, sym, news_features=None, assigned_gpu=
         import sys
         import os
         from pathlib import Path
-        
-        # Set GPU affinity before any torch/cupy imports
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+
+        # Optionally force CPU-only feature engineering to avoid GPU OOM in workers.
+        force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if force_cpu:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            try:
+                settings.system.enable_gpu_preference = "cpu"
+            except Exception:
+                pass
+        else:
+            # Set GPU affinity before any torch/cupy imports
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
         
         # Add src/ to path explicitly to ensure latest code is loaded in the worker process
         project_root = Path(__file__).resolve().parents[3]
