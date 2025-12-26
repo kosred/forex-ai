@@ -64,17 +64,20 @@ if __name__ == "__main__":
     # --- 3. Dependency Check ---
     try:
         if os.environ.get("FOREX_BOT_SKIP_DEPS", "0") != "1":
-            print("[INIT] Checking and auto-installing dependencies (Hardware-Aware)...", flush=True)
+            print("[INIT] Checking and auto-installing dependencies (Global Mode)...", flush=True)
             from forex_bot.core.deps import ensure_dependencies
 
             ensure_dependencies()
             
-            # 2025 SELF-HEALING: Mandatory editable install to sync source with environment.
-            # This kills the 'AttributeError' once and for all by linking the venv directly to ./src.
-            if sys.prefix != sys.base_prefix: # Running in venv
-                print("[INIT] Syncing environment with local source code...", flush=True)
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps", "-e", "."], cwd=SCRIPT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                print("[INIT] Environment synced (pip install -e .).")
+            # 2025 SMART LINKING: Force user-level editable install.
+            # This ensures that even in global mode, the 'forex_bot' name 
+            # points directly to our local /src directory.
+            print("[INIT] Syncing global environment with local source code...", flush=True)
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--no-deps", "-e", "."], cwd=SCRIPT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("[INIT] Global environment synced (pip install --user -e .).")
+            except Exception as e:
+                print(f"[WARN] Local link failed (non-critical): {e}")
         else:
             print("[INIT] Skipping dependency bootstrap (FOREX_BOT_SKIP_DEPS=1).", flush=True)
     except Exception as dep_err:
