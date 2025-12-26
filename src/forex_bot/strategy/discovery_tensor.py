@@ -232,24 +232,32 @@ class TensorDiscoveryEngine:
                                 else self.month_ids_cpu.to(dev, non_blocking=True)
                             )
 
-                        # Auto-scale batch size based on VRAM and footprint.
+                        # Auto-scale batch size based on VRAM, data footprint, and signal tensor cost.
+                        usable_mem = None
                         try:
                             total_mem = torch.cuda.get_device_properties(dev).total_memory
                             reserve = 4 * 1024**3
-                            usable = max(512 * 1024**2, total_mem - reserve)
+                            usable_mem = max(512 * 1024**2, total_mem - reserve)
                             if bytes_per_row > 0:
-                                batch_size = int((usable * 0.60) / bytes_per_row)
+                                base_batch = int((usable_mem * 0.60) / bytes_per_row)
                             else:
-                                batch_size = int((usable / (1024**3)) * 75000)
-                            batch_size = int(max(10000, min(n_samples, batch_size)))
+                                base_batch = int((usable_mem / (1024**3)) * 75000)
+                            base_batch = int(max(1024, min(n_samples, base_batch)))
                         except Exception:
-                            batch_size = min(n_samples, 100000)
+                            base_batch = min(n_samples, 100000)
 
                         genome_dim = int(self.n_features + len(self.timeframes) + 2)
                         try:
                             total_mem = torch.cuda.get_device_properties(dev).total_memory
                             genome_budget = max(128 * 1024**2, int(total_mem * 0.05))
                             max_genomes = max(64, int(genome_budget / (genome_dim * 4)))
+                            # Cap genomes by signal tensor budget for the base batch size.
+                            signal_budget = max(256 * 1024**2, int(total_mem * 0.25))
+                            if base_batch > 0:
+                                max_genomes_by_signal = int(signal_budget / (base_batch * 4 * 4))
+                                if max_genomes_by_signal > 0:
+                                    max_genomes = min(max_genomes, max_genomes_by_signal)
+                            max_genomes = max(16, max_genomes)
                         except Exception:
                             max_genomes = 1024
 
@@ -258,6 +266,15 @@ class TensorDiscoveryEngine:
                             g_end = min(g_start + max_genomes, chunk.shape[0])
                             genomes = chunk[g_start:g_end].clone().detach().to(dev)
                             local_pop = genomes.shape[0]
+                            batch_size = base_batch
+                            if usable_mem is not None and local_pop > 0:
+                                # signals + temp + actions ~ 4x float32 buffers
+                                signal_budget = max(256 * 1024**2, int(usable_mem * 0.35))
+                                denom = max(1, int(local_pop) * 4 * 4)
+                                max_batch_by_signals = int(signal_budget / denom)
+                                if max_batch_by_signals > 0:
+                                    batch_size = min(batch_size, max_batch_by_signals)
+                            batch_size = int(max(256, min(n_samples, batch_size)))
 
                             tf_count = self.data_cube_cpu.shape[0]
                             tf_weights = F.softmax(genomes[:, :tf_count], dim=1)
@@ -423,7 +440,7 @@ class TensorDiscoveryEngine:
                     elif "population" in ckpt and hasattr(searcher, "population"):
                         try:
                             searcher.population.values = ckpt["population"]
-                            if "evaluations" in ckpt:
+                            if "evaluations" in ckpt and hasattr(searcher.population, "evaluations"):
                                 searcher.population.evaluations = ckpt["evaluations"]
                         except Exception as exc:
                             logger.warning(f"Discovery resume population load failed: {exc}")
@@ -451,7 +468,8 @@ class TensorDiscoveryEngine:
                     payload["state"] = searcher.state_dict()
                 elif hasattr(searcher, "population"):
                     payload["population"] = searcher.population.values.detach().cpu()
-                    payload["evaluations"] = searcher.population.evaluations.detach().cpu()
+                    if hasattr(searcher.population, "evaluations"):
+                        payload["evaluations"] = searcher.population.evaluations.detach().cpu()
                 torch.save(payload, ckpt_path)
             except Exception as exc:
                 logger.warning(f"Discovery checkpoint save failed: {exc}")
