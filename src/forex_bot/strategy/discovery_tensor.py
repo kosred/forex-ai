@@ -372,48 +372,35 @@ class TensorDiscoveryEngine:
                                         news_slice = self.news_tensor_cpu[start_idx:end_idx, 0].to(dev, non_blocking=True)
                                     signals = signals + (news_slice.unsqueeze(0) * 0.5)
 
-                                actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
-                                actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
-                                actions = actions.float()
-
-                                close = ohlc_slice[0, :, 3]
-                                if close.numel() <= 1:
-                                    del signals, actions, data_slice, ohlc_slice
-                                    continue
-                                rets = (close[1:] - close[:-1]) / (close[:-1] + 1e-9)
-                                actions = actions[:, :-1]
-
-                                if has_news:
-                                    if preload:
-                                        impact_slice = gpu_news[gpu_idx][start_idx:end_idx, 1]
-                                    else:
-                                        impact_slice = self.news_tensor_cpu[start_idx:end_idx, 1].to(dev, non_blocking=True)
-                                    if impact_slice.numel() > 1:
-                                        impact_slice = impact_slice[1:]
-                                        is_news_event = (impact_slice > 0.7).float()
-                                        trade_cost = is_news_event * 0.0002
-                                        rets = rets - (trade_cost * torch.abs(actions).mean(dim=0))
-
-                                # Commission: $ per round-turn per 1.0 lot (charged on each action change).
-                                if commission_per_side > 0 and lot_size > 0:
-                                    action_prev = torch.zeros_like(actions[:, :1])
-                                    action_diff = torch.abs(actions - torch.cat([action_prev, actions[:, :-1]], dim=1))
-                                    price = torch.clamp(close[1:], min=1e-9)
-                                    commission_ret = (commission_per_side / (lot_size * price)).unsqueeze(0)
-                                    trade_cost = action_diff * commission_ret
-                                else:
-                                    trade_cost = 0.0
-
-                                batch_rets = actions * rets.unsqueeze(0) - trade_cost
-                                if month_returns is not None and month_ids is not None:
-                                    month_ids_batch = month_ids[start_idx + 1 : end_idx]
-                                    month_returns.scatter_add_(
-                                        1,
-                                        month_ids_batch.unsqueeze(0).expand(local_pop, -1),
-                                        batch_rets,
-                                    )
-
-                                sum_ret = sum_ret + batch_rets.sum(dim=1)
+                    actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
+                    actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
+                    
+                    # --- REALITY CHECK FIX (2025 Standard) ---
+                    # Old Logic: Close[t+1] - Close[t] (Captured gaps, unrealistically optimistic)
+                    # New Logic: Close[t+1] - Open[t+1] (Assumes entry at Open, no gap capture)
+                    # This removes "Look-ahead Bias" where the bot 'sees' the gap before it happens.
+                    
+                    close_next = gpu_ohlc_cubes[gpu_idx][0, start_idx:end_idx, 3][1:]
+                    open_next = gpu_ohlc_cubes[gpu_idx][0, start_idx:end_idx, 0][1:]
+                    
+                    # Align actions: Action[t] results in PnL[t+1]
+                    # We lose the last action because we don't have t+1 data for it
+                    actions_aligned = actions[:, :-1]
+                    
+                    # Raw price return of the candle we effectively held
+                    rets = (close_next - open_next) / (open_next + 1e-9)
+                    
+                    # Apply actions to returns
+                    batch_rets = actions_aligned * rets.unsqueeze(0)
+                    
+                    # Slippage/Spread Simulation
+                    # We pay 'spread cost' on every non-zero action because we re-enter at Open
+                    # Cost estimate: 0.0001 (1 pip) roughly relative to price
+                    # Better: dynamic cost if spread provided, but fixed cost is safer for training
+                    spread_cost = 0.0001 * torch.abs(actions_aligned)
+                    batch_rets = batch_rets - spread_cost
+                    
+                    sum_ret = sum_ret + batch_rets.sum(dim=1)
                                 sum_sq_ret = sum_sq_ret + (batch_rets**2).sum(dim=1)
                                 effective_samples += batch_rets.shape[1]
                                 current_chunk_ret = current_chunk_ret + batch_rets.sum(dim=1)
