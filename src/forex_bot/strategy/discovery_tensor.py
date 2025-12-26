@@ -91,7 +91,8 @@ class TensorDiscoveryEngine:
 
         for tf in self.timeframes:
             if tf in frames:
-                df = frames[tf].reindex(master_idx).ffill().bfill().fillna(0.0)
+                # Forward-fill only to avoid look-ahead leakage from future bars.
+                df = frames[tf].reindex(master_idx).ffill().fillna(0.0)
                 
                 # Merge News Features if available
                 if news_map and tf in news_map and news_map[tf] is not None:
@@ -182,6 +183,15 @@ class TensorDiscoveryEngine:
         except Exception:
             monthly_pass_power = 1.0
         monthly_hard = str(os.environ.get("FOREX_BOT_DISCOVERY_MONTHLY_HARD", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            commission_per_lot = float(os.environ.get("FOREX_BOT_DISCOVERY_COMMISSION_PER_LOT", "7") or 7.0)
+        except Exception:
+            commission_per_lot = 7.0
+        try:
+            lot_size = float(os.environ.get("FOREX_BOT_DISCOVERY_LOT_SIZE", "100000") or 100000.0)
+        except Exception:
+            lot_size = 100000.0
+        commission_per_side = commission_per_lot / 2.0
 
         # 1. Setup GPU Contexts for all workers
         # Pre-load data to each GPU once to avoid transfer bottlenecks
@@ -381,7 +391,17 @@ class TensorDiscoveryEngine:
                                         trade_cost = is_news_event * 0.0002
                                         rets = rets - (trade_cost * torch.abs(actions).mean(dim=0))
 
-                                batch_rets = actions * rets.unsqueeze(0)
+                                # Commission: $ per round-turn per 1.0 lot (charged on each action change).
+                                if commission_per_side > 0 and lot_size > 0:
+                                    action_prev = torch.zeros_like(actions[:, :1])
+                                    action_diff = torch.abs(actions - torch.cat([action_prev, actions[:, :-1]], dim=1))
+                                    price = torch.clamp(close[1:], min=1e-9)
+                                    commission_ret = (commission_per_side / (lot_size * price)).unsqueeze(0)
+                                    trade_cost = action_diff * commission_ret
+                                else:
+                                    trade_cost = 0.0
+
+                                batch_rets = actions * rets.unsqueeze(0) - trade_cost
                                 if month_returns is not None and month_ids is not None:
                                     month_ids_batch = month_ids[start_idx + 1 : end_idx]
                                     month_returns.scatter_add_(
