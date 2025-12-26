@@ -208,6 +208,10 @@ class RLlibPPOAgent(ExpertModel):
         # Prepare data for the env
         data_obs = x.to_numpy(dtype=np.float32)
         labels = y.to_numpy(dtype=np.int64)
+        if len(data_obs) != len(labels):
+            raise ValueError(
+                f"RLlib PPO: data/labels length mismatch (data={len(data_obs)}, labels={len(labels)})"
+            )
 
         # We pass data via env_config
         env_config = {"data": data_obs, "labels": labels}
@@ -328,6 +332,10 @@ class RLlibSACAgent(ExpertModel):
 
         data_obs = x.to_numpy(dtype=np.float32)
         labels = y.to_numpy(dtype=np.int64)
+        if len(data_obs) != len(labels):
+            raise ValueError(
+                f"RLlib SAC: data/labels length mismatch (data={len(data_obs)}, labels={len(labels)})"
+            )
 
         env_config = {"data": data_obs, "labels": labels}
 

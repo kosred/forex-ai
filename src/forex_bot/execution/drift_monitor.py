@@ -52,7 +52,13 @@ class ConceptDriftMonitor:
         else:
             idx = 0
 
-        prob_correct = float(np.asarray(y_pred_prob, dtype=float)[idx])
+        arr = np.asarray(y_pred_prob, dtype=float).ravel()
+        if arr.size == 0:
+            prob_correct = 0.0
+        else:
+            if idx >= arr.size:
+                idx = 0
+            prob_correct = float(arr[idx])
         error = 1.0 - prob_correct
 
         self.error_stream.append(error)

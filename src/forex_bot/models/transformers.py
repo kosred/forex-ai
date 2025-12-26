@@ -158,6 +158,7 @@ class TransformerExpertTorch(ExpertModel):
         self.input_dim = 0  # Features per timeframe
         self.num_timeframes = 0
         self.tf_names = []
+        self.base_feats = []
         self.use_te_fp8 = False
         self._te = None
         self._flash_attn = None

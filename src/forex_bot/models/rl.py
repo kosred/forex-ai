@@ -53,6 +53,17 @@ class PropFirmTradingEnv(gym.Env):
     ):
         super().__init__()
 
+        if df is None or len(df) == 0:
+            raise ValueError("PropFirmTradingEnv requires a non-empty DataFrame.")
+        if features is None or len(features) == 0:
+            raise ValueError("PropFirmTradingEnv requires non-empty feature data.")
+        if len(df) != len(features):
+            logger.warning(
+                "PropFirmTradingEnv data length mismatch: df=%s features=%s",
+                len(df),
+                len(features),
+            )
+
         self.df = df
         self.features = features.astype(np.float32)
         self.n_steps = len(df)

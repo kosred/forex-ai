@@ -322,6 +322,7 @@ class AutoTuner:
         try:
             self._apply_thread_env_defaults(hints)
             self._apply_feature_workers(hints)
+            self._apply_discovery_autotune(hints)
         except Exception as e:
             logger.error(f"System operation failed: {e}", exc_info=True)
         return hints
@@ -447,3 +448,77 @@ class AutoTuner:
         """Set feature-engineering worker count if not explicitly provided."""
         if not os.environ.get("FEATURE_WORKERS"):
             os.environ["FEATURE_WORKERS"] = str(max(1, hints.feature_workers))
+
+    def _apply_discovery_autotune(self, hints: AutoTuneHints) -> None:
+        """Auto-tune discovery settings based on GPU/RAM if env not set."""
+        # Allow opt-out
+        if str(os.environ.get("FOREX_BOT_DISCOVERY_AUTOTUNE", "1")).strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return
+
+        num_gpus = max(0, int(getattr(hints, "num_gpus", 0) or 0))
+        gpu_mem_gb = getattr(self.profile, "gpu_mem_gb", []) or []
+        min_vram = min(gpu_mem_gb) if gpu_mem_gb else 0.0
+        ram_gb = float(
+            getattr(self.profile, "available_ram_gb", None)
+            or getattr(self.profile, "total_ram_gb", 0.0)
+            or 0.0
+        )
+
+        # Preload vs streaming: default to streaming on big RAM, disable preload on small VRAM.
+        if "FOREX_BOT_DISCOVERY_STREAM" not in os.environ:
+            if num_gpus > 0 and ram_gb >= 128.0:
+                os.environ["FOREX_BOT_DISCOVERY_STREAM"] = "1"
+        if "FOREX_BOT_DISCOVERY_PRELOAD" not in os.environ:
+            if min_vram > 0 and min_vram <= 16.0:
+                os.environ["FOREX_BOT_DISCOVERY_PRELOAD"] = "0"
+
+        # Population sizing: scale with GPU count but cap to avoid runaway cost.
+        stream_flag = str(os.environ.get("FOREX_BOT_DISCOVERY_STREAM", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if "FOREX_BOT_DISCOVERY_POPULATION" not in os.environ:
+            if num_gpus <= 0:
+                pop = 4000 if ram_gb >= 16.0 else 2000
+            else:
+                # Allow explicit per-GPU override
+                try:
+                    per_gpu_env = int(os.environ.get("FOREX_BOT_DISCOVERY_POP_PER_GPU", "0") or 0)
+                except Exception:
+                    per_gpu_env = 0
+                if per_gpu_env > 0:
+                    per_gpu = per_gpu_env
+                else:
+                    if min_vram >= 80.0:
+                        per_gpu = 6000
+                    elif min_vram >= 48.0:
+                        per_gpu = 4000
+                    elif min_vram >= 24.0:
+                        per_gpu = 2500
+                    elif min_vram >= 16.0:
+                        per_gpu = 2500
+                    else:
+                        per_gpu = 1200
+                pop = int(per_gpu * num_gpus)
+                # Hard cap for practical runtimes; user can override via env.
+                pop_cap = 200000 if num_gpus < 64 else 400000
+                pop = max(2000, min(pop, pop_cap))
+            # If full-data streaming is enabled and no overrides were provided,
+            # default to a smaller, more robust population.
+            if stream_flag and int(os.environ.get("FOREX_BOT_DISCOVERY_POP_PER_GPU", "0") or 0) <= 0:
+                pop = 12000
+            os.environ["FOREX_BOT_DISCOVERY_POPULATION"] = str(int(pop))
+
+        # Optional safety cap on batch size for low VRAM.
+        if "FOREX_BOT_DISCOVERY_MAX_BATCH" not in os.environ and min_vram > 0:
+            if min_vram <= 16.0:
+                os.environ["FOREX_BOT_DISCOVERY_MAX_BATCH"] = "80000"
+            elif min_vram <= 24.0:
+                os.environ["FOREX_BOT_DISCOVERY_MAX_BATCH"] = "110000"

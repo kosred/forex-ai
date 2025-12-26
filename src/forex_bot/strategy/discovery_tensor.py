@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import time
@@ -27,7 +28,7 @@ class TensorDiscoveryEngine:
     ):
         # We detect all GPUs for the distributed evaluation
         from ..models.device import get_available_gpus
-        self.gpu_list = get_available_gpus()
+        self.gpu_list = get_available_gpus() or ["cpu"]
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.n_experts = n_experts
         self.data_cube = None
@@ -211,20 +212,25 @@ class TensorDiscoveryEngine:
                     bytes_per_gpu += int(self.news_tensor_cpu.numel() * self.news_tensor_cpu.element_size())
                 if self.month_ids_cpu is not None:
                     bytes_per_gpu += int(self.month_ids_cpu.numel() * self.month_ids_cpu.element_size())
-                min_mem = min(torch.cuda.get_device_properties(g).total_memory for g in self.gpu_list)
-                preload = bytes_per_gpu < (min_mem * 0.60)
+                cuda_gpus = [g for g in self.gpu_list if str(g).startswith("cuda")]
+                if cuda_gpus:
+                    min_mem = min(torch.cuda.get_device_properties(g).total_memory for g in cuda_gpus)
+                    preload = bytes_per_gpu < (min_mem * 0.60)
+                else:
+                    preload = False
             except Exception:
                 preload = False
         stream_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_STREAM", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
         if stream_mode:
             preload = False
 
-        if preload:
+        cuda_gpus = [g for g in self.gpu_list if str(g).startswith("cuda")]
+        if preload and cuda_gpus:
             logger.info("Discovery: preloading data cubes to all GPUs.")
-            gpu_data_cubes = [self.data_cube_cpu.to(gpu) for gpu in self.gpu_list]
-            gpu_ohlc_cubes = [self.ohlc_cube_cpu.to(gpu) for gpu in self.gpu_list]
-            gpu_news = [self.news_tensor_cpu.to(gpu) for gpu in self.gpu_list] if self.news_tensor_cpu is not None else []
-            gpu_month_ids = [self.month_ids_cpu.to(gpu) for gpu in self.gpu_list] if self.month_ids_cpu is not None else []
+            gpu_data_cubes = [self.data_cube_cpu.to(gpu) for gpu in cuda_gpus]
+            gpu_ohlc_cubes = [self.ohlc_cube_cpu.to(gpu) for gpu in cuda_gpus]
+            gpu_news = [self.news_tensor_cpu.to(gpu) for gpu in cuda_gpus] if self.news_tensor_cpu is not None else []
+            gpu_month_ids = [self.month_ids_cpu.to(gpu) for gpu in cuda_gpus] if self.month_ids_cpu is not None else []
         else:
             logger.info("Discovery: streaming data per-batch to avoid VRAM exhaustion.")
             gpu_data_cubes = []
@@ -232,7 +238,7 @@ class TensorDiscoveryEngine:
             gpu_news = []
             gpu_month_ids = []
 
-        num_gpus = len(self.gpu_list)
+        num_gpus = max(1, len(self.gpu_list))
 
         # Estimate per-row GPU footprint for safe batch sizing.
         try:
@@ -261,8 +267,11 @@ class TensorDiscoveryEngine:
             import concurrent.futures
             def _eval_on_gpu(chunk: torch.Tensor, gpu_idx: int):
                 dev = torch.device(self.gpu_list[gpu_idx])
+                is_cuda = dev.type == "cuda"
                 try:
-                    with torch.cuda.device(dev):
+                    if is_cuda:
+                        torch.cuda.set_device(dev)
+                    with torch.cuda.device(dev) if is_cuda else contextlib.nullcontext():
                         if chunk.numel() == 0:
                             return torch.empty((0,), dtype=torch.float32)
                         n_samples = self.data_cube_cpu.shape[1]
@@ -277,37 +286,44 @@ class TensorDiscoveryEngine:
 
                         # Auto-scale batch size based on VRAM, data footprint, and signal tensor cost.
                         usable_mem = None
-                        try:
-                            total_mem = torch.cuda.get_device_properties(dev).total_memory
-                            reserve = 4 * 1024**3
-                            usable_mem = max(512 * 1024**2, total_mem - reserve)
+                        if is_cuda:
                             try:
-                                free_mem, _ = torch.cuda.mem_get_info(dev)
-                                usable_mem = min(usable_mem, int(free_mem))
+                                total_mem = torch.cuda.get_device_properties(dev).total_memory
+                                reserve = 4 * 1024**3
+                                usable_mem = max(512 * 1024**2, total_mem - reserve)
+                                try:
+                                    free_mem, _ = torch.cuda.mem_get_info(dev)
+                                    usable_mem = min(usable_mem, int(free_mem))
+                                except Exception:
+                                    pass
+                                if bytes_per_row > 0:
+                                    base_batch = int((usable_mem * 0.60) / bytes_per_row)
+                                else:
+                                    base_batch = int((usable_mem / (1024**3)) * 75000)
+                                base_batch = int(max(256, min(n_samples, base_batch)))
                             except Exception:
-                                pass
-                            if bytes_per_row > 0:
-                                base_batch = int((usable_mem * 0.60) / bytes_per_row)
-                            else:
-                                base_batch = int((usable_mem / (1024**3)) * 75000)
-                            base_batch = int(max(256, min(n_samples, base_batch)))
-                        except Exception:
-                            base_batch = min(n_samples, 100000)
+                                base_batch = min(n_samples, 100000)
+                        else:
+                            usable_mem = None
+                            base_batch = min(n_samples, 5000)
 
                         genome_dim = int(self.n_features + len(self.timeframes) + 2)
-                        try:
-                            total_mem = torch.cuda.get_device_properties(dev).total_memory
-                            genome_budget = max(128 * 1024**2, int(total_mem * 0.04))
-                            max_genomes = max(64, int(genome_budget / (genome_dim * 4)))
-                            # Cap genomes by signal tensor budget for the base batch size.
-                            signal_budget = max(256 * 1024**2, int(total_mem * 0.20))
-                            if base_batch > 0:
-                                max_genomes_by_signal = int(signal_budget / (base_batch * 4 * 4))
-                                if max_genomes_by_signal > 0:
-                                    max_genomes = min(max_genomes, max_genomes_by_signal)
-                            max_genomes = max(16, max_genomes)
-                        except Exception:
-                            max_genomes = 1024
+                        if is_cuda:
+                            try:
+                                total_mem = torch.cuda.get_device_properties(dev).total_memory
+                                genome_budget = max(128 * 1024**2, int(total_mem * 0.04))
+                                max_genomes = max(64, int(genome_budget / (genome_dim * 4)))
+                                # Cap genomes by signal tensor budget for the base batch size.
+                                signal_budget = max(256 * 1024**2, int(total_mem * 0.20))
+                                if base_batch > 0:
+                                    max_genomes_by_signal = int(signal_budget / (base_batch * 4 * 4))
+                                    if max_genomes_by_signal > 0:
+                                        max_genomes = min(max_genomes, max_genomes_by_signal)
+                                max_genomes = max(16, max_genomes)
+                            except Exception:
+                                max_genomes = 1024
+                        else:
+                            max_genomes = 256
 
                         fitness_all = []
                         for g_start in range(0, chunk.shape[0], max_genomes):
@@ -366,7 +382,10 @@ class TensorDiscoveryEngine:
 
                                 signals = torch.zeros((local_pop, end_idx - start_idx), device=dev, dtype=torch.float16)
                                 for i in range(tf_count):
-                                    with torch.amp.autocast('cuda', enabled=True):
+                                    if is_cuda:
+                                        with torch.amp.autocast('cuda', enabled=True):
+                                            tf_sig = torch.matmul(data_slice[i], logic_weights.t())
+                                    else:
                                         tf_sig = torch.matmul(data_slice[i], logic_weights.t())
                                     signals = signals + (tf_weights[:, i].unsqueeze(1) * tf_sig.t())
 
@@ -445,7 +464,8 @@ class TensorDiscoveryEngine:
                                 if has_news and news_slice is not None:
                                     del news_slice
 
-                            torch.cuda.empty_cache()
+                            if is_cuda:
+                                torch.cuda.empty_cache()
 
                             if effective_samples <= 0:
                                 fitness_all.append(torch.full((local_pop,), -1e9))
