@@ -420,6 +420,31 @@ class TensorDiscoveryEngine:
                                 running_cum_ret = abs_cum[:, -1]
                                 running_peak = batch_peaks[:, -1]
 
+                                # Monthly Grouping (Prop Firm Target: 4% / Month)
+                                if self.month_ids_cpu is not None:
+                                    # Extract month IDs for this batch (adjust for lookahead shift)
+                                    # rets is length (end-start-1), so we slice month_ids[start+1:end]
+                                    batch_month_ids = self.month_ids_cpu[start_idx+1:end_idx].to(dev, non_blocking=True)
+                                    
+                                    # Initialize global monthly tensor if first batch
+                                    if not hasattr(self, 'gpu_month_rets'):
+                                        # Use a list of tensors, one per GPU to avoid race conditions/locking
+                                        if not hasattr(self, '_month_rets_storage'):
+                                            self._month_rets_storage = {}
+                                        if gpu_idx not in self._month_rets_storage:
+                                            self._month_rets_storage[gpu_idx] = torch.zeros((local_pop, self.month_count), device=dev)
+                                    
+                                    # Add batch returns to monthly buckets
+                                    # batch_rets: (Pop, Time)
+                                    # batch_month_ids: (Time)
+                                    # We use scatter_add_. Since batch_month_ids is 1D, we broadcast it.
+                                    # Target: (Pop, Months)
+                                    self._month_rets_storage[gpu_idx].scatter_add_(
+                                        1, 
+                                        batch_month_ids.unsqueeze(0).expand(local_pop, -1), 
+                                        batch_rets
+                                    )
+
                                 del signals, actions, rets, batch_rets, batch_cum, abs_cum, batch_peaks, data_slice, ohlc_slice
 
                             torch.cuda.empty_cache()
@@ -434,9 +459,49 @@ class TensorDiscoveryEngine:
                             fitness = torch.where(max_dd > 0.07, torch.tensor(-1e9, device=dev), fitness)
                             fitness = torch.where(std_ret * (1440**0.5) > 0.04, fitness * 0.1, fitness)
 
-                            consistency = None
-                            pass_rate = None
-                            median_month = None
+                                                        # 3. Monthly Target Logic (4% Target)
+
+                                                        # Use local month_returns accumulator
+
+                                                        if month_returns is not None:
+
+                                                            # Count months where profit >= 4%
+
+                                                            wins = (month_returns >= 0.04).float().sum(dim=1)
+
+                                                            # Count months where loss <= -4% (Fail)
+
+                                                            fails = (month_returns <= -0.04).float().sum(dim=1)
+
+                                                            
+
+                                                            # Reward hitting the target (Explosive Alpha)
+
+                                                            fitness = fitness + (wins * 2.0)
+
+                                                            
+
+                                                            # Kill if hitting the loss limit (Iron Guard)
+
+                                                            fitness = torch.where(fails > 0, torch.tensor(-1e9, device=dev), fitness)
+
+                                                            
+
+                                                            # Consistency Boost
+
+                                                            non_negative = (month_returns >= 0).float().sum(dim=1)
+
+                                                            fitness = fitness * (non_negative / max(1, self.month_count))
+
+                            
+
+                                                        consistency = None
+
+                                                        pass_rate = None
+
+                                                        median_month = None
+
+                            
                             if month_returns is not None:
                                 negative_months = (month_returns < 0).sum(dim=1).float()
                                 consistency = torch.clamp(1.0 - (negative_months * 0.1), min=0.0)
