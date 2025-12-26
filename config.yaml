@@ -26,7 +26,7 @@ system:
   cache_enabled: true
   cache_dir: cache
   cache_max_age_minutes: 0
-  deep_purge_mode: off  # off | cache | all
+  deep_purge_mode: "off"  # off | cache | all
   deep_purge_on_train: true
   # Hardware is detected automatically (CPU/GPU/RAM)
   # Set preference to "auto", "true" (force GPU), or "false" (force CPU)

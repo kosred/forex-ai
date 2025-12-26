@@ -221,8 +221,8 @@ def ensure_dependencies() -> None:
         if not pkg:
             continue
 
-        # Skip packages known to lack wheels for Py3.13 (e.g., pytorch-tabnet).
-        if is_py313 and pkg in {"pytorch-tabnet"}:
+        # Skip packages known to lack wheels for Py3.13 (e.g., pytorch-tabnet, flash-attn).
+        if is_py313 and pkg in {"pytorch-tabnet", "flash-attn", "transformer-engine"}:
             continue
 
         # Filter exclusions
@@ -250,13 +250,22 @@ def ensure_dependencies() -> None:
     # 5. Install Logic
     gpu_libs = []
     standard_libs = []
-    
+
     for pkg in missing:
         # Only core torch libs are on the special index; evotorch is on standard PyPI
         if any(x == pkg for x in ["torch", "torchvision", "torchaudio"]):
             gpu_libs.append(pkg)
         else:
             standard_libs.append(pkg)
+
+    post_torch_libs = []
+    needs_torch = {"flash-attn", "transformer-engine"}
+    torch_missing = any(x in missing for x in ("torch", "torchvision", "torchaudio"))
+    if torch_missing:
+        for pkg in list(standard_libs):
+            if pkg in needs_torch:
+                standard_libs.remove(pkg)
+                post_torch_libs.append(pkg)
 
     if standard_libs:
         logger.info("Installing standard dependencies...")
@@ -273,6 +282,10 @@ def ensure_dependencies() -> None:
                 index_url = "https://download.pytorch.org/whl/cu121"
 
         _install(gpu_libs, index_url=index_url, pre=is_py313)
+
+    if post_torch_libs:
+        logger.info("Installing torch-dependent deps after torch is available...")
+        _install(post_torch_libs, pre=is_py313)
 
     if os.environ.get("FOREX_BOT_DEPS_REEXEC", "") != "1":
         os.environ["FOREX_BOT_DEPS_REEXEC"] = "1"
