@@ -238,21 +238,26 @@ class TensorDiscoveryEngine:
                             total_mem = torch.cuda.get_device_properties(dev).total_memory
                             reserve = 4 * 1024**3
                             usable_mem = max(512 * 1024**2, total_mem - reserve)
+                            try:
+                                free_mem, _ = torch.cuda.mem_get_info(dev)
+                                usable_mem = min(usable_mem, int(free_mem))
+                            except Exception:
+                                pass
                             if bytes_per_row > 0:
                                 base_batch = int((usable_mem * 0.60) / bytes_per_row)
                             else:
                                 base_batch = int((usable_mem / (1024**3)) * 75000)
-                            base_batch = int(max(1024, min(n_samples, base_batch)))
+                            base_batch = int(max(256, min(n_samples, base_batch)))
                         except Exception:
                             base_batch = min(n_samples, 100000)
 
                         genome_dim = int(self.n_features + len(self.timeframes) + 2)
                         try:
                             total_mem = torch.cuda.get_device_properties(dev).total_memory
-                            genome_budget = max(128 * 1024**2, int(total_mem * 0.05))
+                            genome_budget = max(128 * 1024**2, int(total_mem * 0.04))
                             max_genomes = max(64, int(genome_budget / (genome_dim * 4)))
                             # Cap genomes by signal tensor budget for the base batch size.
-                            signal_budget = max(256 * 1024**2, int(total_mem * 0.25))
+                            signal_budget = max(256 * 1024**2, int(total_mem * 0.20))
                             if base_batch > 0:
                                 max_genomes_by_signal = int(signal_budget / (base_batch * 4 * 4))
                                 if max_genomes_by_signal > 0:
@@ -269,12 +274,19 @@ class TensorDiscoveryEngine:
                             batch_size = base_batch
                             if usable_mem is not None and local_pop > 0:
                                 # signals + temp + actions ~ 4x float32 buffers
-                                signal_budget = max(256 * 1024**2, int(usable_mem * 0.35))
+                                signal_budget = max(256 * 1024**2, int(usable_mem * 0.30))
                                 denom = max(1, int(local_pop) * 4 * 4)
                                 max_batch_by_signals = int(signal_budget / denom)
                                 if max_batch_by_signals > 0:
                                     batch_size = min(batch_size, max_batch_by_signals)
-                            batch_size = int(max(256, min(n_samples, batch_size)))
+                            # Allow explicit caps via env.
+                            try:
+                                max_batch_env = int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_BATCH", "0") or 0)
+                                if max_batch_env > 0:
+                                    batch_size = min(batch_size, max_batch_env)
+                            except Exception:
+                                pass
+                            batch_size = int(max(128, min(n_samples, batch_size)))
 
                             tf_count = self.data_cube_cpu.shape[0]
                             tf_weights = F.softmax(genomes[:, :tf_count], dim=1)
@@ -304,7 +316,7 @@ class TensorDiscoveryEngine:
                                     data_slice = self.data_cube_cpu[:, start_idx:end_idx, :].to(dev, non_blocking=True)
                                     ohlc_slice = self.ohlc_cube_cpu[:, start_idx:end_idx, :].to(dev, non_blocking=True)
 
-                                signals = torch.zeros((local_pop, end_idx - start_idx), device=dev)
+                                signals = torch.zeros((local_pop, end_idx - start_idx), device=dev, dtype=torch.float16)
                                 for i in range(tf_count):
                                     with torch.amp.autocast("cuda", enabled=True):
                                         tf_sig = torch.matmul(data_slice[i], logic_weights.t())
@@ -317,8 +329,9 @@ class TensorDiscoveryEngine:
                                         news_slice = self.news_tensor_cpu[start_idx:end_idx, 0].to(dev, non_blocking=True)
                                     signals = signals + (news_slice.unsqueeze(0) * 0.5)
 
-                                actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
-                                actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
+                            actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
+                            actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
+                            actions = actions.float()
 
                                 close = ohlc_slice[0, :, 3]
                                 if close.numel() <= 1:
@@ -442,7 +455,14 @@ class TensorDiscoveryEngine:
         resume_enabled = _truthy(resume_flag, default=True)
         if resume_enabled and ckpt_path.exists():
             try:
-                ckpt = torch.load(ckpt_path, map_location="cpu")
+                ckpt = None
+                try:
+                    from torch.serialization import safe_globals
+                    from evotorch.tools.readonlytensor import ReadOnlyTensor
+                    with safe_globals([ReadOnlyTensor]):
+                        ckpt = torch.load(ckpt_path, map_location="cpu")
+                except Exception:
+                    ckpt = torch.load(ckpt_path, map_location="cpu")
                 if ckpt.get("genome_dim") == genome_dim and ckpt.get("n_features") == self.n_features:
                     if "state" in ckpt and hasattr(searcher, "load_state_dict"):
                         searcher.load_state_dict(ckpt["state"])
