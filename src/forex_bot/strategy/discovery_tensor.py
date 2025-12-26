@@ -165,12 +165,23 @@ class TensorDiscoveryEngine:
             "profitable_chunks": None,
             "consistency": None,
             "samples": None,
+            "pass_rate": None,
+            "median_month": None,
         }
         if debug_metrics:
             import threading
             debug_lock = threading.Lock()
         else:
             debug_lock = None
+        try:
+            monthly_floor = float(os.environ.get("FOREX_BOT_DISCOVERY_MONTHLY_FLOOR", "0.04") or 0.04)
+        except Exception:
+            monthly_floor = 0.04
+        try:
+            monthly_pass_power = float(os.environ.get("FOREX_BOT_DISCOVERY_MONTHLY_PASS_POWER", "1.0") or 1.0)
+        except Exception:
+            monthly_pass_power = 1.0
+        monthly_hard = str(os.environ.get("FOREX_BOT_DISCOVERY_MONTHLY_HARD", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
         # 1. Setup GPU Contexts for all workers
         # Pre-load data to each GPU once to avoid transfer bottlenecks
@@ -191,6 +202,9 @@ class TensorDiscoveryEngine:
                 preload = bytes_per_gpu < (min_mem * 0.60)
             except Exception:
                 preload = False
+        stream_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_STREAM", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        if stream_mode:
+            preload = False
 
         if preload:
             logger.info("Discovery: preloading data cubes to all GPUs.")
@@ -411,10 +425,21 @@ class TensorDiscoveryEngine:
                             fitness = torch.where(std_ret * (1440**0.5) > 0.04, fitness * 0.1, fitness)
 
                             consistency = None
+                            pass_rate = None
+                            median_month = None
                             if month_returns is not None:
                                 negative_months = (month_returns < 0).sum(dim=1).float()
                                 consistency = torch.clamp(1.0 - (negative_months * 0.1), min=0.0)
                                 fitness = fitness * consistency
+                                pass_rate = (month_returns >= monthly_floor).float().mean(dim=1)
+                                if monthly_pass_power != 1.0:
+                                    pass_rate = torch.clamp(pass_rate, min=0.0) ** monthly_pass_power
+                                fitness = fitness * pass_rate
+                                median_month = month_returns.median(dim=1).values
+                                if monthly_hard:
+                                    fitness = torch.where(median_month < monthly_floor, torch.tensor(-1e9, device=dev), fitness)
+                                else:
+                                    fitness = torch.where(median_month < monthly_floor, fitness * 0.1, fitness)
 
                             if debug_lock is not None:
                                 try:
@@ -426,6 +451,8 @@ class TensorDiscoveryEngine:
                                     best_dd = float(max_dd[best_idx].item())
                                     best_chunks = float(profitable_chunks[best_idx].item())
                                     best_consistency = float(consistency[best_idx].item()) if consistency is not None else 1.0
+                                    best_pass_rate = float(pass_rate[best_idx].item()) if pass_rate is not None else 1.0
+                                    best_median_month = float(median_month[best_idx].item()) if median_month is not None else 0.0
                                     with debug_lock:
                                         if debug_snapshot["fitness"] is None or best_fit > debug_snapshot["fitness"]:
                                             debug_snapshot["fitness"] = best_fit
@@ -436,6 +463,8 @@ class TensorDiscoveryEngine:
                                             debug_snapshot["profitable_chunks"] = best_chunks
                                             debug_snapshot["consistency"] = best_consistency
                                             debug_snapshot["samples"] = int(effective_samples)
+                                            debug_snapshot["pass_rate"] = best_pass_rate
+                                            debug_snapshot["median_month"] = best_median_month
                                 except Exception:
                                     pass
 
@@ -468,7 +497,7 @@ class TensorDiscoveryEngine:
                          solution_length=genome_dim, device="cpu", vectorized=True)
         
         # Tournament of 50,000 Default for High-End Clusters
-        pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 50000))
+        pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 30000))
         searcher = CMAES(problem, popsize=pop_size, stdev_init=0.5)
 
         logger.info(f"Starting COOPERATIVE {len(self.gpu_list)}-GPU Discovery (Pop: {pop_size})...")
@@ -561,7 +590,7 @@ class TensorDiscoveryEngine:
                     if snap.get("fitness") is not None:
                         logger.info(
                             "Gen %d metrics: best_fit=%.4f sharpe=%.4f mean_ret=%.6f std_ret=%.6f max_dd=%.4f "
-                            "prof_chunks=%.1f consistency=%.3f samples=%s",
+                            "prof_chunks=%.1f consistency=%.3f pass_rate=%.3f median_month=%.4f samples=%s",
                             i,
                             snap["fitness"],
                             snap["sharpe"],
@@ -570,6 +599,8 @@ class TensorDiscoveryEngine:
                             snap["max_dd"],
                             snap["profitable_chunks"],
                             snap["consistency"],
+                            snap.get("pass_rate", 1.0),
+                            snap.get("median_month", 0.0),
                             snap["samples"],
                         )
                 if plateau_gens > 0 and (i - last_improve) >= plateau_gens and best_val >= score_target:
