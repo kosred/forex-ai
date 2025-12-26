@@ -324,7 +324,7 @@ class TensorDiscoveryEngine:
                                     batch_size = min(batch_size, max_batch_by_signals)
                             # Allow explicit caps via env.
                             try:
-                                max_batch_env = int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_BATCH", "0") or 0)
+                                max_batch_env = int(os.environ.get('FOREX_BOT_DISCOVERY_MAX_BATCH', '0') or 0)
                                 if max_batch_env > 0:
                                     batch_size = min(batch_size, max_batch_env)
                             except Exception:
@@ -352,55 +352,67 @@ class TensorDiscoveryEngine:
 
                             for start_idx in range(0, n_samples, batch_size):
                                 end_idx = min(start_idx + batch_size, n_samples)
+                                news_slice = None
                                 if preload:
                                     data_slice = gpu_data_cubes[gpu_idx][:, start_idx:end_idx, :]
                                     ohlc_slice = gpu_ohlc_cubes[gpu_idx][:, start_idx:end_idx, :]
+                                    if has_news:
+                                        news_slice = gpu_news[gpu_idx][start_idx:end_idx]
                                 else:
                                     data_slice = self.data_cube_cpu[:, start_idx:end_idx, :].to(dev, non_blocking=True)
                                     ohlc_slice = self.ohlc_cube_cpu[:, start_idx:end_idx, :].to(dev, non_blocking=True)
+                                    if has_news:
+                                        news_slice = self.news_tensor_cpu[start_idx:end_idx].to(dev, non_blocking=True)
 
                                 signals = torch.zeros((local_pop, end_idx - start_idx), device=dev, dtype=torch.float16)
                                 for i in range(tf_count):
-                                    with torch.amp.autocast("cuda", enabled=True):
+                                    with torch.amp.autocast('cuda', enabled=True):
                                         tf_sig = torch.matmul(data_slice[i], logic_weights.t())
                                     signals = signals + (tf_weights[:, i].unsqueeze(1) * tf_sig.t())
 
-                                if has_news:
-                                    if preload:
-                                        news_slice = gpu_news[gpu_idx][start_idx:end_idx, 0]
+                                impact_slice = None
+                                if has_news and news_slice is not None:
+                                    if news_slice.ndim == 1:
+                                        sentiment = news_slice
                                     else:
-                                        news_slice = self.news_tensor_cpu[start_idx:end_idx, 0].to(dev, non_blocking=True)
-                                    signals = signals + (news_slice.unsqueeze(0) * 0.5)
+                                        sentiment = news_slice[:, 0]
+                                        if news_slice.shape[1] > 1:
+                                            impact_slice = news_slice[:, 1]
+                                    signals = signals + (sentiment.unsqueeze(0) * 0.5)
 
-                    actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
-                    actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
-                    
-                    # --- REALITY CHECK FIX (2025 Standard) ---
-                    # Old Logic: Close[t+1] - Close[t] (Captured gaps, unrealistically optimistic)
-                    # New Logic: Close[t+1] - Open[t+1] (Assumes entry at Open, no gap capture)
-                    # This removes "Look-ahead Bias" where the bot 'sees' the gap before it happens.
-                    
-                    close_next = gpu_ohlc_cubes[gpu_idx][0, start_idx:end_idx, 3][1:]
-                    open_next = gpu_ohlc_cubes[gpu_idx][0, start_idx:end_idx, 0][1:]
-                    
-                    # Align actions: Action[t] results in PnL[t+1]
-                    # We lose the last action because we don't have t+1 data for it
-                    actions_aligned = actions[:, :-1]
-                    
-                    # Raw price return of the candle we effectively held
-                    rets = (close_next - open_next) / (open_next + 1e-9)
-                    
-                    # Apply actions to returns
-                    batch_rets = actions_aligned * rets.unsqueeze(0)
-                    
-                    # Slippage/Spread Simulation
-                    # We pay 'spread cost' on every non-zero action because we re-enter at Open
-                    # Cost estimate: 0.0001 (1 pip) roughly relative to price
-                    # Better: dynamic cost if spread provided, but fixed cost is safer for training
-                    spread_cost = 0.0001 * torch.abs(actions_aligned)
-                    batch_rets = batch_rets - spread_cost
-                    
-                    sum_ret = sum_ret + batch_rets.sum(dim=1)
+                                actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
+                                actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
+
+                                if (end_idx - start_idx) < 2:
+                                    del signals, actions, data_slice, ohlc_slice
+                                    if has_news and news_slice is not None:
+                                        del news_slice
+                                    continue
+
+                                close_next = ohlc_slice[0, :, 3][1:]
+                                open_next = ohlc_slice[0, :, 0][1:]
+                                actions_aligned = actions[:, :-1]
+
+                                rets = (close_next - open_next) / (open_next + 1e-9)
+                                batch_rets = actions_aligned * rets.unsqueeze(0)
+
+                                spread_cost = 0.0001 * torch.abs(actions_aligned)
+                                batch_rets = batch_rets - spread_cost
+
+                                if commission_per_side > 0:
+                                    commission_frac = commission_per_side / (lot_size * open_next)
+                                    prev_actions = torch.cat(
+                                        [torch.zeros((local_pop, 1), device=dev), actions_aligned[:, :-1]],
+                                        dim=1,
+                                    )
+                                    trade_changes = torch.abs(actions_aligned - prev_actions)
+                                    batch_rets = batch_rets - trade_changes * commission_frac.unsqueeze(0)
+
+                                if impact_slice is not None:
+                                    impact_aligned = impact_slice[1:]
+                                    batch_rets = batch_rets - impact_aligned.unsqueeze(0) * torch.abs(actions_aligned)
+
+                                sum_ret = sum_ret + batch_rets.sum(dim=1)
                                 sum_sq_ret = sum_sq_ret + (batch_rets**2).sum(dim=1)
                                 effective_samples += batch_rets.shape[1]
                                 current_chunk_ret = current_chunk_ret + batch_rets.sum(dim=1)
@@ -420,37 +432,24 @@ class TensorDiscoveryEngine:
                                 running_cum_ret = abs_cum[:, -1]
                                 running_peak = batch_peaks[:, -1]
 
-                                # Monthly Grouping (Prop Firm Target: 4% / Month)
-                                if self.month_ids_cpu is not None:
-                                    # Extract month IDs for this batch (adjust for lookahead shift)
-                                    # rets is length (end-start-1), so we slice month_ids[start+1:end]
-                                    batch_month_ids = self.month_ids_cpu[start_idx+1:end_idx].to(dev, non_blocking=True)
-                                    
-                                    # Initialize global monthly tensor if first batch
-                                    if not hasattr(self, 'gpu_month_rets'):
-                                        # Use a list of tensors, one per GPU to avoid race conditions/locking
-                                        if not hasattr(self, '_month_rets_storage'):
-                                            self._month_rets_storage = {}
-                                        if gpu_idx not in self._month_rets_storage:
-                                            self._month_rets_storage[gpu_idx] = torch.zeros((local_pop, self.month_count), device=dev)
-                                    
-                                    # Add batch returns to monthly buckets
-                                    # batch_rets: (Pop, Time)
-                                    # batch_month_ids: (Time)
-                                    # We use scatter_add_. Since batch_month_ids is 1D, we broadcast it.
-                                    # Target: (Pop, Months)
-                                    self._month_rets_storage[gpu_idx].scatter_add_(
-                                        1, 
-                                        batch_month_ids.unsqueeze(0).expand(local_pop, -1), 
-                                        batch_rets
-                                    )
+                                if month_returns is not None and month_ids is not None:
+                                    batch_month_ids = month_ids[start_idx + 1 : end_idx]
+                                    if batch_month_ids.numel() > 0:
+                                        month_returns.scatter_add_(
+                                            1,
+                                            batch_month_ids.unsqueeze(0).expand(local_pop, -1),
+                                            batch_rets,
+                                        )
 
                                 del signals, actions, rets, batch_rets, batch_cum, abs_cum, batch_peaks, data_slice, ohlc_slice
+                                if has_news and news_slice is not None:
+                                    del news_slice
 
                             torch.cuda.empty_cache()
 
                             if effective_samples <= 0:
-                                return torch.full((local_pop,), -1e9)
+                                fitness_all.append(torch.full((local_pop,), -1e9))
+                                continue
                             mean_ret = sum_ret / effective_samples
                             std_ret = torch.sqrt(torch.clamp((sum_sq_ret / effective_samples) - mean_ret**2, min=1e-9)) + 1e-6
                             sharpe = (mean_ret / std_ret) * (252 * 1440) ** 0.5
@@ -459,49 +458,9 @@ class TensorDiscoveryEngine:
                             fitness = torch.where(max_dd > 0.07, torch.tensor(-1e9, device=dev), fitness)
                             fitness = torch.where(std_ret * (1440**0.5) > 0.04, fitness * 0.1, fitness)
 
-                                                        # 3. Monthly Target Logic (4% Target)
-
-                                                        # Use local month_returns accumulator
-
-                                                        if month_returns is not None:
-
-                                                            # Count months where profit >= 4%
-
-                                                            wins = (month_returns >= 0.04).float().sum(dim=1)
-
-                                                            # Count months where loss <= -4% (Fail)
-
-                                                            fails = (month_returns <= -0.04).float().sum(dim=1)
-
-                                                            
-
-                                                            # Reward hitting the target (Explosive Alpha)
-
-                                                            fitness = fitness + (wins * 2.0)
-
-                                                            
-
-                                                            # Kill if hitting the loss limit (Iron Guard)
-
-                                                            fitness = torch.where(fails > 0, torch.tensor(-1e9, device=dev), fitness)
-
-                                                            
-
-                                                            # Consistency Boost
-
-                                                            non_negative = (month_returns >= 0).float().sum(dim=1)
-
-                                                            fitness = fitness * (non_negative / max(1, self.month_count))
-
-                            
-
-                                                        consistency = None
-
-                                                        pass_rate = None
-
-                                                        median_month = None
-
-                            
+                            consistency = None
+                            pass_rate = None
+                            median_month = None
                             if month_returns is not None:
                                 negative_months = (month_returns < 0).sum(dim=1).float()
                                 consistency = torch.clamp(1.0 - (negative_months * 0.1), min=0.0)
@@ -529,17 +488,17 @@ class TensorDiscoveryEngine:
                                     best_pass_rate = float(pass_rate[best_idx].item()) if pass_rate is not None else 1.0
                                     best_median_month = float(median_month[best_idx].item()) if median_month is not None else 0.0
                                     with debug_lock:
-                                        if debug_snapshot["fitness"] is None or best_fit > debug_snapshot["fitness"]:
-                                            debug_snapshot["fitness"] = best_fit
-                                            debug_snapshot["sharpe"] = best_sharpe
-                                            debug_snapshot["mean_ret"] = best_mean
-                                            debug_snapshot["std_ret"] = best_std
-                                            debug_snapshot["max_dd"] = best_dd
-                                            debug_snapshot["profitable_chunks"] = best_chunks
-                                            debug_snapshot["consistency"] = best_consistency
-                                            debug_snapshot["samples"] = int(effective_samples)
-                                            debug_snapshot["pass_rate"] = best_pass_rate
-                                            debug_snapshot["median_month"] = best_median_month
+                                        if debug_snapshot['fitness'] is None or best_fit > debug_snapshot['fitness']:
+                                            debug_snapshot['fitness'] = best_fit
+                                            debug_snapshot['sharpe'] = best_sharpe
+                                            debug_snapshot['mean_ret'] = best_mean
+                                            debug_snapshot['std_ret'] = best_std
+                                            debug_snapshot['max_dd'] = best_dd
+                                            debug_snapshot['profitable_chunks'] = best_chunks
+                                            debug_snapshot['consistency'] = best_consistency
+                                            debug_snapshot['samples'] = int(effective_samples)
+                                            debug_snapshot['pass_rate'] = best_pass_rate
+                                            debug_snapshot['median_month'] = best_median_month
                                 except Exception:
                                     pass
 
@@ -549,7 +508,6 @@ class TensorDiscoveryEngine:
                 except Exception as e:
                     logger.error(f"GPU {gpu_idx} eval failed: {e}", exc_info=True)
                     return torch.full((chunk.shape[0],), -1e9)
-
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_gpus) as executor:
                 futures = {
                     executor.submit(_eval_on_gpu, pop_chunks[i], i): pop_chunks[i].shape[0]

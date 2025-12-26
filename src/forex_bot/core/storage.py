@@ -19,12 +19,32 @@ logger = logging.getLogger(__name__)
 
 class StrategyLedger:
     def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
+        path = Path(db_path)
+        if not path.is_absolute():
+            # Anchor relative paths to repo root (avoid CWD-dependent I/O errors).
+            repo_root = Path(__file__).resolve().parents[3]
+            path = repo_root / path
+        self.db_path = str(path)
         self._init_db()
 
     def _init_db(self) -> None:
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
+        db_path = Path(self.db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            conn = sqlite3.connect(self.db_path)
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "disk i/o" in msg or "disk io" in msg:
+                # Attempt a clean rebuild of the ledger database.
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        (db_path.with_suffix(db_path.suffix + suffix)).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                conn = sqlite3.connect(self.db_path)
+            else:
+                raise
+        with conn:
             # Enable Write-Ahead Logging for concurrency
             conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()

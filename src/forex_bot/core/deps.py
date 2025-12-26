@@ -79,7 +79,7 @@ IMPORT_TO_PYPI = {
     "neuralforecast": "neuralforecast",
     "tslib": "tslib",
     "evotorch": "evotorch",
-    "ax": "ax-platform",
+    "ax": "ax-platform[mysql]",
     "botorch": "botorch",
     "cma": "cma",
     "cudf": "cudf-cu12",
@@ -91,7 +91,7 @@ IMPORT_TO_PYPI = {
     "onnxruntime": "onnxruntime-gpu",
     "openai": "openai",
     "polars": "polars",
-    "pytorch_tabnet": "pytorch-tabnet",
+    "pytorch_tabnet": "pytorch-tabnet2",
     "skl2onnx": "skl2onnx",
     "threadpoolctl": "threadpoolctl",
     "transformer_engine": "transformer-engine",
@@ -221,8 +221,8 @@ def ensure_dependencies() -> None:
         if not pkg:
             continue
 
-        # Skip packages known to lack wheels for Py3.13 (e.g., pytorch-tabnet, flash-attn).
-        if is_py313 and pkg in {"pytorch-tabnet", "flash-attn", "transformer-engine"}:
+        # Skip packages known to lack wheels for Py3.13 (e.g., transformer-engine).
+        if is_py313 and pkg in {"transformer-engine"}:
             continue
 
         # Filter exclusions
@@ -311,6 +311,11 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
 
     final_pkgs: list[str] = []
     for p in packages:
+        if p == "flash-attn":
+            wheel = _flash_attn_wheel_url()
+            if wheel:
+                final_pkgs.append(wheel)
+                continue
         if p in SPECIAL_SOURCES:
             final_pkgs.append(SPECIAL_SOURCES[p])
         else:
@@ -318,3 +323,44 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
 
     logger.info(f"Running pip: {' '.join(cmd + final_pkgs)}")
     subprocess.check_call(cmd + final_pkgs)
+
+
+def _flash_attn_wheel_url() -> str | None:
+    override = os.environ.get("FOREX_BOT_FLASH_ATTN_WHEEL_URL")
+    if override:
+        return override
+    try:
+        import platform as _platform
+        if _platform.system().lower() != "linux":
+            return None
+        machine = _platform.machine().lower()
+        if machine not in {"x86_64", "amd64"}:
+            return None
+        py_ver = sys.version_info[:2]
+        try:
+            import torch
+        except Exception:
+            return None
+        torch_ver = str(getattr(torch, "__version__", "")).split("+")[0]
+        torch_major_minor = ".".join(torch_ver.split(".")[:2])
+        if torch_major_minor not in {"2.6", "2.7", "2.8", "2.9"}:
+            return None
+        cuda_ver = getattr(getattr(torch, "version", None), "cuda", None)
+        if not cuda_ver or not str(cuda_ver).startswith("12"):
+            return None
+        abi_flag = "TRUE"
+        try:
+            abi_flag = "TRUE" if bool(getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", True)) else "FALSE"
+        except Exception:
+            pass
+        cp_tag = f"cp{py_ver[0]}{py_ver[1]}"
+        # Wheels exist for cp39-cp313 for torch2.6/2.7/2.8. Torch2.9 wheels are
+        # currently published for cp312 only.
+        if torch_major_minor == "2.9" and cp_tag != "cp312":
+            return None
+        return (
+            "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/"
+            f"flash_attn-2.8.3+cu12torch{torch_major_minor}cxx11abi{abi_flag}-{cp_tag}-{cp_tag}-linux_x86_64.whl"
+        )
+    except Exception:
+        return None
