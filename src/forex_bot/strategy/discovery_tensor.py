@@ -283,6 +283,7 @@ class TensorDiscoveryEngine:
 
                             sum_ret = torch.zeros(local_pop, device=dev)
                             sum_sq_ret = torch.zeros(local_pop, device=dev)
+                            effective_samples = 0
                             running_cum_ret = torch.zeros(local_pop, device=dev)
                             running_peak = torch.zeros(local_pop, device=dev)
                             max_dd = torch.zeros(local_pop, device=dev)
@@ -290,7 +291,7 @@ class TensorDiscoveryEngine:
                             if month_ids is not None and self.month_count > 0:
                                 month_returns = torch.zeros((local_pop, self.month_count), device=dev)
 
-                            chunk_size = max(1, n_samples // 10)
+                            chunk_size = max(1, (n_samples - 1) // 10)
                             profitable_chunks = torch.zeros(local_pop, device=dev)
                             current_chunk_ret = torch.zeros(local_pop, device=dev)
 
@@ -320,21 +321,26 @@ class TensorDiscoveryEngine:
                                 actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
 
                                 close = ohlc_slice[0, :, 3]
-                                rets = torch.zeros_like(close)
-                                rets[1:] = (close[1:] - close[:-1]) / (close[:-1] + 1e-9)
+                                if close.numel() <= 1:
+                                    del signals, actions, data_slice, ohlc_slice
+                                    continue
+                                rets = (close[1:] - close[:-1]) / (close[:-1] + 1e-9)
+                                actions = actions[:, :-1]
 
                                 if has_news:
                                     if preload:
                                         impact_slice = gpu_news[gpu_idx][start_idx:end_idx, 1]
                                     else:
                                         impact_slice = self.news_tensor_cpu[start_idx:end_idx, 1].to(dev, non_blocking=True)
-                                    is_news_event = (impact_slice > 0.7).float()
-                                    trade_cost = is_news_event * 0.0002
-                                    rets = rets - (trade_cost * torch.abs(actions).mean(dim=0))
+                                    if impact_slice.numel() > 1:
+                                        impact_slice = impact_slice[1:]
+                                        is_news_event = (impact_slice > 0.7).float()
+                                        trade_cost = is_news_event * 0.0002
+                                        rets = rets - (trade_cost * torch.abs(actions).mean(dim=0))
 
                                 batch_rets = actions * rets.unsqueeze(0)
                                 if month_returns is not None and month_ids is not None:
-                                    month_ids_batch = month_ids[start_idx:end_idx]
+                                    month_ids_batch = month_ids[start_idx + 1 : end_idx]
                                     month_returns.scatter_add_(
                                         1,
                                         month_ids_batch.unsqueeze(0).expand(local_pop, -1),
@@ -343,6 +349,7 @@ class TensorDiscoveryEngine:
 
                                 sum_ret = sum_ret + batch_rets.sum(dim=1)
                                 sum_sq_ret = sum_sq_ret + (batch_rets**2).sum(dim=1)
+                                effective_samples += batch_rets.shape[1]
                                 current_chunk_ret = current_chunk_ret + batch_rets.sum(dim=1)
 
                                 if (end_idx // chunk_size) > (start_idx // chunk_size):
@@ -364,8 +371,10 @@ class TensorDiscoveryEngine:
 
                             torch.cuda.empty_cache()
 
-                            mean_ret = sum_ret / n_samples
-                            std_ret = torch.sqrt(torch.clamp((sum_sq_ret / n_samples) - mean_ret**2, min=1e-9)) + 1e-6
+                            if effective_samples <= 0:
+                                return torch.full((local_pop,), -1e9)
+                            mean_ret = sum_ret / effective_samples
+                            std_ret = torch.sqrt(torch.clamp((sum_sq_ret / effective_samples) - mean_ret**2, min=1e-9)) + 1e-6
                             sharpe = (mean_ret / std_ret) * (252 * 1440) ** 0.5
 
                             fitness = sharpe * (profitable_chunks / 10.0)
