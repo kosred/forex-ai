@@ -155,6 +155,22 @@ class TensorDiscoveryEngine:
 
     def run_unsupervised_search(self, frames: Dict[str, pd.DataFrame], news_features: Optional[pd.DataFrame] = None, iterations: int = 1000):
         self._prepare_tensor_cube(frames, news_features)
+        debug_metrics = os.environ.get("FOREX_BOT_DISCOVERY_DEBUG_METRICS", "1").strip().lower() not in {"0", "false", "no", "off"}
+        debug_snapshot = {
+            "fitness": None,
+            "sharpe": None,
+            "mean_ret": None,
+            "std_ret": None,
+            "max_dd": None,
+            "profitable_chunks": None,
+            "consistency": None,
+            "samples": None,
+        }
+        if debug_metrics:
+            import threading
+            debug_lock = threading.Lock()
+        else:
+            debug_lock = None
 
         # 1. Setup GPU Contexts for all workers
         # Pre-load data to each GPU once to avoid transfer bottlenecks
@@ -394,10 +410,34 @@ class TensorDiscoveryEngine:
                             fitness = torch.where(max_dd > 0.07, torch.tensor(-1e9, device=dev), fitness)
                             fitness = torch.where(std_ret * (1440**0.5) > 0.04, fitness * 0.1, fitness)
 
+                            consistency = None
                             if month_returns is not None:
                                 negative_months = (month_returns < 0).sum(dim=1).float()
                                 consistency = torch.clamp(1.0 - (negative_months * 0.1), min=0.0)
                                 fitness = fitness * consistency
+
+                            if debug_lock is not None:
+                                try:
+                                    best_idx = int(torch.argmax(fitness).item())
+                                    best_fit = float(fitness[best_idx].item())
+                                    best_sharpe = float(sharpe[best_idx].item())
+                                    best_mean = float(mean_ret[best_idx].item())
+                                    best_std = float(std_ret[best_idx].item())
+                                    best_dd = float(max_dd[best_idx].item())
+                                    best_chunks = float(profitable_chunks[best_idx].item())
+                                    best_consistency = float(consistency[best_idx].item()) if consistency is not None else 1.0
+                                    with debug_lock:
+                                        if debug_snapshot["fitness"] is None or best_fit > debug_snapshot["fitness"]:
+                                            debug_snapshot["fitness"] = best_fit
+                                            debug_snapshot["sharpe"] = best_sharpe
+                                            debug_snapshot["mean_ret"] = best_mean
+                                            debug_snapshot["std_ret"] = best_std
+                                            debug_snapshot["max_dd"] = best_dd
+                                            debug_snapshot["profitable_chunks"] = best_chunks
+                                            debug_snapshot["consistency"] = best_consistency
+                                            debug_snapshot["samples"] = int(effective_samples)
+                                except Exception:
+                                    pass
 
                             fitness_all.append(fitness.detach().cpu())
 
@@ -515,6 +555,23 @@ class TensorDiscoveryEngine:
                     best_val = float(current_best)
                     last_improve = i
                 logger.info(f"Generation {i}: Global Best Fitness = {float(current_best):.4f}")
+                if debug_lock is not None:
+                    with debug_lock:
+                        snap = dict(debug_snapshot)
+                    if snap.get("fitness") is not None:
+                        logger.info(
+                            "Gen %d metrics: best_fit=%.4f sharpe=%.4f mean_ret=%.6f std_ret=%.6f max_dd=%.4f "
+                            "prof_chunks=%.1f consistency=%.3f samples=%s",
+                            i,
+                            snap["fitness"],
+                            snap["sharpe"],
+                            snap["mean_ret"],
+                            snap["std_ret"],
+                            snap["max_dd"],
+                            snap["profitable_chunks"],
+                            snap["consistency"],
+                            snap["samples"],
+                        )
                 if plateau_gens > 0 and (i - last_improve) >= plateau_gens and best_val >= score_target:
                     logger.info(
                         f"Plateau reached ({plateau_gens} gens, best={best_val:.4f} >= {score_target}). Stopping early."
