@@ -45,12 +45,15 @@ class TensorDiscoveryEngine:
         master_idx = frames[master_tf].index
 
         # Adaptive downsampling to avoid CPU OOM on massive datasets.
+        stream_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_STREAM", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
         try:
             max_rows_env = int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_ROWS", "0") or 0)
         except Exception:
             max_rows_env = 0
         max_rows = max_rows_env
-        if max_rows <= 0:
+        if stream_mode:
+            max_rows = 0
+        if max_rows <= 0 and not stream_mode:
             try:
                 from ..core.system import HardwareProbe
 

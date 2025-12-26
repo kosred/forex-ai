@@ -786,7 +786,8 @@ class DataLoader:
                     df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
                 df = df.sort_index()
                 df = self._adjust_to_utc(df)
-                max_rows = int(getattr(self.settings.system, "max_training_rows_per_tf", 0))
+                full_data = str(os.environ.get("FOREX_BOT_FULL_DATA", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+                max_rows = 0 if full_data else int(getattr(self.settings.system, "max_training_rows_per_tf", 0))
                 if max_rows and len(df) > max_rows:
                     df = df.tail(max_rows)
                 if getattr(self.settings.system, "downcast_training_float32", True):

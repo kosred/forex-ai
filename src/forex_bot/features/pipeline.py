@@ -205,7 +205,8 @@ class FeatureEngineer:
         df = base.copy()
 
         # Optional row cap to prevent runaway memory on very long histories
-        max_rows = int(getattr(self.settings.system, "max_training_rows_per_tf", 0) or 0)
+        full_data = str(os.environ.get("FOREX_BOT_FULL_DATA", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        max_rows = 0 if full_data else int(getattr(self.settings.system, "max_training_rows_per_tf", 0) or 0)
         if max_rows > 0 and len(df) > max_rows:
             df = df.tail(max_rows)
 

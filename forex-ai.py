@@ -79,6 +79,8 @@ os.environ.setdefault("FOREX_BOT_DISABLE_COMPILE", "1")
 # Tuning for 16GB+ VRAM Cards (A4000/A6000)
 os.environ.setdefault("FOREX_BOT_GLOBAL_POOL_MEM_FRAC", "0.20")
 os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", "auto")
+if _is_truthy(os.environ.get("FOREX_BOT_DISCOVERY_STREAM")):
+    os.environ.setdefault("FOREX_BOT_FULL_DATA", "1")
 
 # Linux-specific: Ensure system CUDA libraries take precedence if present
 if sys.platform.startswith("linux"):
