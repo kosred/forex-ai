@@ -446,8 +446,18 @@ class AutoTuner:
 
     def _apply_feature_workers(self, hints: AutoTuneHints) -> None:
         """Set feature-engineering worker count if not explicitly provided."""
-        if not os.environ.get("FEATURE_WORKERS"):
-            os.environ["FEATURE_WORKERS"] = str(max(1, hints.feature_workers))
+        if os.environ.get("FOREX_BOT_FEATURE_WORKERS") or os.environ.get("FEATURE_WORKERS"):
+            return
+        target = max(1, int(getattr(hints, "feature_workers", 1) or 1))
+        try:
+            num_gpus = max(0, int(getattr(hints, "num_gpus", 0) or 0))
+            if num_gpus > 0:
+                # Default to one worker per GPU to avoid OOM in feature-engineering workers.
+                target = min(target, max(1, num_gpus))
+        except Exception:
+            pass
+        os.environ["FOREX_BOT_FEATURE_WORKERS"] = str(target)
+        os.environ["FEATURE_WORKERS"] = str(target)
 
     def _apply_discovery_autotune(self, hints: AutoTuneHints) -> None:
         """Auto-tune discovery settings based on GPU/RAM if env not set."""
