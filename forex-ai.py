@@ -69,14 +69,12 @@ if __name__ == "__main__":
 
             ensure_dependencies()
             
-            # Self-Correction: Ensure package is installed in editable mode if using venv
-            # This prevents "AttributeError" in workers due to stale package installs
+            # 2025 SELF-HEALING: Mandatory editable install to sync source with environment.
+            # This kills the 'AttributeError' once and for all by linking the venv directly to ./src.
             if sys.prefix != sys.base_prefix: # Running in venv
-                try:
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "-e", "."], cwd=SCRIPT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    print("[INIT] Source code linked to environment (pip install -e .).")
-                except Exception:
-                    pass
+                print("[INIT] Syncing environment with local source code...", flush=True)
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps", "-e", "."], cwd=SCRIPT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("[INIT] Environment synced (pip install -e .).")
         else:
             print("[INIT] Skipping dependency bootstrap (FOREX_BOT_SKIP_DEPS=1).", flush=True)
     except Exception as dep_err:
