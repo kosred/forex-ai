@@ -956,7 +956,7 @@ class TrainingService:
         if rank == 0:
             # --- RANK 0: Heavy Lifting ---
             # Allow overriding feature-engineering worker count via env to avoid pool crashes/OOM.
-            env_workers = os.getenv("FEATURE_WORKERS")
+            env_workers = os.getenv("FOREX_BOT_FEATURE_WORKERS") or os.getenv("FEATURE_WORKERS")
             if env_workers:
                 try:
                     max_workers = max(1, int(env_workers))
@@ -988,13 +988,16 @@ class TrainingService:
             # Parallel Feature Engineering (use spawn to avoid CUDA fork issues)
             logger.info(f"HPC (Rank 0): Launching feature engineering on {max_workers} workers...")
             spawn_ctx = multiprocessing.get_context("spawn")
+            # Avoid oversubscribing GPUs during feature engineering (cupy/cudf in workers can OOM).
+            gpu_count = len(self.discovery_engine.gpu_pool) if hasattr(self.discovery_engine, "gpu_pool") else 1
+            if gpu_count <= 1:
+                import torch
+                gpu_count = torch.cuda.device_count()
+            if not env_workers and gpu_count > 0:
+                max_workers = min(max_workers, max(1, gpu_count))
+
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
                 futures: dict[concurrent.futures.Future, str] = {}
-                gpu_count = len(self.discovery_engine.gpu_pool) if hasattr(self.discovery_engine, "gpu_pool") else 1
-                if gpu_count <= 1:
-                    import torch
-                    gpu_count = torch.cuda.device_count()
-
                 for i, (sym, frames) in enumerate(raw_frames_map.items()):
                     assigned_gpu = i % max(1, gpu_count)
                     fut = executor.submit(
@@ -1011,6 +1014,9 @@ class TrainingService:
                     try:
                         sym = futures.get(fut, "UNKNOWN")
                         ds = fut.result()
+                        if ds is None:
+                            logger.error(f"HPC Feature Gen failed (empty dataset) for {sym}")
+                            continue
                         datasets.append((sym, ds))
                     except Exception as e:
                         logger.error(f"HPC Feature Gen failed: {e}")
