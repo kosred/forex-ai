@@ -329,9 +329,9 @@ class TensorDiscoveryEngine:
                                         news_slice = self.news_tensor_cpu[start_idx:end_idx, 0].to(dev, non_blocking=True)
                                     signals = signals + (news_slice.unsqueeze(0) * 0.5)
 
-                            actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
-                            actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
-                            actions = actions.float()
+                                actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
+                                actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
+                                actions = actions.float()
 
                                 close = ohlc_slice[0, :, 3]
                                 if close.numel() <= 1:
