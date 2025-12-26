@@ -47,14 +47,15 @@ class TensorDiscoveryEngine:
                 # Merge News Features if available
                 if news_map and tf in news_map and news_map[tf] is not None:
                     nf = news_map[tf].reindex(master_idx).ffill().fillna(0.0)
-                    # We only care about sentiment and impact for the discovery engine
-                    # Assuming columns like 'news_sentiment', 'news_impact' exists or created by pipeline
-                    # If not, we skip.
-                    # But TrainingService passes result of _build_news_features which aligns to base_tf.
-                    # For simplicity, we align the base news features to the current DF if indices match
                     pass
 
                 feats = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+                
+                # DEBUG: Print columns to diagnose missing features
+                if len(cube_list) == 0:
+                    logger.info(f"DEBUG: TF {tf} Columns ({len(df.columns)}): {list(df.columns)[:10]} ...")
+                    logger.info(f"DEBUG: Numeric Shape: {feats.shape}")
+
                 f_std = np.maximum(feats.std(axis=0), 1e-6)
                 norm = (feats - feats.mean(axis=0)) / f_std
                 ohlc = df[['open', 'high', 'low', 'close']].to_numpy(dtype=np.float32)
