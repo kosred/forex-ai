@@ -192,6 +192,11 @@ class TensorDiscoveryEngine:
         except Exception:
             commission_per_lot = 7.0
         try:
+            threshold_gap = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_GAP", "0.05") or 0.05)
+        except Exception:
+            threshold_gap = 0.05
+        threshold_gap = max(0.0, threshold_gap)
+        try:
             lot_size = float(os.environ.get("FOREX_BOT_DISCOVERY_LOT_SIZE", "100000") or 100000.0)
         except Exception:
             lot_size = 100000.0
@@ -351,12 +356,23 @@ class TensorDiscoveryEngine:
                             tf_weights = F.softmax(genomes[:, :tf_count], dim=1)
                             logic_weights = genomes[:, tf_count : tf_count + self.n_features]
                             thresholds = genomes[:, -2:]
+                            raw_t0 = thresholds[:, 0]
+                            raw_t1 = thresholds[:, 1]
+                            lo_t = torch.minimum(raw_t0, raw_t1)
+                            hi_t = torch.maximum(raw_t0, raw_t1)
+                            if threshold_gap > 0:
+                                half_gap = threshold_gap * 0.5
+                                buy_th = hi_t + half_gap
+                                sell_th = lo_t - half_gap
+                            else:
+                                buy_th = hi_t
+                                sell_th = lo_t
 
                             sum_ret = torch.zeros(local_pop, device=dev)
                             sum_sq_ret = torch.zeros(local_pop, device=dev)
                             effective_samples = 0
-                            running_cum_ret = torch.zeros(local_pop, device=dev)
-                            running_peak = torch.zeros(local_pop, device=dev)
+                            running_equity = torch.ones(local_pop, device=dev)
+                            running_peak = torch.ones(local_pop, device=dev)
                             max_dd = torch.zeros(local_pop, device=dev)
                             month_returns = None
                             if month_ids is not None and self.month_count > 0:
@@ -399,8 +415,8 @@ class TensorDiscoveryEngine:
                                             impact_slice = news_slice[:, 1]
                                     signals = signals + (sentiment.unsqueeze(0) * 0.5)
 
-                                actions = torch.where(signals > thresholds[:, 0].unsqueeze(1), 1.0, 0.0)
-                                actions = torch.where(signals < thresholds[:, 1].unsqueeze(1), -1.0, actions)
+                                actions = torch.where(signals > buy_th.unsqueeze(1), 1.0, 0.0)
+                                actions = torch.where(signals < sell_th.unsqueeze(1), -1.0, actions)
 
                                 if (end_idx - start_idx) < 2:
                                     del signals, actions, data_slice, ohlc_slice
@@ -440,15 +456,17 @@ class TensorDiscoveryEngine:
                                     profitable_chunks = profitable_chunks + (current_chunk_ret > 0).float()
                                     current_chunk_ret = torch.zeros_like(current_chunk_ret)
 
-                                batch_cum = batch_rets.cumsum(dim=1)
-                                abs_cum = batch_cum + running_cum_ret.unsqueeze(1)
+                                equity_step = torch.clamp(1.0 + batch_rets, min=1e-6)
+                                batch_equity = torch.cumprod(equity_step, dim=1)
+                                abs_equity = batch_equity * running_equity.unsqueeze(1)
                                 batch_peaks = torch.maximum(
-                                    torch.cummax(abs_cum, dim=1)[0],
+                                    torch.cummax(abs_equity, dim=1)[0],
                                     running_peak.unsqueeze(1),
                                 )
-                                max_dd = torch.maximum((batch_peaks - abs_cum).max(dim=1)[0], max_dd)
+                                dd = (batch_peaks - abs_equity) / torch.clamp(batch_peaks, min=1e-9)
+                                max_dd = torch.maximum(dd.max(dim=1)[0], max_dd)
 
-                                running_cum_ret = abs_cum[:, -1]
+                                running_equity = abs_equity[:, -1]
                                 running_peak = batch_peaks[:, -1]
 
                                 if month_returns is not None and month_ids is not None:
@@ -460,7 +478,7 @@ class TensorDiscoveryEngine:
                                             batch_rets,
                                         )
 
-                                del signals, actions, rets, batch_rets, batch_cum, abs_cum, batch_peaks, data_slice, ohlc_slice
+                                del signals, actions, rets, batch_rets, equity_step, batch_equity, abs_equity, batch_peaks, dd, data_slice, ohlc_slice
                                 if has_news and news_slice is not None:
                                     del news_slice
 

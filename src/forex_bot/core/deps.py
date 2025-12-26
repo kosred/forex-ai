@@ -310,19 +310,38 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
         cmd.extend(["--index-url", index_url])
 
     final_pkgs: list[str] = []
+    flash_build: list[str] = []
+    def _truthy(val: str | None) -> bool:
+        if val is None:
+            return False
+        return str(val).strip().lower() in {"1", "true", "yes", "on"}
+    allow_flash_build = _truthy(os.environ.get("FOREX_BOT_FLASH_ATTN_BUILD"))
     for p in packages:
         if p == "flash-attn":
             wheel = _flash_attn_wheel_url()
             if wheel:
                 final_pkgs.append(wheel)
                 continue
+            if allow_flash_build:
+                flash_build.append(p)
+                continue
+            logger.warning(
+                "Skipping flash-attn install: no compatible wheel detected. "
+                "Set FOREX_BOT_FLASH_ATTN_BUILD=1 to attempt a source build."
+            )
+            continue
         if p in SPECIAL_SOURCES:
             final_pkgs.append(SPECIAL_SOURCES[p])
         else:
             final_pkgs.append(p)
 
-    logger.info(f"Running pip: {' '.join(cmd + final_pkgs)}")
-    subprocess.check_call(cmd + final_pkgs)
+    if final_pkgs:
+        logger.info(f"Running pip: {' '.join(cmd + final_pkgs)}")
+        subprocess.check_call(cmd + final_pkgs)
+    if flash_build:
+        build_cmd = list(cmd) + ["--no-build-isolation"]
+        logger.info(f"Running pip (flash-attn source build): {' '.join(build_cmd + flash_build)}")
+        subprocess.check_call(build_cmd + flash_build)
 
 
 def _flash_attn_wheel_url() -> str | None:
