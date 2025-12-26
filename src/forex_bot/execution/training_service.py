@@ -272,7 +272,8 @@ class TrainingService:
         discovery_frames = frames.copy()
         base_tf = self.settings.system.base_timeframe
         
-        logger.info(f"[DEBUG] Base TF: {base_tf}. Dataset Shape: {dataset.X.shape}")
+        print(f"DEBUG: Base TF: {base_tf}. Dataset Shape: {dataset.X.shape}")
+        print(f"DEBUG: Dataset Columns (first 10): {list(dataset.X.columns)[:10]}")
         
         if base_tf in discovery_frames:
              # Merge dataset.X (features) with original OHLC (needed for PnL)
@@ -284,48 +285,21 @@ class TrainingService:
                      if col in orig.columns:
                          rich_df[col] = orig[col]
              discovery_frames[base_tf] = rich_df
-             logger.info(f"[DEBUG] Enriched {base_tf} with {rich_df.shape[1]} columns.")
+             print(f"DEBUG: Enriched {base_tf} with {rich_df.shape[1]} columns.")
         else:
-             logger.warning(f"[DEBUG] Base TF {base_tf} not found in frames keys: {list(discovery_frames.keys())}")
+             print(f"DEBUG: Base TF {base_tf} not found in frames keys: {list(discovery_frames.keys())}")
 
         # CRITICAL FIX: Tensor Discovery expects UNIFORM feature sets across timeframes.
-        # If M5 has 200 features and M1 has 5, torch.stack() will crash or behavior is undefined.
-        # We must align all frames to the enriched feature set (forward/back filling or resampling).
-        # Since we only engineered the Base TF, we project these features to other TFs?
-        # No, that's wrong (M1 can't have M5 features easily without lookahead/lag).
+        # ...
         
-        # STRATEGY CHANGE: 
-        # For Discovery, we only use the ENRICHED Base Timeframe if we want the 200 features.
-        # We cannot use Multi-TF (M1..D1) if they don't have the same features.
-        # So we pass ONLY the base_tf frame to discovery if we want full features.
-        
-        # BUT discovery_tensor uses self.timeframes = ["M1", ...].
-        # We need to tell it to ONLY look at base_tf?
-        # Or we force all frames to match base_tf columns (filling missing with 0).
-        
-        feature_cols = dataset.X.columns.tolist()
-        aligned_frames = {}
-        
-        # We map the rich features to other timeframes (reindexing/ffill) 
-        # This is heavy but necessary for uniform tensor.
-        # Actually, simpler: Discovery Engine usually runs on ONE main timeframe for the "Logic", 
-        # and maybe peeks at others.
-        # If we want 200 features, we should probably stick to Single-TF Discovery for now,
-        # OR we replicate the features to all TFs (features are slow, so maybe just ffill the M5 features to M1?)
-        
-        # Let's try: Propagate M5 features to all TFs.
-        # M1 gets M5 features (ffilled). H1 gets M5 features (sampled).
-        # This unifies the feature space.
-        
-        logger.info("[DEBUG] Aligning all discovery frames to enriched feature space...")
+        print("DEBUG: Aligning all discovery frames to enriched feature space...")
         reference_df = discovery_frames[base_tf]
         
         for tf in ["M1", "M5", "M15", "H1", "H4", "D1"]:
             if tf in frames:
                 # Reindex reference (Rich Features) to target TF index
-                # This puts "M5 SMA" onto "H1" candles (last known M5 SMA).
                 aligned = reference_df.reindex(frames[tf].index, method="ffill").fillna(0.0)
-                # Ensure OHLC is from the TARGET timeframe (real H1 price, not M5 price)
+                # Ensure OHLC is from the TARGET timeframe
                 aligned["open"] = frames[tf]["open"]
                 aligned["high"] = frames[tf]["high"]
                 aligned["low"] = frames[tf]["low"]
@@ -334,7 +308,9 @@ class TrainingService:
         
         # Update discovery frames to the aligned set
         discovery_frames = aligned_frames
-        logger.info(f"[DEBUG] Alignment complete. Frames: {list(discovery_frames.keys())}")
+        print(f"DEBUG: Alignment complete. Frames: {list(discovery_frames.keys())}")
+        # Validate one frame
+        print(f"DEBUG: M1 Columns: {len(discovery_frames['M1'].columns)}")
 
         # New Unsupervised Tensor Engine (Million-Search)
         # We increase experts to 100 to create a diverse "Council of 100" for the deep models
