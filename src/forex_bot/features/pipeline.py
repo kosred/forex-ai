@@ -5,6 +5,8 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+import concurrent.futures
+import multiprocessing
 
 import joblib
 import numpy as np
@@ -75,6 +77,47 @@ def to_numpy_safe(data: Any) -> np.ndarray:
             
     # 3. Fallback to standard NumPy conversion
     return np.asarray(data)
+
+
+def _feature_cpu_budget() -> int:
+    """Best-effort CPU budget per rank/process for feature work."""
+    per_gpu = os.environ.get("FOREX_BOT_CPU_THREADS_PER_GPU")
+    if per_gpu and os.environ.get("LOCAL_RANK") is not None:
+        try:
+            return max(1, int(per_gpu))
+        except Exception:
+            pass
+    for key in ("FOREX_BOT_CPU_BUDGET", "FOREX_BOT_CPU_THREADS"):
+        val = os.environ.get(key)
+        if val:
+            try:
+                return max(1, int(val))
+            except Exception:
+                pass
+    return os.cpu_count() or 1
+
+
+def _talib_chunk_worker(payload):
+    """Compute a chunk of TA-Lib indicators for parallel feature injection."""
+    inputs, indicators, use_volume = payload
+    out: dict[str, np.ndarray] = {}
+    for ind_name in indicators:
+        try:
+            if (not use_volume) and ind_name in VOLUME_TALIB_INDICATORS:
+                continue
+            if ind_name in ["SMA", "EMA", "RSI", "BBANDS", "ADX", "CCI", "MOM", "ROC", "WILLR", "ATR"]:
+                continue
+            func = abstract.Function(ind_name)
+            res = func(inputs)
+            if isinstance(res, (list, tuple)):
+                for i, arr in enumerate(res):
+                    out[f"ta_{ind_name.lower()}_{i}"] = arr.astype(np.float32)
+            elif isinstance(res, (pd.Series, np.ndarray)):
+                val = res.values if isinstance(res, pd.Series) else res
+                out[f"ta_{ind_name.lower()}"] = val.astype(np.float32)
+        except Exception:
+            continue
+    return out
 
 
 class FeatureEngineer:
