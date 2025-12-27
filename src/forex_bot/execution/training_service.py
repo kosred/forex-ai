@@ -1032,7 +1032,11 @@ class TrainingService:
             if gpu_count <= 1:
                 import torch
                 gpu_count = torch.cuda.device_count()
-            if not env_workers and gpu_count > 0:
+            # If feature engineering is forced to CPU, allow using more CPU workers.
+            force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+            if not env_workers and gpu_count > 0 and not force_cpu:
                 max_workers = min(max_workers, max(1, gpu_count))
 
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
