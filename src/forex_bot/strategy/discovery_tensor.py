@@ -1,4 +1,5 @@
 import contextlib
+import math
 import logging
 import os
 import time
@@ -262,11 +263,11 @@ class TensorDiscoveryEngine:
                                 except torch.OutOfMemoryError:
                                     torch.cuda.empty_cache(); gc.collect()
                                     batch_size_map[gpu_idx] = int(current_batch * 0.5)
-                                    if batch_size_map[gpu_idx] < 128: return torch.full((chunk.shape[0],), -1e9)
+                                        if batch_size_map[gpu_idx] < 128: return torch.full((chunk.shape[0],), 0.0)
                                     continue
                         return torch.cat(fitness_all, dim=0)
                 except Exception as e: 
-                    logger.error(f"GPU {gpu_idx} fatal: {e}"); return torch.full((chunk.shape[0],), -1e9)
+                    logger.error(f"GPU {gpu_idx} fatal: {e}"); return torch.full((chunk.shape[0],), 0.0)
 
             def _eval_batch_safe(gpu_idx, dev, genomes, batch_size, n_samples, preload, 
                                  gpu_data_cubes, gpu_ohlc_cubes, gpu_news, month_ids):
@@ -282,7 +283,8 @@ class TensorDiscoveryEngine:
                 running_peak = torch.ones(local_pop, device=dev, dtype=torch.float32)
                 
                 survival_steps = torch.zeros(local_pop, device=dev, dtype=torch.float32)
-                alive_mask = torch.ones(local_pop, device=dev, dtype=torch.bool)
+                    alive_mask = torch.ones(local_pop, device=dev, dtype=torch.bool)
+                    trade_steps = torch.zeros(local_pop, device=dev, dtype=torch.float32)
 
                 tf_count = self.data_cube_cpu.shape[0]
                 matmul_dtype = torch.float16 if dev.type == "cuda" else torch.float32
@@ -321,6 +323,7 @@ class TensorDiscoveryEngine:
                     active_rets = torch.where(alive_mask.unsqueeze(1), batch_rets, torch.zeros_like(batch_rets))
                     sum_ret.add_(active_rets.sum(dim=1))
                     sum_sq_ret.add_((active_rets**2).sum(dim=1))
+                    trade_steps.add_((torch.abs(actions[:, :-1]).to(dtype=torch.float32) * alive_mask.unsqueeze(1)).sum(dim=1))
                     
                     for s in range(n_segments):
                         overlap_start = max(start_idx, s * seg_size)
@@ -340,24 +343,78 @@ class TensorDiscoveryEngine:
                     
                     running_equity.copy_(abs_equity[:, -1]); running_peak.copy_(batch_peaks[:, -1])
 
-                # --- FITNESS CALCULATION ---
-                survival_ratio = survival_steps / n_samples
-                mean_r = sum_ret / torch.clamp(survival_steps, min=1.0)
-                std_r = torch.sqrt(torch.clamp((sum_sq_ret / torch.clamp(survival_steps, min=1.0)) - mean_r**2, min=1e-9)) + 1e-5
+                # --- FITNESS CALCULATION (POSITIVE, PROP-ALIGNED) ---
+                denom = torch.clamp(survival_steps, min=1.0)
+                survival_ratio = torch.clamp(survival_steps / max(1, n_samples), 0.0, 1.0)
+
+                mean_r = sum_ret / denom
+                std_r = torch.sqrt(torch.clamp((sum_sq_ret / denom) - mean_r**2, min=1e-9)) + 1e-6
                 sharpe = (mean_r / std_r) * (252 * 1440)**0.5
-                sharpe = torch.clamp(sharpe, min=-5.0, max=10.0)
-                
+                try:
+                    sharpe_cap = float(os.environ.get("FOREX_BOT_DISCOVERY_SHARPE_CAP", "10.0") or 10.0)
+                except Exception:
+                    sharpe_cap = 10.0
+                sharpe = torch.clamp(sharpe, min=-sharpe_cap, max=sharpe_cap)
+
+                # Probabilistic Sharpe (normal approx)
+                n_eff = torch.clamp(denom, min=2.0)
+                se = torch.sqrt((1.0 + 0.5 * sharpe**2) / torch.clamp(n_eff - 1.0, min=1.0))
+                z = sharpe / torch.clamp(se, min=1e-6)
+                psr = 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
+
+                try:
+                    ret_scale = float(os.environ.get("FOREX_BOT_DISCOVERY_RET_SCALE", "0.0002") or 0.0002)
+                except Exception:
+                    ret_scale = 0.0002
+                ret_scale = max(ret_scale, 1e-9)
+                return_score = 0.5 * (torch.tanh(mean_r / ret_scale) + 1.0)
+
                 segment_profitability = (seg_rets > 0).float().sum(dim=1)
-                consistency_bonus = (segment_profitability / n_segments) * 5.0
-                dd_penalty = torch.where(max_dd > 0.08, (max_dd - 0.08) * 50.0, torch.tensor(0.0, device=dev))
-                
-                total_fitness = (survival_ratio * 10.0) + sharpe + consistency_bonus - dd_penalty
+                consistency_score = segment_profitability / float(n_segments)
+
+                trade_density = trade_steps / denom
+                try:
+                    target_density = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_DENSITY", "0.01") or 0.01)
+                except Exception:
+                    target_density = 0.01
+                target_density = max(target_density, 1e-6)
+                trade_score = torch.clamp(trade_density / target_density, 0.0, 1.0)
+
+                try:
+                    dd_limit = float(os.environ.get("FOREX_BOT_DISCOVERY_DD_LIMIT", "0.07") or 0.07)
+                except Exception:
+                    dd_limit = 0.07
+                try:
+                    dd_alpha = float(os.environ.get("FOREX_BOT_DISCOVERY_DD_ALPHA", "30.0") or 30.0)
+                except Exception:
+                    dd_alpha = 30.0
+                dd_excess = torch.clamp(max_dd - dd_limit, min=0.0)
+                dd_score = torch.exp(-dd_alpha * dd_excess)
+
+                w_surv, w_ret, w_psr, w_cons, w_trade = 0.25, 0.25, 0.25, 0.15, 0.10
+                raw_score = (
+                    w_surv * survival_ratio
+                    + w_ret * return_score
+                    + w_psr * psr
+                    + w_cons * consistency_score
+                    + w_trade * trade_score
+                )
+                try:
+                    fit_scale = float(os.environ.get("FOREX_BOT_DISCOVERY_FITNESS_SCALE", "10.0") or 10.0)
+                except Exception:
+                    fit_scale = 10.0
+                total_fitness = fit_scale * dd_score * raw_score
                 bi = int(torch.argmax(total_fitness).item())
                 metadata = {
-                    "fit": float(total_fitness[bi].item()), "surv": float(survival_ratio[bi].item()),
-                    "shrp": float(sharpe[bi].item()), "dd": float(max_dd[bi].item()), "segs": int(segment_profitability[bi].item())
+                    "fit": float(total_fitness[bi].item()),
+                    "surv": float(survival_ratio[bi].item()),
+                    "psr": float(psr[bi].item()),
+                    "ret": float(return_score[bi].item()),
+                    "dd": float(max_dd[bi].item()),
+                    "segs": int(segment_profitability[bi].item()),
+                    "trade": float(trade_density[bi].item()),
                 }
-                return torch.nan_to_num(total_fitness, nan=0.0).detach().cpu(), metadata
+                return torch.nan_to_num(total_fitness, nan=0.0, posinf=0.0, neginf=0.0).detach().cpu(), metadata
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_gpus) as executor:
                 futures = {executor.submit(_eval_on_gpu, pop_chunks[i], i): pop_chunks[i].shape[0] for i in range(num_gpus)}
@@ -378,7 +435,11 @@ class TensorDiscoveryEngine:
             searcher.step()
             with registry_lock:
                 m = metrics_registry.get(i)
-                if m: logger.info(f"Discovery (gen {i}): fit={m['fit']:.2f} surv={m['surv']:.2f} shrp={m['shrp']:.2f} dd={m['dd']:.2f} segs={m['segs']}/3")
+                    if m: logger.info(
+                        f"Discovery (gen {i}): fit={m['fit']:.2f} surv={m['surv']:.2f} "
+                        f"psr={m['psr']:.2f} ret={m['ret']:.2f} dd={m['dd']:.2f} "
+                        f"segs={m['segs']}/3 trade={m['trade']:.3f}"
+                    )
             if i % 10 == 0: logger.info(f"Generation {i}: Global Best Fitness = {float(searcher.status.get('best_eval', 0.0)):.4f}")
         
         final_pop = searcher.population.values.detach().cpu()
