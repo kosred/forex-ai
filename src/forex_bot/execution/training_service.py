@@ -1156,8 +1156,11 @@ class TrainingService:
             # but we force the workers to use the shared RAM space.
             all_tasks = []
             for sym, frames in raw_frames_map.items():
-                base_df = frames.get(self.settings.system.base_timeframe) or frames.get("M1")
-                if base_df is None: continue
+                base_df = frames.get(self.settings.system.base_timeframe)
+                if base_df is None or (isinstance(base_df, pd.DataFrame) and base_df.empty):
+                    base_df = frames.get("M1")
+                if base_df is None or (isinstance(base_df, pd.DataFrame) and base_df.empty):
+                    continue
                 
                 # Shard each symbol into 32 time-slices
                 n_shards = max(1, max_workers // len(symbols))
