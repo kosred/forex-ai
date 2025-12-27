@@ -181,33 +181,11 @@ if __name__ == "__main__":
             
             # Feature workers are auto-tuned later in core.system.AutoTuner.
 
-            # Auto-DDP: If > 1 GPU and running on Linux, relaunch with torchrun
-            # We skip this if already launched or on Windows (DDP issues)
-            if (
-                os.name != "nt"
-                and gpu_count > 1
-                and os.environ.get("FOREX_BOT_DDP_LAUNCHED") != "1"
-                and "--train" in sys.argv # Only use DDP for training
-            ):
-                print(f"[HPC] Relaunching with torch.distributed.run across {gpu_count} GPUs...", flush=True)
-                env = os.environ.copy()
-                env["FOREX_BOT_DDP_LAUNCHED"] = "1"
-                # Allow controlled CPU usage per rank (defaults to per-GPU threads)
-                env["OMP_NUM_THREADS"] = str(threads_per_worker)
-                env["MKL_NUM_THREADS"] = str(threads_per_worker)
-                env["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
-                env["NUMEXPR_NUM_THREADS"] = str(threads_per_worker)
-                
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "torch.distributed.run",
-                    f"--nproc_per_node={gpu_count}",
-                    __file__,
-                    *sys.argv[1:],
-                ]
-                subprocess.check_call(cmd, env=env)
-                sys.exit(0)
+            # HPC Stability: Single-process Multi-GPU mode.
+            # We use internal ThreadPools for 8-GPU scaling to avoid NCCL socket timeouts.
+            os.environ["FOREX_BOT_DDP_LAUNCHED"] = "1" 
+            os.environ["OMP_NUM_THREADS"] = str(cpu_cores)
+            
     except Exception:
         pass
 

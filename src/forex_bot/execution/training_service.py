@@ -1091,486 +1091,78 @@ class TrainingService:
             logger.warning(f"Global post-train evaluation skipped: {exc}", exc_info=True)
 
     async def _train_global_hpc(self, symbols: list[str], optimize: bool, stop_event: asyncio.Event | None) -> None:
-        logger.info("?? HPC Mode Active: Switching to PARALLEL Global Training (All data in RAM).")
+        logger.info("?? HPC Mode Active: Switching to Parallel Global Training.")
 
-        # DDP Synchronization
-        is_ddp = dist.is_available() and dist.is_initialized()
-        rank = dist.get_rank() if is_ddp else 0
-        world_size = dist.get_world_size() if is_ddp else 1
-        keep_ranks = is_ddp and str(os.environ.get("FOREX_BOT_DDP_KEEP_RANKS", "1") or "1").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
+        # Single-process mode for stability (Avoids NCCL timeouts)
+        rank = 0
+        world_size = 1
 
-        # Cache path for sharing data between ranks
+        # Cache path for data persistence
         cache_path = Path(self.settings.system.cache_dir) / "hpc_datasets.pkl"
-
         datasets: list[tuple[str, PreparedDataset]] = []
         datasets_loaded = False
-        # Optional dataset reuse to avoid re-running feature engineering
-        reuse_cache = str(os.environ.get("FOREX_BOT_HPC_DATASET_CACHE", "1") or "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        # Allow DDP ranks to contribute to feature engineering.
-        distributed_features = is_ddp and str(
-            os.environ.get("FOREX_BOT_HPC_DDP_FEATURES", "1")
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        raw_frames_map: dict[str, dict[str, pd.DataFrame]] = {}
-        news_map: dict[str, pd.DataFrame | None] = {}
-        skip_rank0_heavy = False
-        cache_ready = reuse_cache and cache_path.exists()
 
-        # --- DDP FEATURE SHARDING (use all ranks to build datasets) ---
-        if distributed_features and not cache_ready:
-            target_sym = "EURUSD" if "EURUSD" in symbols else symbols[0]
-            ordered_symbols = [target_sym] + [s for s in symbols if s != target_sym]
-            shard_symbols = [sym for idx, sym in enumerate(ordered_symbols) if idx % world_size == rank]
-            logger.info(
-                f"HPC (Rank {rank}): DDP feature shard {len(shard_symbols)}/{len(ordered_symbols)} symbols."
-            )
-
-            analyzer = None
-            if self.settings.news.enable_news:
-                try:
-                    analyzer = await get_sentiment_analyzer(self.settings)
-                except Exception as exc:
-                    logger.warning(f"News analyzer unavailable (rank {rank}): {exc}")
-
-            local_frames_map: dict[str, dict[str, pd.DataFrame]] = {}
-            local_news_map: dict[str, pd.DataFrame | None] = {}
-            local_datasets: list[tuple[str, PreparedDataset]] = []
-            for sym in shard_symbols:
-                try:
-                    self.settings.system.symbol = sym
-                    await self.data_loader.ensure_history(sym)
-                    frames = await self.data_loader.get_training_data(sym)
-                    if not isinstance(frames, dict) or not frames:
-                        logger.warning(f"HPC (Rank {rank}): Missing frames for {sym}")
-                        continue
-                    local_frames_map[sym] = frames
-                    if analyzer is not None:
-                        local_news_map[sym] = self._build_news_features(analyzer, sym, frames)
-                    ds = self.feature_engineer.prepare(
-                        frames,
-                        news_features=local_news_map.get(sym),
-                        symbol=sym,
-                    )
-                    local_datasets.append((sym, ds))
-                except Exception as exc:
-                    logger.error(f"HPC (Rank {rank}) feature gen failed for {sym}: {exc}", exc_info=True)
-
-            shard_path = cache_path.with_name(f"hpc_datasets_rank{rank}.pkl")
+        # --- Data Loading & Feature Engineering ---
+        reuse_cache = str(os.environ.get("FOREX_BOT_HPC_DATASET_CACHE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+        if reuse_cache and cache_path.exists():
             try:
-                joblib.dump(
-                    {"datasets": local_datasets, "frames": local_frames_map, "news": local_news_map},
-                    shard_path,
-                )
-            except Exception as exc:
-                logger.error(f"HPC (Rank {rank}) failed to write shard: {exc}")
+                cached = joblib.load(cache_path)
+                if isinstance(cached, list) and cached:
+                    datasets = cached
+                    datasets_loaded = True
+                    logger.info(f"HPC: Loaded cached datasets from {cache_path}.")
+            except Exception as e:
+                logger.warning(f"HPC: Failed to load cached datasets: {e}")
 
-            if is_ddp:
-                dist.barrier()
-
-            if rank == 0:
-                merged: list[tuple[str, PreparedDataset]] = []
-                for r in range(world_size):
-                    p = cache_path.with_name(f"hpc_datasets_rank{r}.pkl")
-                    if not p.exists():
-                        logger.warning(f"HPC (Rank 0): Missing shard {p}")
-                        continue
-                    try:
-                        payload = joblib.load(p)
-                    except Exception as exc:
-                        logger.warning(f"HPC (Rank 0): Failed to load shard {p}: {exc}")
-                        continue
-                    if isinstance(payload, dict):
-                        merged.extend(payload.get("datasets", []) or [])
-                        frames_payload = payload.get("frames") or {}
-                        news_payload = payload.get("news") or {}
-                        if target_sym in frames_payload:
-                            raw_frames_map[target_sym] = frames_payload[target_sym]
-                            if target_sym in news_payload:
-                                news_map[target_sym] = news_payload[target_sym]
-                    elif isinstance(payload, list):
-                        merged.extend(payload)
-                datasets = merged
-                datasets_loaded = bool(merged)
-                skip_rank0_heavy = datasets_loaded
-                if datasets_loaded:
-                    logger.info(
-                        f"HPC (Rank 0): Merged {len(datasets)}/{len(symbols)} datasets from {world_size} ranks."
-                    )
-                    try:
-                        joblib.dump(datasets, cache_path)
-                    except Exception as exc:
-                        logger.warning(f"HPC (Rank 0): Failed to write merged cache: {exc}")
-                if target_sym not in raw_frames_map:
-                    try:
-                        self.settings.system.symbol = target_sym
-                        await self.data_loader.ensure_history(target_sym)
-                        frames = await self.data_loader.get_training_data(target_sym)
-                        if isinstance(frames, dict) and frames:
-                            raw_frames_map[target_sym] = frames
-                            if analyzer is not None:
-                                news_map[target_sym] = self._build_news_features(
-                                    analyzer, target_sym, frames
-                                )
-                    except Exception as exc:
-                        logger.warning(
-                            f"HPC (Rank 0): Failed to load discovery frames for {target_sym}: {exc}"
-                        )
-                for r in range(world_size):
-                    p = cache_path.with_name(f"hpc_datasets_rank{r}.pkl")
-                    try:
-                        p.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-            if is_ddp:
-                dist.barrier()
-            if rank != 0 and not keep_ranks:
-                logger.info(f"Rank {rank}: Exiting (feature shard complete; rank 0 continues).")
-                try:
-                    dist.destroy_process_group()
-                except Exception:
-                    pass
-                return
-            if rank != 0 and keep_ranks:
-                logger.info(f"Rank {rank}: Feature shard complete; continuing to discovery.")
-
-        if rank == 0 and not skip_rank0_heavy:
-            # --- RANK 0: Heavy Lifting ---
-            # Optional dataset reuse to avoid re-running feature engineering    
-            if reuse_cache and cache_path.exists():
-                try:
-                    cached = joblib.load(cache_path)
-                    if isinstance(cached, list) and cached:
-                        cached_symbols = [str(s) for s, _ in cached if s is not None]
-                        if set(cached_symbols) == set(symbols):
-                            datasets = cached
-                            datasets_loaded = True
-                            logger.info(f"HPC: Loaded cached datasets from {cache_path}; skipping feature engineering.")
-                except Exception as e:
-                    logger.warning(f"HPC: Failed to load cached datasets: {e}")
-
-            # Allow overriding feature-engineering worker count via env to avoid pool crashes/OOM.
-            env_workers = os.getenv("FOREX_BOT_FEATURE_WORKERS") or os.getenv("FEATURE_WORKERS")
-            if env_workers:
-                try:
-                    max_workers = max(1, int(env_workers))
-                except ValueError:
-                    max_workers = max(1, min(self.settings.system.n_jobs, os.cpu_count() or 1))
-            else:
-                max_workers = max(1, min(self.settings.system.n_jobs, os.cpu_count() or 1))
-            max_workers = max(1, min(max_workers, len(symbols)))
-
-            analyzer = None
-            if self.settings.news.enable_news:
-                try:
-                    analyzer = await get_sentiment_analyzer(self.settings)
-                except Exception as exc:
-                    logger.warning(f"News analyzer unavailable (global HPC): {exc}")
-
+        if not datasets_loaded:
             raw_frames_map = {}
             news_map: dict[str, pd.DataFrame | None] = {}
+            
+            analyzer = await get_sentiment_analyzer(self.settings) if self.settings.news.enable_news else None
 
+            # 1. Parallel loading of raw data
             for sym in symbols:
-                self.settings.system.symbol = sym
                 await self.data_loader.ensure_history(sym)
                 frames = await self.data_loader.get_training_data(sym)
                 raw_frames_map[sym] = frames
-                logger.info(f"HPC (Rank 0): Loaded raw data for {sym}")
-                if analyzer is not None:
+                if analyzer:
                     news_map[sym] = self._build_news_features(analyzer, sym, frames)
 
-            # RAM-aware worker cap based on dataset footprint (avoid pool crashes).
-            try:
-                from ..core.system import HardwareProbe
-
-                profile = HardwareProbe().detect()
-                ram_gb = float(
-                    getattr(profile, "available_ram_gb", None)
-                    or getattr(profile, "total_ram_gb", 0.0)
-                    or 0.0
-                )
-                try:
-                    per_worker_gb = float(os.environ.get("FOREX_BOT_FEATURE_WORKER_GB", "12") or 12)
-                except Exception:
-                    per_worker_gb = 12.0
-                if ram_gb > 0 and per_worker_gb > 0:
-                    max_workers = min(max_workers, max(1, int(ram_gb // per_worker_gb)))
-                try:
-                    def _frames_bytes(frames_map: dict[str, pd.DataFrame]) -> int:
-                        total = 0
-                        for df in frames_map.values():
-                            try:
-                                total += int(df.memory_usage(deep=True).sum())
-                            except Exception:
-                                total += int(df.shape[0] * df.shape[1] * 8)
-                        return total
-
-                    worst_bytes = max((_frames_bytes(fr) for fr in raw_frames_map.values()), default=0)
-                    if worst_bytes > 0 and ram_gb > 0:
-                        # Rough overhead factor for features + intermediates.
-                        worker_gb = (worst_bytes / (1024**3)) * 2.5
-                        if worker_gb > 0:
-                            max_workers = min(max_workers, max(1, int((ram_gb * 0.65) // worker_gb)))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-            if not datasets_loaded:
-                # Parallel Feature Engineering (use spawn to avoid CUDA fork issues)
-                logger.info(f"HPC (Rank 0): Launching feature engineering on {max_workers} workers...")
-                spawn_ctx = multiprocessing.get_context("spawn")
-                # Avoid oversubscribing GPUs during feature engineering (cupy/cudf in workers can OOM).
-                gpu_count = len(self.discovery_engine.gpu_pool) if hasattr(self.discovery_engine, "gpu_pool") else 1
-                if gpu_count <= 1:
-                    import torch
-                    gpu_count = torch.cuda.device_count()
-                # If feature engineering is forced to CPU, allow using more CPU workers.
-                force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {
-                    "1", "true", "yes", "on"
-                }
-                if not env_workers and gpu_count > 0 and not force_cpu:
-                    max_workers = min(max_workers, max(1, gpu_count))
-
-                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
-                    futures: dict[concurrent.futures.Future, str] = {}
-                    for i, (sym, frames) in enumerate(raw_frames_map.items()):
-                        assigned_gpu = i % max(1, gpu_count)
-                        fut = executor.submit(
-                            _hpc_feature_worker,
-                            self.settings.model_copy(),
-                            frames,
-                            sym,
-                            news_map.get(sym),
-                            assigned_gpu,
-                        )
-                        futures[fut] = sym
-
-                    for fut in concurrent.futures.as_completed(list(futures.keys())):
-                        try:
-                            sym = futures.get(fut, "UNKNOWN")
-                            ds = fut.result()
-                            if ds is None:
-                                logger.error(f"HPC Feature Gen failed (empty dataset) for {sym}")
-                                continue
-                            datasets.append((sym, ds))
-                        except Exception as e:
-                            logger.error(f"HPC Feature Gen failed: {e}")
-
-            # If any symbols failed in the pool, fall back to sequential for the missing ones.
-            got_syms = {s for s, _ in datasets}
-            missing_syms = [s for s in symbols if s not in got_syms]
-            if missing_syms:
-                logger.warning(
-                    f"HPC feature generation missing {len(missing_syms)}/{len(symbols)} symbols; "
-                    "retrying sequentially for the missing symbols."
-                )
-                for sym in missing_syms:
-                    try:
-                        frames = raw_frames_map.get(sym)
-                        if not frames:
-                            continue
-                        ds = self.feature_engineer.prepare(frames, news_features=news_map.get(sym), symbol=sym)
-                        datasets.append((sym, ds))
-                    except Exception as e:
-                        logger.error(f"Sequential feature gen failed for {sym}: {e}", exc_info=True)
-
-        if rank == 0:
-            # ... (Existing feature gen code)
+            # 2. Multiprocessing Feature Engineering (Use 200+ cores)
+            max_workers = int(os.environ.get("FOREX_BOT_FEATURE_WORKERS", 200))
+            logger.info(f"HPC: Launching feature engineering on {max_workers} workers...")
             
-            # Save for other ranks
-            if is_ddp:
-                try:
-                    logger.info("HPC (Rank 0): Saving datasets to disk for other ranks...")
-                    joblib.dump(datasets, cache_path)
-                except Exception as e:
-                    logger.error(f"Failed to save HPC datasets: {e}")
+            spawn_ctx = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
+                futures = {executor.submit(_hpc_feature_worker, self.settings.model_copy(), raw_frames_map[sym], sym, news_map.get(sym)): sym for sym in symbols}
+                for fut in concurrent.futures.as_completed(futures):
+                    res = fut.result()
+                    if res: datasets.append((futures[fut], res))
 
-        # --- DDP NON-ZERO RANKS EXIT EARLY (avoid long discovery/barrier timeouts) ---
-        if is_ddp and rank != 0:
-            logger.info(f"Rank {rank}: Waiting for dataset cache at {cache_path}...")
-            wait_seconds = int(os.environ.get("FOREX_BOT_HPC_CACHE_WAIT", "600") or 600)
-            waited = 0
-            while waited < wait_seconds and not cache_path.exists():
-                time.sleep(2)
-                waited += 2
-            if cache_path.exists():
-                try:
-                    datasets = joblib.load(cache_path)
-                except Exception as e:
-                    logger.error(f"Rank {rank} failed to load datasets: {e}")
-            if not keep_ranks:
-                logger.info(f"Rank {rank}: Exiting (discovery/training handled on rank 0).")
-                try:
-                    dist.destroy_process_group()
-                except Exception:
-                    pass
-                return
-            logger.info(f"Rank {rank}: Dataset cache loaded; continuing to discovery.")
+            # Save cache for next time
+            if reuse_cache:
+                joblib.dump(datasets, cache_path)
 
-        # --- EXPERT DISCOVERY (optionally multi-rank) ---
-        if (rank == 0) or (keep_ranks and is_ddp):
-            logger.info("Launching GPU-Native Expert Discovery (Multi-Symbol)...")
-            from ..strategy.discovery_tensor import TensorDiscoveryEngine
+        # --- Launch Discovery (Uses internal 8-GPU ThreadPool) ---
+        logger.info("Launching GPU-Native Expert Discovery (Multi-GPU Pool)...")
+        from ..strategy.discovery_tensor import TensorDiscoveryEngine
+        
+        target_sym = "EURUSD" if "EURUSD" in [s for s, _ in datasets] else datasets[0][0]
+        target_ds = next(ds for sym, ds in datasets if sym == target_sym)
+        
+        # Load raw frame for OHLC data
+        await self.data_loader.ensure_history(target_sym)
+        raw_frames = await self.data_loader.get_training_data(target_sym)
 
-            # Ensure datasets are available for non-zero ranks (for feature-rich discovery)
-            if not datasets and cache_path.exists():
-                try:
-                    cached = joblib.load(cache_path)
-                    if isinstance(cached, list) and cached:
-                        datasets = cached
-                except Exception as exc:
-                    logger.warning(f"Rank {rank}: Failed to load cached datasets for discovery: {exc}")
+        discovery_frames, timeframes = self._build_discovery_frames_for_tensor(
+            raw_frames, None, target_sym, base_dataset=target_ds
+        )
 
-            # Choose target symbol for discovery
-            if raw_frames_map:
-                target_sym = "EURUSD" if "EURUSD" in raw_frames_map else next(iter(raw_frames_map.keys()))
-            else:
-                target_sym = "EURUSD" if "EURUSD" in symbols else symbols[0]
+        discovery_tensor = TensorDiscoveryEngine(n_experts=100, timeframes=timeframes)
+        discovery_tensor.run_unsupervised_search(discovery_frames, iterations=1000)
+        discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
-            # Ensure we have frames for target symbol on every rank
-            if target_sym not in raw_frames_map:
-                try:
-                    self.settings.system.symbol = target_sym
-                    await self.data_loader.ensure_history(target_sym)
-                    frames = await self.data_loader.get_training_data(target_sym)
-                    if isinstance(frames, dict) and frames:
-                        raw_frames_map[target_sym] = frames
-                except Exception as exc:
-                    logger.warning(f"Rank {rank}: Failed to load discovery frames for {target_sym}: {exc}")
-
-            target_ds = next((ds for sym, ds in datasets if sym == target_sym), None)
-            if target_ds is not None and rank == 0:
-                print(f"DEBUG (Global): Enriching discovery with {target_ds.X.shape[1]} features.")
-
-            frames_for_discovery = raw_frames_map.get(target_sym)
-            if not isinstance(frames_for_discovery, dict) or not frames_for_discovery:
-                logger.error(f"Rank {rank}: Discovery frames unavailable for {target_sym}; skipping discovery.")
-                if keep_ranks and is_ddp:
-                    try:
-                        dist.barrier()
-                    except Exception:
-                        pass
-                    if rank != 0:
-                        try:
-                            dist.destroy_process_group()
-                        except Exception:
-                            pass
-                        return
-                frames_for_discovery = None
-
-            if frames_for_discovery is None:
-                discovery_frames, timeframes = {}, []
-            else:
-                discovery_frames, timeframes = self._build_discovery_frames_for_tensor(
-                    frames_for_discovery,
-                    news_map.get(target_sym) if news_map else None,
-                    target_sym,
-                    base_dataset=target_ds,
-                )
-
-            local_rank_env = os.environ.get("LOCAL_RANK")
-            device = "cuda"
-            if local_rank_env is not None:
-                try:
-                    device = f"cuda:{int(local_rank_env)}"
-                except Exception:
-                    device = "cuda"
-
-            discovery_tensor = TensorDiscoveryEngine(
-                device=device,
-                n_experts=100,
-                timeframes=timeframes,
-                max_rows=int(getattr(self.settings.system, "discovery_max_rows", 0) or 0),
-                stream_mode=bool(getattr(self.settings.system, "discovery_stream", False)),
-                auto_cap=bool(getattr(self.settings.system, "discovery_auto_cap", True)),
-            )
-
-            discovery_tensor.run_unsupervised_search(
-                discovery_frames,
-                news_features=news_map.get(target_sym) if news_map else None,
-                iterations=1000
-            )
-
-            cache_dir = Path(self.settings.system.cache_dir)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            if keep_ranks and is_ddp:
-                expert_path = cache_dir / f"tensor_knowledge_rank{rank}.pt"
-            else:
-                expert_path = cache_dir / "tensor_knowledge.pt"
-            discovery_tensor.save_experts(str(expert_path))
-
-            if keep_ranks and is_ddp:
-                try:
-                    dist.barrier()
-                except Exception:
-                    pass
-                if rank == 0:
-                    import torch
-                    merged_genomes = []
-                    merged_scores = []
-                    meta_timeframes = None
-                    meta_features = None
-                    for r in range(world_size):
-                        p = cache_dir / f"tensor_knowledge_rank{r}.pt"
-                        if not p.exists():
-                            logger.warning(f"Discovery merge: missing expert file {p}")
-                            continue
-                        try:
-                            data = torch.load(p, map_location="cpu")
-                        except Exception as exc:
-                            logger.warning(f"Discovery merge: failed to load {p}: {exc}")
-                            continue
-                        tf = data.get("timeframes")
-                        nf = data.get("n_features")
-                        if meta_timeframes is None:
-                            meta_timeframes = tf
-                            meta_features = nf
-                        if tf != meta_timeframes or nf != meta_features:
-                            logger.warning(f"Discovery merge: skipping {p} due to schema mismatch.")
-                            continue
-                        genomes = data.get("genomes")
-                        if genomes is not None:
-                            merged_genomes.append(genomes)
-                        scores = data.get("scores")
-                        if scores is not None:
-                            merged_scores.append(scores)
-                    if merged_genomes:
-                        all_genomes = torch.cat(merged_genomes, dim=0)
-                        if merged_scores and len(merged_scores) == len(merged_genomes):
-                            all_scores = torch.cat(merged_scores, dim=0)
-                        else:
-                            all_scores = torch.zeros(all_genomes.shape[0], dtype=torch.float32)
-                        topk = torch.argsort(all_scores, descending=True)[:discovery_tensor.n_experts]
-                        torch.save(
-                            {
-                                "genomes": all_genomes[topk],
-                                "scores": all_scores[topk],
-                                "timeframes": meta_timeframes,
-                                "n_features": meta_features,
-                            },
-                            cache_dir / "tensor_knowledge.pt",
-                        )
-                try:
-                    dist.barrier()
-                except Exception:
-                    pass
-                if rank != 0:
-                    try:
-                        dist.destroy_process_group()
-                    except Exception:
-                        pass
-                    return
-
-        if not datasets:
-            logger.error("HPC: No datasets generated.")
-            return
+        # --- Final Global Training ---
         await self._train_global_from_datasets(datasets, symbols, optimize, stop_event)
 
     async def _train_global_sequential(
