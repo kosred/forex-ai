@@ -151,17 +151,21 @@ class TensorDiscoveryEngine:
         def _process_frame(tf_name):
             try:
                 # Forward-fill to avoid look-ahead
-                df = frames[tf_name].reindex(master_idx).ffill().fillna(0.0)
-                
-                # Extract numeric features
-                feats = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+                raw = frames[tf_name].reindex(master_idx).ffill()
+
+                # Features: fill remaining NaNs with 0 (safe for indicators)
+                feat_df = raw.fillna(0.0)
+                feats = feat_df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
                 f_std = np.maximum(feats.std(axis=0), 1e-6)
                 norm = (feats - feats.mean(axis=0)) / f_std
-                
+
                 # OPTIMIZATION: Convert to Float16 immediately to save RAM
                 norm_fp16 = norm.astype(np.float16)
                 ohlc_dtype = np.float16 if self.full_fp16 else np.float32
-                ohlc_arr = df[['open', 'high', 'low', 'close']].to_numpy(dtype=ohlc_dtype)
+                # OHLC: avoid zero-filled gaps by using ffill+bfill
+                ohlc_df = raw[['open', 'high', 'low', 'close']].copy()
+                ohlc_df = ohlc_df.ffill().bfill()
+                ohlc_arr = ohlc_df.to_numpy(dtype=ohlc_dtype)
 
                 return tf_name, torch.from_numpy(norm_fp16), torch.from_numpy(ohlc_arr)
             except Exception as e:
@@ -519,7 +523,9 @@ class TensorDiscoveryEngine:
                     open_next = torch.clamp(open_next, min=1e-6)
                     actions_aligned = actions[:, :-1]
 
+                    valid_px = (open_next > 1e-6) & (close_next > 1e-6)
                     rets = (close_next - open_next) / open_next
+                    rets = torch.where(valid_px, rets, torch.zeros_like(rets))
                     rets = torch.nan_to_num(rets, nan=0.0, posinf=0.0, neginf=0.0)
                     rets = torch.clamp(rets, min=-1.0, max=1.0)
                     batch_rets = actions_aligned * rets.unsqueeze(0)
@@ -652,7 +658,9 @@ class TensorDiscoveryEngine:
         if resume_enabled and ckpt_path.exists():
             try:
                 data = torch.load(ckpt_path, map_location="cpu")
-                best = data.get("best_experts") or data.get("genomes")
+                best = data.get("best_experts")
+                if best is None:
+                    best = data.get("genomes")
                 if best is not None:
                     self.best_experts = best
                     logger.warning(
