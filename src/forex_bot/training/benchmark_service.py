@@ -46,9 +46,13 @@ class BenchmarkService:
     COMPLEXITY_MAP = {
         "lightgbm": 5e-5,
         "xgboost": 5e-4,
+        "xgboost_rf": 6e-4,
+        "xgboost_dart": 7e-4,
         "catboost": 1.2e-3,
+        "catboost_alt": 1.3e-3,
         "random_forest": 1.5e-4,
         "extra_trees": 1.2e-4,
+        "mlp": 8e-4,
         "transformer": 1e-3,
         "nbeats": 1.1e-3,
         "tide": 1.0e-3,

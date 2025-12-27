@@ -21,17 +21,37 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> type[ExpertModel]:
     return entry["cpu"]
 
 
-# Tree/linear models (CPU only)
+# Tree/linear models (CPU+GPU where supported)
 try:
-    from .trees import CatBoostExpert, ExtraTreesExpert, LightGBMExpert, RandomForestExpert, XGBoostExpert
+    from .trees import (
+        CatBoostAltExpert,
+        CatBoostExpert,
+        ExtraTreesExpert,
+        LightGBMExpert,
+        RandomForestExpert,
+        XGBoostDARTExpert,
+        XGBoostExpert,
+        XGBoostRFExpert,
+    )
 
     register_model("lightgbm", LightGBMExpert)
     register_model("xgboost", XGBoostExpert)
+    register_model("xgboost_rf", XGBoostRFExpert)
+    register_model("xgboost_dart", XGBoostDARTExpert)
     register_model("catboost", CatBoostExpert)
+    register_model("catboost_alt", CatBoostAltExpert)
     register_model("random_forest", RandomForestExpert)
     register_model("extra_trees", ExtraTreesExpert)
 except ImportError as e:
     logger.warning(f"Tree models not fully available: {e}")
+
+# Simple tabular MLP (CPU/GPU)
+try:
+    from .mlp import MLPExpert
+
+    register_model("mlp", MLPExpert, MLPExpert)
+except ImportError as e:
+    logger.warning(f"MLP model not available: {e}")
 
 # Deep models: always register both CPU and GPU variants when present
 try:

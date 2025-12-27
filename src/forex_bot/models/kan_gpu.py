@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +9,13 @@ import pandas as pd
 import torch
 import torch.distributed as dist  # DDP Support
 
-from .base import ExpertModel, dataframe_to_float32_numpy
+from .base import (
+    EarlyStopper,
+    ExpertModel,
+    dataframe_to_float32_numpy,
+    get_early_stop_params,
+    time_series_train_val_split,
+)
 from .device import select_device
 
 logger = logging.getLogger(__name__)
@@ -69,9 +76,43 @@ class KANExpert(ExpertModel):
         if not np.all(np.isin(y_vals, [-1, 0, 1])):
             raise ValueError(f"Labels must be in {{-1, 0, 1}}, got: {np.unique(y_vals)}")
 
+        try:
+            X_train, X_val, y_train, y_val = time_series_train_val_split(
+                X, y, val_ratio=0.15, min_train_samples=100, embargo_samples=0
+            )
+        except Exception:
+            split = int(len(X) * 0.85)
+            X_train, X_val = X.iloc[:split], X.iloc[split:]
+            y_train, y_val = y.iloc[:split], y.iloc[split:]
+
         # Convert to tensors on CPU to avoid VRAM OOM
-        X_t = torch.as_tensor(dataframe_to_float32_numpy(X), dtype=torch.float32, device="cpu")
-        y_t = torch.as_tensor(y_vals + 1, dtype=torch.long, device="cpu")  # -1,0,1 -> 0,1,2
+        X_t = torch.as_tensor(
+            dataframe_to_float32_numpy(X_train), dtype=torch.float32, device="cpu"
+        )
+        y_t = torch.as_tensor(
+            y_train.to_numpy() + 1, dtype=torch.long, device="cpu"
+        )  # -1,0,1 -> 0,1,2
+
+        X_v = None
+        y_v = None
+        if len(X_val) > 0:
+            try:
+                max_val = int(os.environ.get("FOREX_BOT_KAN_VAL_MAX_ROWS", "200000") or 200000)
+            except Exception:
+                max_val = 200000
+            if max_val > 0 and len(X_val) > max_val:
+                X_val = X_val.iloc[-max_val:]
+                y_val = y_val.iloc[-max_val:]
+            X_v = torch.as_tensor(
+                dataframe_to_float32_numpy(X_val),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            y_v = torch.as_tensor(
+                y_val.to_numpy() + 1,
+                dtype=torch.long,
+                device=self.device,
+            )
 
         # KAN library expects [Input -> Hidden -> Output] layers list
         # We construct a simple 2-layer KAN: Input -> Hidden -> 3 (Classes)
@@ -120,6 +161,8 @@ class KANExpert(ExpertModel):
 
         # Training Loop
         self.model.train()
+        es_pat, es_delta = get_early_stop_params(20, 0.001)
+        early_stopper = EarlyStopper(patience=es_pat, min_delta=es_delta)
         for epoch in range(1000):
             if sampler:
                 sampler.set_epoch(epoch)  # Crucial for shuffling in DDP
@@ -142,6 +185,20 @@ class KANExpert(ExpertModel):
 
             if tensorboard_writer:
                 tensorboard_writer.add_scalar("Loss/train_KAN", total_loss / len(loader), epoch)
+
+            if X_v is not None and y_v is not None and len(X_val) > 0:
+                self.model.eval()
+                with torch.no_grad():
+                    v_logits = self.model(X_v)
+                    v_loss = criterion(v_logits, y_v).item()
+                self.model.train()
+                if early_stopper(v_loss):
+                    logger.info(
+                        "KAN GPU early stopping at epoch %s (val_loss=%.6f)",
+                        epoch,
+                        v_loss,
+                    )
+                    break
 
         if is_cuda:
             torch.cuda.empty_cache()

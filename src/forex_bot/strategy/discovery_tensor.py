@@ -258,13 +258,10 @@ class TensorDiscoveryEngine:
         except Exception:
             dd_penalty_weight = 1.0
         debug_validity = os.environ.get("FOREX_BOT_DISCOVERY_DEBUG_VALIDITY", "0").strip().lower() in {"1", "true", "yes", "on"}
-        log_metrics = str(os.environ.get("FOREX_BOT_DISCOVERY_LOG_METRICS", "0") or "0").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
-        try:
-            log_metrics_every = int(os.environ.get("FOREX_BOT_DISCOVERY_LOG_METRICS_EVERY", "10") or 10)
-        except Exception:
-            log_metrics_every = 10
+        # Permanent Metrics Logging (Every 10 Gens)
+        log_metrics = True
+        log_metrics_every = 10
+        
         debug_snapshot = {
             "fitness": None, "sharpe": None, "mean_ret": None, "std_ret": None,
             "max_dd": None, "profitable_chunks": None, "consistency": None,

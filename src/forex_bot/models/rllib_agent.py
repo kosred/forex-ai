@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -6,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .base import ExpertModel
+from .base import ExpertModel, get_early_stop_params
 from .device import get_available_gpus
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,49 @@ def _deps_ready(context: str) -> bool:
     return True
 
 
+def _train_with_early_stop(
+    algo: Any,
+    *,
+    timesteps: int,
+    max_time_sec: int,
+    context: str,
+) -> None:
+    """Run RLlib training with time cap + early stop on reward plateaus."""
+    if algo is None:
+        return
+    start = time.time()
+    patience, min_delta = get_early_stop_params(5, 0.0)
+    best_reward = None
+    no_improve = 0
+
+    while True:
+        result = algo.train()
+        if not isinstance(result, dict):
+            break
+
+        reward = result.get("episode_reward_mean", None)
+        if reward is not None:
+            if best_reward is None or reward > best_reward + min_delta:
+                best_reward = reward
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    logger.info("%s: early stop (reward plateau).", context)
+                    break
+
+        steps = (
+            result.get("timesteps_total")
+            or result.get("num_env_steps_sampled")
+            or result.get("num_env_steps_trained")
+        )
+        if timesteps > 0 and steps is not None and steps >= timesteps:
+            break
+        if max_time_sec > 0 and (time.time() - start) >= max_time_sec:
+            logger.info("%s: time limit reached (%ss).", context, max_time_sec)
+            break
+
+
 def _find_latest_checkpoint(checkpoint_dir: Path) -> str | None:
     marker = checkpoint_dir / "checkpoint_path.txt"
     if marker.exists():
@@ -234,7 +278,12 @@ class RLlibPPOAgent(ExpertModel):
         self.algo = None
         try:
             self.algo = config.build()
-            self.algo.train()
+            _train_with_early_stop(
+                self.algo,
+                timesteps=int(self.timesteps),
+                max_time_sec=int(self.max_time_sec),
+                context="RLlib PPO",
+            )
         except Exception as exc:
             logger.info(f"RLlib PPO training failed: {exc}")
             _stop_algo(self.algo)
@@ -349,7 +398,12 @@ class RLlibSACAgent(ExpertModel):
         self.algo = None
         try:
             self.algo = config.build()
-            self.algo.train()
+            _train_with_early_stop(
+                self.algo,
+                timesteps=int(self.timesteps),
+                max_time_sec=int(self.max_time_sec),
+                context="RLlib SAC",
+            )
         except Exception as exc:
             logger.info(f"RLlib SAC training failed: {exc}")
             _stop_algo(self.algo)

@@ -16,6 +16,13 @@ except ImportError:
     AX_AVAILABLE = False
 
 try:
+    from ax.service.ax_client import AxClient  # type: ignore
+    AX_CLIENT_AVAILABLE = True
+except Exception:
+    AxClient = None
+    AX_CLIENT_AVAILABLE = False
+
+try:
     import ray
     from ray import tune
     from ray.tune.schedulers import ASHAScheduler
@@ -37,7 +44,14 @@ from ..core.config import Settings
 from ..core.system import normalize_device_preference
 from ..models.device import get_available_gpus, select_device
 from ..models.transformers import TransformerExpertTorch
-from ..models.trees import ExtraTreesExpert, LightGBMExpert, RandomForestExpert
+from ..models.trees import (
+    CatBoostAltExpert,
+    LightGBMExpert,
+    RandomForestExpert,
+    XGBoostDARTExpert,
+    XGBoostRFExpert,
+)
+from ..models.mlp import MLPExpert
 from ..strategy.fast_backtest import (
     fast_evaluate_strategy,
     infer_pip_metrics,
@@ -100,6 +114,11 @@ class HyperparameterOptimizer:
 
         if not (RAY_AVAILABLE and AX_AVAILABLE):
             logger.warning("Ray Tune/Ax not available. Skipping optimization.")
+        elif self.hpo_backend != "none":
+            if AX_CLIENT_AVAILABLE:
+                logger.info("HPO backend: Ax/BoTorch via AxClient.")
+            else:
+                logger.info("HPO backend: AxSearch (AxClient unavailable).")
 
     def _should_stop(self) -> bool:
         try:
@@ -136,14 +155,38 @@ class HyperparameterOptimizer:
                 {"name": "max_features", "type": "range", "bounds": [0.5, 1.0]},
                 {"name": "bootstrap", "type": "choice", "values": [True, False]},
             ]
-        if name == "ExtraTrees":
+        if name == "XGBoostRF":
             return [
                 {"name": "n_estimators", "type": "range", "bounds": [200, 800], "value_type": "int"},
-                {"name": "max_depth", "type": "range", "bounds": [10, 24], "value_type": "int"},
-                {"name": "min_samples_split", "type": "range", "bounds": [2, 10], "value_type": "int"},
-                {"name": "min_samples_leaf", "type": "range", "bounds": [1, 6], "value_type": "int"},
-                {"name": "max_features", "type": "range", "bounds": [0.4, 0.9]},
-                {"name": "bootstrap", "type": "choice", "values": [True, False]},
+                {"name": "max_depth", "type": "range", "bounds": [4, 10], "value_type": "int"},
+                {"name": "learning_rate", "type": "range", "bounds": [0.05, 0.5], "log_scale": True},
+                {"name": "subsample", "type": "range", "bounds": [0.6, 1.0]},
+                {"name": "colsample_bynode", "type": "range", "bounds": [0.6, 1.0]},
+                {"name": "num_parallel_tree", "type": "range", "bounds": [4, 16], "value_type": "int"},
+            ]
+        if name == "XGBoostDART":
+            return [
+                {"name": "n_estimators", "type": "range", "bounds": [300, 900], "value_type": "int"},
+                {"name": "max_depth", "type": "range", "bounds": [4, 12], "value_type": "int"},
+                {"name": "learning_rate", "type": "range", "bounds": [0.01, 0.1], "log_scale": True},
+                {"name": "rate_drop", "type": "range", "bounds": [0.05, 0.3]},
+                {"name": "skip_drop", "type": "range", "bounds": [0.1, 0.7]},
+            ]
+        if name == "CatBoostAlt":
+            return [
+                {"name": "iterations", "type": "range", "bounds": [400, 1200], "value_type": "int"},
+                {"name": "depth", "type": "range", "bounds": [6, 12], "value_type": "int"},
+                {"name": "learning_rate", "type": "range", "bounds": [0.01, 0.2], "log_scale": True},
+                {"name": "l2_leaf_reg", "type": "range", "bounds": [1.0, 10.0]},
+                {"name": "random_strength", "type": "range", "bounds": [0.5, 3.0]},
+            ]
+        if name == "MLP":
+            return [
+                {"name": "hidden_dim", "type": "range", "bounds": [128, 512], "value_type": "int"},
+                {"name": "n_layers", "type": "range", "bounds": [2, 5], "value_type": "int"},
+                {"name": "dropout", "type": "range", "bounds": [0.0, 0.3]},
+                {"name": "lr", "type": "range", "bounds": [1e-4, 1e-2], "log_scale": True},
+                {"name": "batch_size", "type": "range", "bounds": [1024, 8192], "value_type": "int"},
             ]
         if name == "TabNet":
             return [
@@ -228,9 +271,15 @@ class HyperparameterOptimizer:
                     pass
             params.setdefault("random_state", 42)
             return RandomForestExpert(params=params)
-        if name == "ExtraTrees":
+        if name == "XGBoostRF":
             params.setdefault("random_state", 42)
-            return ExtraTreesExpert(params=params)
+            return XGBoostRFExpert(params=params)
+        if name == "XGBoostDART":
+            params.setdefault("random_state", 42)
+            return XGBoostDARTExpert(params=params)
+        if name == "CatBoostAlt":
+            params.setdefault("random_seed", 42)
+            return CatBoostAltExpert(params=params)
         if name == "N-BEATS":
             params.setdefault("max_time_sec", int(self.settings.models.nbeats_train_seconds))
             params.setdefault("device", device)
@@ -251,6 +300,10 @@ class HyperparameterOptimizer:
             params.setdefault("max_time_sec", int(self.settings.models.tabnet_train_seconds))
             params.setdefault("device", device)
             return TabNetExpert(**self._filter_kwargs(TabNetExpert, params))
+        if name == "MLP":
+            params.setdefault("max_time_sec", int(self.settings.models.transformer_train_seconds))
+            params.setdefault("device", device)
+            return MLPExpert(**self._filter_kwargs(MLPExpert, params))
         return None
 
     def _filter_kwargs(self, cls: type, params: dict[str, Any]) -> dict[str, Any]:
@@ -702,12 +755,58 @@ class HyperparameterOptimizer:
                 f"daily_dd <= {daily_dd_limit}",
             ]
 
-        ax_search = AxSearch(
-            space=space,
-            metric="prop_score",
-            mode="max",
-            outcome_constraints=outcome_constraints or None,
-        )
+        ax_search = None
+        if AX_CLIENT_AVAILABLE and AxClient is not None:
+            try:
+                ax_client = AxClient()
+                ax_client.create_experiment(
+                    name=f"HPO_{name}",
+                    parameters=space,
+                    objective_name="prop_score",
+                    minimize=False,
+                    outcome_constraints=outcome_constraints or None,
+                )
+                logger.info(
+                    "AxClient experiment ready for %s (BoTorch). Constraints=%s",
+                    name,
+                    outcome_constraints or "none",
+                )
+                ax_search = AxSearch(
+                    ax_client=ax_client,
+                    metric="prop_score",
+                    mode="max",
+                )
+            except Exception as exc:
+                logger.warning(f"AxClient init failed, falling back to AxSearch: {exc}")
+                ax_search = None
+
+        if ax_search is None:
+            logger.info("AxSearch fallback for %s (no AxClient).", name)
+            ax_search = AxSearch(
+                space=space,
+                metric="prop_score",
+                mode="max",
+                outcome_constraints=outcome_constraints or None,
+            )
+
+        try:
+            if hasattr(ax_search, "set_search_properties"):
+                sig = inspect.signature(ax_search.set_search_properties)
+                kwargs = {}
+                if "metric" in sig.parameters:
+                    kwargs["metric"] = "prop_score"
+                if "mode" in sig.parameters:
+                    kwargs["mode"] = "max"
+                if "config" in sig.parameters:
+                    kwargs["config"] = space
+                elif "parameters" in sig.parameters:
+                    kwargs["parameters"] = space
+                elif "space" in sig.parameters:
+                    kwargs["space"] = space
+                if kwargs:
+                    ax_search.set_search_properties(**kwargs)
+        except Exception as exc:
+            logger.debug(f"AxSearch set_search_properties failed: {exc}")
         max_concurrent = self.ray_max_concurrency
         if name in {"TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"} and self.device_pool:
             max_concurrent = 1
@@ -719,7 +818,7 @@ class HyperparameterOptimizer:
         resources = {"cpu": 1, "gpu": 0}
         if self.device_pool and name in {"TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"}:
             resources["gpu"] = 1
-        if name in {"LightGBM", "RandomForest", "ExtraTrees"} and self.device_pool:
+        if name in {"LightGBM", "RandomForest", "XGBoostRF", "XGBoostDART", "CatBoostAlt"} and self.device_pool:
             resources["gpu"] = 1
 
         try:
@@ -807,7 +906,7 @@ class HyperparameterOptimizer:
         best_params: dict[str, dict[str, Any]] = {}
 
         model_batches = [
-            ["LightGBM", "RandomForest", "ExtraTrees"],
+            ["LightGBM", "RandomForest", "XGBoostRF", "XGBoostDART", "CatBoostAlt", "MLP"],
             ["TabNet", "N-BEATS", "TiDE", "KAN"],
             ["Transformer"],
         ]

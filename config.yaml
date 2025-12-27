@@ -122,7 +122,7 @@ risk:
   hurst_range: 0.45
 
 models:
-  ml_models: [lightgbm, xgboost, catboost, random_forest, extra_trees]
+  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, random_forest, mlp]
   use_rl_agent: true
   use_sac_agent: true
   use_neuroevolution: true

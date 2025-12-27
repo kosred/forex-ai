@@ -928,3 +928,76 @@ class CatBoostExpert(ExpertModel):
                 self.model.load_model(str(p))
             except Exception as e:
                 logger.warning(f"Failed to load CatBoost: {e}")
+
+
+class CatBoostAltExpert(CatBoostExpert):
+    """Alternate CatBoost preset (CPU/GPU capable) to diversify tree ensemble."""
+
+    def __init__(self, params: dict[str, Any] = None) -> None:
+        defaults = {
+            "iterations": 900,
+            "depth": 10,
+            "learning_rate": 0.03,
+            "loss_function": "MultiClass",
+            "random_seed": 7,
+            "verbose": False,
+            "thread_count": -1,
+            "l2_leaf_reg": 6.0,
+            "random_strength": 1.5,
+        }
+        if params:
+            defaults.update(params)
+        super().__init__(params=defaults)
+
+
+class XGBoostRFExpert(XGBoostExpert):
+    """Random-forest flavored XGBoost (CPU/GPU via XGBoost)."""
+
+    def __init__(self, params: dict[str, Any] = None) -> None:
+        defaults = {
+            "n_estimators": 400,
+            "max_depth": 6,
+            "learning_rate": 0.3,
+            "objective": "multi:softprob",
+            "num_class": 3,
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": 0,
+            "subsample": 0.8,
+            "colsample_bynode": 0.8,
+            "colsample_bytree": 0.8,
+            "num_parallel_tree": 8,
+            "eval_metric": "mlogloss",
+            "tree_method": "hist",
+        }
+        if params:
+            defaults.update(params)
+        super().__init__(params=defaults)
+
+
+class XGBoostDARTExpert(XGBoostExpert):
+    """DART (dropout) XGBoost variant (CPU/GPU via XGBoost)."""
+
+    def __init__(self, params: dict[str, Any] = None) -> None:
+        defaults = {
+            "n_estimators": 600,
+            "max_depth": 8,
+            "learning_rate": 0.05,
+            "objective": "multi:softprob",
+            "num_class": 3,
+            "random_state": 42,
+            "n_jobs": -1,
+            "verbosity": 0,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
+            "eval_metric": "mlogloss",
+            "booster": "dart",
+            "rate_drop": 0.10,
+            "skip_drop": 0.50,
+            "sample_type": "uniform",
+            "normalize_type": "tree",
+            "tree_method": "hist",
+        }
+        if params:
+            defaults.update(params)
+        super().__init__(params=defaults)

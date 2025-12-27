@@ -208,9 +208,12 @@ class ModelsConfig(BaseModel):
         default_factory=lambda: [
             "lightgbm",
             "xgboost",
+            "xgboost_rf",
+            "xgboost_dart",
             "catboost",
+            "catboost_alt",
             "random_forest",
-            "extra_trees",
+            "mlp",
         ]
     )
     use_rl_agent: bool = True

@@ -35,8 +35,11 @@ class ModelFactory:
         # Map config names to HPO key names if needed
         opt_key_map = {
             "xgboost": "XGBoost",
+            "xgboost_rf": "XGBoostRF",
+            "xgboost_dart": "XGBoostDART",
             "lightgbm": "LightGBM",
             "catboost": "CatBoost",
+            "catboost_alt": "CatBoostAlt",
             "tabnet": "TabNet",
             "nbeats": "N-BEATS",
             "tide": "TiDE",
@@ -44,6 +47,7 @@ class ModelFactory:
             "transformer": "Transformer",
             "evolution": "Neuroevolution",
             "extra_trees": "ExtraTrees",
+            "mlp": "MLP",
         }
         opt_key = opt_key_map.get(model_name)
         if opt_key and opt_key in best_params:
@@ -76,7 +80,16 @@ class ModelFactory:
         # 4. Filter Init Kwargs based on Signature
         init_kwargs = params.copy()
         # Tree experts expect a single "params" dict in __init__
-        if model_name in {"lightgbm", "random_forest", "extra_trees"}:
+        if model_name in {
+            "lightgbm",
+            "random_forest",
+            "extra_trees",
+            "xgboost",
+            "xgboost_rf",
+            "xgboost_dart",
+            "catboost",
+            "catboost_alt",
+        }:
             init_kwargs = {"params": params.copy()}
 
         # Inject Device if supported
@@ -154,6 +167,16 @@ class ModelFactory:
         if name in {"rllib_ppo", "rllib_sac"}:
             if hasattr(model, "parallel_envs"):
                 model.parallel_envs = getattr(self.settings.models, "rllib_num_workers", 1)
+            if hasattr(model, "timesteps"):
+                model.timesteps = int(getattr(self.settings.models, "rl_timesteps", 100000))
+
+        if name in {"rl_ppo", "rl_sac"}:
+            if hasattr(model, "timesteps"):
+                model.timesteps = int(getattr(self.settings.models, "rl_timesteps", 100000))
+            if hasattr(model, "network_arch"):
+                model.network_arch = list(getattr(self.settings.models, "rl_network_arch", [256, 256]))
+            if hasattr(model, "parallel_envs"):
+                model.parallel_envs = int(getattr(self.settings.models, "rl_parallel_envs", 1))
 
         # Apply remaining params
         for k, v in params.items():

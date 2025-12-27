@@ -1,4 +1,5 @@
 import logging
+import time
 
 import gymnasium as gym
 import numpy as np
@@ -9,15 +10,30 @@ from gymnasium import spaces
 try:
     from stable_baselines3 import PPO, SAC
     from stable_baselines3.common.vec_env import DummyVecEnv
+    from stable_baselines3.common.callbacks import (
+        BaseCallback,
+        CallbackList,
+        EvalCallback,
+        StopTrainingOnNoModelImprovement,
+    )
 
     SB3_AVAILABLE = True
 except ImportError:
     PPO = None
     SAC = None
     DummyVecEnv = None
+    BaseCallback = None
+    CallbackList = None
+    EvalCallback = None
+    StopTrainingOnNoModelImprovement = None
     SB3_AVAILABLE = False
 
-from .base import ExpertModel, validate_time_ordering
+from .base import (
+    ExpertModel,
+    get_early_stop_params,
+    time_series_train_val_split,
+    validate_time_ordering,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -239,12 +255,90 @@ class PropFirmTradingEnv(gym.Env):
             self.high_water_mark = self.equity
 
 
+if BaseCallback is not None:
+    class _TimeLimitCallback(BaseCallback):
+        def __init__(self, max_time_sec: int, verbose: int = 0) -> None:
+            super().__init__(verbose)
+            self.max_time_sec = max(0, int(max_time_sec))
+            self._start_time: float | None = None
+
+        def _on_training_start(self) -> None:
+            self._start_time = time.time()
+
+        def _on_step(self) -> bool:
+            if self.max_time_sec <= 0 or self._start_time is None:
+                return True
+            if time.time() - self._start_time > self.max_time_sec:
+                if self.model is not None:
+                    self.model.stop_training = True
+                return False
+            return True
+else:
+    _TimeLimitCallback = None
+
+
 class RLExpertPPO(ExpertModel):
     """PPO Agent wrapper compatible with ForexBot ensemble."""
 
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        timesteps: int = 1_000_000,
+        max_time_sec: int = 1800,
+        device: str = "auto",
+        network_arch: list[int] | None = None,
+        eval_ratio: float = 0.15,
+        eval_max_rows: int = 200_000,
+        eval_freq: int = 0,
+        parallel_envs: int = 1,
+        **kwargs,
+    ):
         self.model = None
         self.env = None
+        self.timesteps = int(timesteps)
+        self.max_time_sec = int(max_time_sec) if max_time_sec else 0
+        self.device = device
+        self.network_arch = network_arch
+        self.eval_ratio = float(eval_ratio)
+        self.eval_max_rows = int(eval_max_rows) if eval_max_rows else 0
+        self.eval_freq = int(eval_freq) if eval_freq else 0
+        self.parallel_envs = int(parallel_envs) if parallel_envs else 1
+
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        if not isinstance(device, str) or device.strip() == "" or device == "auto":
+            return "auto"
+        if device.startswith("cuda"):
+            return "cuda"
+        return "cpu"
+
+    def _split_env_data(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        metadata: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
+        try:
+            _, X_val, _, _ = time_series_train_val_split(
+                X, y, val_ratio=self.eval_ratio, min_train_samples=100, embargo_samples=0
+            )
+        except Exception:
+            split = int(len(X) * (1.0 - self.eval_ratio))
+            X_val = X.iloc[split:]
+
+        meta_train = None
+        meta_val = None
+        if metadata is not None:
+            try:
+                meta_train = metadata
+                meta_val = metadata.loc[X_val.index] if len(X_val) else None
+            except Exception:
+                meta_train = metadata
+                meta_val = (
+                    metadata.iloc[len(X) - len(X_val) : len(X)]
+                    if len(X_val)
+                    else None
+                )
+        return X, X_val, meta_train, meta_val
 
     def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs):
         if not SB3_AVAILABLE:
@@ -261,24 +355,67 @@ class RLExpertPPO(ExpertModel):
             logger.warning("RL Expert requires metadata (OHLC) for Prop Environment.")
             return
 
+        X_train, X_val, meta_train, meta_val = self._split_env_data(X, y, metadata)
+        if meta_train is None or len(X_train) == 0:
+            logger.warning("RL Expert: training metadata unavailable or empty.")
+            return
+
+        if meta_val is not None and self.eval_max_rows > 0 and len(X_val) > self.eval_max_rows:
+            X_val = X_val.iloc[-self.eval_max_rows:]
+            meta_val = meta_val.iloc[-self.eval_max_rows:]
+
         # Create environment with sequential stepping (no random resets during training)
-        self.env = DummyVecEnv([lambda: PropFirmTradingEnv(metadata, X.values)])
+        self.env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_train, X_train.values)])
+        eval_env = None
+        if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
+            eval_env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_val, X_val.values)])
 
         # Larger policy on GPU; smaller on CPU
         policy_kwargs = {}
         try:
             import torch
 
-            is_cuda = torch.cuda.is_available()
+            is_cuda = torch.cuda.is_available() and self._resolve_device(self.device) != "cpu"
         except Exception:
             is_cuda = False
-        if is_cuda:
-            policy_kwargs["net_arch"] = [512, 512, 512]
+        if self.network_arch:
+            policy_kwargs["net_arch"] = list(self.network_arch)
         else:
-            policy_kwargs["net_arch"] = [256, 256]
+            policy_kwargs["net_arch"] = [512, 512, 512] if is_cuda else [256, 256]
 
-        self.model = PPO("MlpPolicy", self.env, verbose=0, device="auto", policy_kwargs=policy_kwargs)
-        self.model.learn(total_timesteps=1000000 if is_cuda else 100000)
+        sb3_device = self._resolve_device(self.device)
+        if sb3_device == "auto" and not is_cuda:
+            sb3_device = "cpu"
+
+        self.model = PPO("MlpPolicy", self.env, verbose=0, device=sb3_device, policy_kwargs=policy_kwargs)
+
+        callbacks = []
+        if _TimeLimitCallback is not None and self.max_time_sec > 0:
+            callbacks.append(_TimeLimitCallback(self.max_time_sec))
+        if (
+            eval_env is not None
+            and EvalCallback is not None
+            and StopTrainingOnNoModelImprovement is not None
+        ):
+            patience, _ = get_early_stop_params(5, 0.0)
+            eval_freq = self.eval_freq or max(1000, int(self.timesteps // 10))
+            stop_cb = StopTrainingOnNoModelImprovement(
+                max_no_improvement_evals=patience,
+                min_evals=3,
+                verbose=0,
+            )
+            eval_cb = EvalCallback(
+                eval_env,
+                eval_freq=eval_freq,
+                n_eval_episodes=1,
+                deterministic=True,
+                callback_after_eval=stop_cb,
+            )
+            callbacks.append(eval_cb)
+
+        callback = CallbackList(callbacks) if callbacks and CallbackList is not None else None
+        total_timesteps = max(1, int(self.timesteps))
+        self.model.learn(total_timesteps=total_timesteps, callback=callback)
 
     def predict_proba(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
         if self.model is None:
@@ -324,23 +461,67 @@ class RLExpertSAC(RLExpertPPO):
             logger.warning("RL Expert requires metadata (OHLC) for Prop Environment.")
             return
 
+        X_train, X_val, meta_train, meta_val = self._split_env_data(X, y, metadata)
+        if meta_train is None or len(X_train) == 0:
+            logger.warning("RL Expert: training metadata unavailable or empty.")
+            return
+
+        if meta_val is not None and self.eval_max_rows > 0 and len(X_val) > self.eval_max_rows:
+            X_val = X_val.iloc[-self.eval_max_rows:]
+            meta_val = meta_val.iloc[-self.eval_max_rows:]
+
         # Create environment with sequential stepping (no random resets during training)
-        self.env = DummyVecEnv([lambda: PropFirmTradingEnv(metadata, X.values)])
+        self.env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_train, X_train.values)])
+        eval_env = None
+        if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
+            eval_env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_val, X_val.values)])
+
         # Larger policy on GPU; smaller on CPU
         policy_kwargs = {}
         try:
             import torch
 
-            is_cuda = torch.cuda.is_available()
+            is_cuda = torch.cuda.is_available() and self._resolve_device(self.device) != "cpu"
         except Exception:
             is_cuda = False
-        if is_cuda:
-            policy_kwargs["net_arch"] = [512, 512, 512]
+        if self.network_arch:
+            policy_kwargs["net_arch"] = list(self.network_arch)
         else:
-            policy_kwargs["net_arch"] = [256, 256]
+            policy_kwargs["net_arch"] = [512, 512, 512] if is_cuda else [256, 256]
 
-        self.model = SAC("MlpPolicy", self.env, verbose=0, device="auto", policy_kwargs=policy_kwargs)
-        self.model.learn(total_timesteps=1000000 if is_cuda else 100000)
+        sb3_device = self._resolve_device(self.device)
+        if sb3_device == "auto" and not is_cuda:
+            sb3_device = "cpu"
+
+        self.model = SAC("MlpPolicy", self.env, verbose=0, device=sb3_device, policy_kwargs=policy_kwargs)
+
+        callbacks = []
+        if _TimeLimitCallback is not None and self.max_time_sec > 0:
+            callbacks.append(_TimeLimitCallback(self.max_time_sec))
+        if (
+            eval_env is not None
+            and EvalCallback is not None
+            and StopTrainingOnNoModelImprovement is not None
+        ):
+            patience, _ = get_early_stop_params(5, 0.0)
+            eval_freq = self.eval_freq or max(1000, int(self.timesteps // 10))
+            stop_cb = StopTrainingOnNoModelImprovement(
+                max_no_improvement_evals=patience,
+                min_evals=3,
+                verbose=0,
+            )
+            eval_cb = EvalCallback(
+                eval_env,
+                eval_freq=eval_freq,
+                n_eval_episodes=1,
+                deterministic=True,
+                callback_after_eval=stop_cb,
+            )
+            callbacks.append(eval_cb)
+
+        callback = CallbackList(callbacks) if callbacks and CallbackList is not None else None
+        total_timesteps = max(1, int(self.timesteps))
+        self.model.learn(total_timesteps=total_timesteps, callback=callback)
 
     def save(self, path):
         if self.model:
