@@ -1024,6 +1024,43 @@ class TrainingService:
                 if analyzer is not None:
                     news_map[sym] = self._build_news_features(analyzer, sym, frames)
 
+            # RAM-aware worker cap based on dataset footprint (avoid pool crashes).
+            try:
+                from ..core.system import HardwareProbe
+
+                profile = HardwareProbe().detect()
+                ram_gb = float(
+                    getattr(profile, "available_ram_gb", None)
+                    or getattr(profile, "total_ram_gb", 0.0)
+                    or 0.0
+                )
+                try:
+                    per_worker_gb = float(os.environ.get("FOREX_BOT_FEATURE_WORKER_GB", "12") or 12)
+                except Exception:
+                    per_worker_gb = 12.0
+                if ram_gb > 0 and per_worker_gb > 0:
+                    max_workers = min(max_workers, max(1, int(ram_gb // per_worker_gb)))
+                try:
+                    def _frames_bytes(frames_map: dict[str, pd.DataFrame]) -> int:
+                        total = 0
+                        for df in frames_map.values():
+                            try:
+                                total += int(df.memory_usage(deep=True).sum())
+                            except Exception:
+                                total += int(df.shape[0] * df.shape[1] * 8)
+                        return total
+
+                    worst_bytes = max((_frames_bytes(fr) for fr in raw_frames_map.values()), default=0)
+                    if worst_bytes > 0 and ram_gb > 0:
+                        # Rough overhead factor for features + intermediates.
+                        worker_gb = (worst_bytes / (1024**3)) * 2.5
+                        if worker_gb > 0:
+                            max_workers = min(max_workers, max(1, int((ram_gb * 0.65) // worker_gb)))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
             # Parallel Feature Engineering (use spawn to avoid CUDA fork issues)
             logger.info(f"HPC (Rank 0): Launching feature engineering on {max_workers} workers...")
             spawn_ctx = multiprocessing.get_context("spawn")

@@ -459,6 +459,28 @@ class AutoTuner:
         if force_cpu:
             cpu_cores = max(1, int(getattr(self.profile, "cpu_cores", 1) or 1))
             target = max(1, cpu_cores - 1)
+            # Cap by RAM to avoid spawning too many heavy pandas/TA-Lib workers.
+            try:
+                ram_gb = float(
+                    getattr(self.profile, "available_ram_gb", None)
+                    or getattr(self.profile, "total_ram_gb", 0.0)
+                    or 0.0
+                )
+            except Exception:
+                ram_gb = 0.0
+            try:
+                per_worker_gb = float(os.environ.get("FOREX_BOT_FEATURE_WORKER_GB", "12") or 12)
+            except Exception:
+                per_worker_gb = 12.0
+            if ram_gb > 0 and per_worker_gb > 0:
+                ram_cap = max(1, int(ram_gb // per_worker_gb))
+                target = min(target, ram_cap)
+            try:
+                hard_cap = int(os.environ.get("FOREX_BOT_FEATURE_WORKERS_MAX", "0") or 0)
+            except Exception:
+                hard_cap = 0
+            if hard_cap > 0:
+                target = min(target, hard_cap)
         try:
             num_gpus = max(0, int(getattr(hints, "num_gpus", 0) or 0))
             if num_gpus > 0 and not force_cpu:
@@ -491,8 +513,12 @@ class AutoTuner:
 
         # Preload vs streaming: default to streaming on big RAM, disable preload on small VRAM.
         if "FOREX_BOT_DISCOVERY_STREAM" not in os.environ:
-            if num_gpus > 0 and ram_gb >= 128.0:
+            if num_gpus > 0 and ram_gb >= 64.0:
                 os.environ["FOREX_BOT_DISCOVERY_STREAM"] = "1"
+        if "FOREX_BOT_DISCOVERY_MAX_ROWS" not in os.environ:
+            # Keep full history on high-RAM boxes by default.
+            if ram_gb >= 64.0:
+                os.environ["FOREX_BOT_DISCOVERY_MAX_ROWS"] = "0"
         if "FOREX_BOT_DISCOVERY_PRELOAD" not in os.environ:
             if min_vram > 0 and min_vram <= 16.0:
                 os.environ["FOREX_BOT_DISCOVERY_PRELOAD"] = "0"
@@ -516,20 +542,24 @@ class AutoTuner:
                 if per_gpu_env > 0:
                     per_gpu = per_gpu_env
                 else:
-                    if min_vram >= 80.0:
-                        per_gpu = 6000
-                    elif min_vram >= 48.0:
-                        per_gpu = 4000
+                    if min_vram >= 40.0:
+                        per_gpu = 1500
                     elif min_vram >= 24.0:
-                        per_gpu = 2500
-                    elif min_vram >= 16.0:
-                        per_gpu = 2500
-                    else:
                         per_gpu = 1200
-                pop = int(per_gpu * num_gpus)
+                    elif min_vram >= 16.0:
+                        per_gpu = 800
+                    else:
+                        per_gpu = 500
+                pop = int(per_gpu * max(1, num_gpus))
                 # Hard cap for practical runtimes; user can override via env.
-                pop_cap = 200000 if num_gpus < 64 else 400000
+                pop_cap = 120000 if num_gpus < 64 else 240000
                 pop = max(2000, min(pop, pop_cap))
+                try:
+                    pop_max = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION_MAX", "0") or 0)
+                except Exception:
+                    pop_max = 0
+                if pop_max > 0:
+                    pop = min(pop, pop_max)
             # If full-data streaming is enabled and no overrides were provided,
             # default to a smaller, more robust population.
             if stream_flag and int(os.environ.get("FOREX_BOT_DISCOVERY_POP_PER_GPU", "0") or 0) <= 0:

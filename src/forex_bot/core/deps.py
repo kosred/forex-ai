@@ -261,6 +261,11 @@ def ensure_dependencies() -> None:
     post_torch_libs = []
     needs_torch = {"flash-attn", "transformer-engine"}
     torch_missing = any(x in missing for x in ("torch", "torchvision", "torchaudio"))
+    if not torch_missing:
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            torch_missing = True
     if torch_missing:
         for pkg in list(standard_libs):
             if pkg in needs_torch:
