@@ -938,7 +938,9 @@ class FeatureEngineer:
                     smc_threads = max(1, int(smc_threads_env))
                 else:
                     smc_threads = _feature_cpu_budget()
-                numba.set_num_threads(smc_threads)
+                # Only set if numba is actually importable
+                if hasattr(numba, 'set_num_threads'):
+                    numba.set_num_threads(smc_threads)
             except Exception:
                 pass
         freshness, atr_disp, max_levels = self._auto_smc_params(df)

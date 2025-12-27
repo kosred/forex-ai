@@ -1,6 +1,20 @@
 import numpy as np
-from numba import njit
 from typing import Any
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    from numba import njit, prange
+except ImportError:
+    logger.warning("Numba not available or incompatible. Using slow pure-Python fallback.")
+    
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+        
+    prange = range
 
 
 def infer_pip_metrics(symbol: str) -> tuple[float, float]:

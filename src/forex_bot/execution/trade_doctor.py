@@ -20,7 +20,16 @@ class CloseInstruction:
     score: float
 
 
-from numba import njit
+try:
+    from numba import njit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 @njit(cache=True, fastmath=True)
 def _diagnose_positions_numba(

@@ -13,11 +13,13 @@ logger = logging.getLogger(__name__)
 
 
 class AutonomousDiscoveryEngine:
-    def __init__(self, cache_dir: Path):
+    def __init__(self, cache_dir: Path, n_jobs: int = 1):
         self.cache_dir = cache_dir
         # HPC: Use a dedicated discovery ledger
         self.ledger = StrategyLedger(str(cache_dir / "strategy_ledger.sqlite"), symbol="DISCOVERY")
         self.n_jobs = n_jobs
+        self.mixer = TALibStrategyMixer(use_volume_features=True)
+        self.evolution = GeneticStrategyEvolution(self.mixer, population_size=100)
 
     def run_discovery_cycle(self, df: pd.DataFrame, population_size: int = 100) -> None:
         logger.info(f"Starting autonomous discovery cycle (Pop: {population_size})...")

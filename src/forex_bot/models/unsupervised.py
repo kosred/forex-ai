@@ -6,20 +6,36 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from numba import njit, prange
+
+try:
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+        
+    prange = range
 
 from .base import ExpertModel
 
 logger = logging.getLogger(__name__)
 
-@njit(cache=True, fastmath=True, parallel=True)
-def _rolling_std_numba(data, window):
-    n = len(data)
-    out = np.zeros(n, dtype=np.float32)
-    for i in prange(window, n):
-        chunk = data[i-window+1 : i+1]
-        out[i] = np.std(chunk)
-    return out
+if NUMBA_AVAILABLE:
+    @njit(cache=True, fastmath=True, parallel=True)
+    def _rolling_std_numba(data, window):
+        n = len(data)
+        out = np.zeros(n, dtype=np.float32)
+        for i in prange(window, n):
+            chunk = data[i-window+1 : i+1]
+            out[i] = np.std(chunk)
+        return out
+else:
+    def _rolling_std_numba(data, window):
+        return pd.Series(data).rolling(window).std().fillna(0.0).values.astype(np.float32)
 
 from sklearn.mixture import GaussianMixture
 

@@ -21,17 +21,10 @@ try:
 except ImportError:
     NUMBA_AVAILABLE = False
 
-    def njit(
-        *,
-        cache: bool = False,
-        fastmath: bool = False,
-        parallel: bool = False,
-        nogil: bool = False,
-    ):
-        def _decorator(func):
+    def njit(*args, **kwargs):
+        def decorator(func):
             return func
-
-        return _decorator
+        return decorator
 
     prange = range
 

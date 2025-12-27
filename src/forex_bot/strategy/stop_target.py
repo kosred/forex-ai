@@ -63,33 +63,66 @@ def _vol_ewma(close: np.ndarray, *, window: int, lam: float) -> np.ndarray:
     return sigma
 
 
-from numba import njit, prange
-
-@njit(cache=True, fastmath=True, parallel=True)
-def _vol_parkinson_numba(high, low, window):
-    n = len(high)
-    out = np.zeros(n, dtype=np.float64)
-    hl = np.log(high) - np.log(low)
-    sq_hl = hl * hl
+try:
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
     
-    for i in prange(window, n):
-        # Rolling mean of squared HL
-        out[i] = np.sqrt(np.mean(sq_hl[i-window+1 : i+1]) / (4.0 * np.log(2.0)))
-    return out
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+        
+    prange = range
 
-@njit(cache=True, fastmath=True)
-def _estimate_hurst_fast(series):
-    # Fast Hurst approximation without heavy polyfit
-    n = len(series)
-    if n < 20: return 0.5
-    
-    # Simple rescaled range approach
-    m = np.mean(series)
-    z = np.cumsum(series - m)
-    r = np.max(z) - np.min(z)
-    s = np.std(series)
-    if s < 1e-12: return 0.5
-    return math.log(r/s) / math.log(n)
+if NUMBA_AVAILABLE:
+    @njit(cache=True, fastmath=True, parallel=True)
+    def _vol_parkinson_numba(high, low, window):
+        n = len(high)
+        out = np.zeros(n, dtype=np.float64)
+        hl = np.log(high) - np.log(low)
+        sq_hl = hl * hl
+        
+        for i in prange(window, n):
+            # Rolling mean of squared HL
+            out[i] = np.sqrt(np.mean(sq_hl[i-window+1 : i+1]) / (4.0 * np.log(2.0)))
+        return out
+
+    @njit(cache=True, fastmath=True)
+    def _estimate_hurst_fast(series):
+        # Fast Hurst approximation without heavy polyfit
+        n = len(series)
+        if n < 20: return 0.5
+        
+        # Simple rescaled range approach
+        m = np.mean(series)
+        z = np.cumsum(series - m)
+        r = np.max(z) - np.min(z)
+        s = np.std(series)
+        if s < 1e-12: return 0.5
+        return math.log(r/s) / math.log(n)
+else:
+    def _vol_parkinson_numba(high, low, window):
+        n = len(high)
+        out = np.zeros(n, dtype=np.float64)
+        hl = np.log(high) - np.log(low)
+        sq_hl = hl * hl
+        
+        # Vectorized rolling mean
+        series = pd.Series(sq_hl)
+        out = np.sqrt(series.rolling(window).mean() / (4.0 * np.log(2.0))).fillna(0.0).values
+        return out
+
+    def _estimate_hurst_fast(series):
+        n = len(series)
+        if n < 20: return 0.5
+        m = np.mean(series)
+        z = np.cumsum(series - m)
+        r = np.max(z) - np.min(z)
+        s = np.std(series)
+        if s < 1e-12: return 0.5
+        return math.log(r/s) / math.log(n)
 
 class StopTargetEngine: # Wrapper logic if needed
 

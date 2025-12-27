@@ -10,11 +10,9 @@ except ImportError:
     def njit(*args, **kwargs):
         def decorator(func):
             return func
+        return decorator
 
-        return decorator if args else decorator
-
-    def prange(x):
-        return range(x)
+    prange = range
 
 
 try:
