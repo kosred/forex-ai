@@ -421,19 +421,52 @@ class AutoTuner:
         """Set reasonable BLAS/OpenMP thread defaults based on hardware."""
         cpu_cores = max(1, self.profile.cpu_cores)
 
-        # FIX: For multi-agent/multi-process setups (n_jobs > 1), restrict library threads
-        # to 1 to prevent massive oversubscription (e.g., 7 bots * 12 threads = 84 active threads).
-        # Heavy operations (training) should dynamically request more threads via 'thread_limits'.
-        if hints.n_jobs > 1:
-            blas_threads = 1
+        # Prefer explicit per-rank budgets (e.g., 20 cores per GPU under DDP).
+        local_rank = os.environ.get("LOCAL_RANK")
+        per_gpu = os.environ.get("FOREX_BOT_CPU_THREADS_PER_GPU")
+        budget = os.environ.get("FOREX_BOT_CPU_BUDGET") or os.environ.get("FOREX_BOT_CPU_THREADS")
+        blas_threads = None
+        if local_rank is not None:
+            if per_gpu:
+                try:
+                    blas_threads = max(1, int(per_gpu))
+                except Exception:
+                    blas_threads = None
+            if blas_threads is None and budget:
+                try:
+                    blas_threads = max(1, int(budget))
+                except Exception:
+                    blas_threads = None
+            if blas_threads is None:
+                blas_threads = 20
         else:
-            # Single process mode: allow full CPU utilization (capped at 8 for diminishing returns)
-            blas_threads = min(8, max(1, cpu_cores))
+            if budget:
+                try:
+                    blas_threads = max(1, int(budget))
+                except Exception:
+                    blas_threads = None
+        # Fallbacks if no explicit override was set.
+        if blas_threads is None:
+            # FIX: For multi-agent/multi-process setups (n_jobs > 1), restrict library threads
+            # to 1 to prevent massive oversubscription (e.g., 7 bots * 12 threads = 84 active threads).
+            # Heavy operations (training) should dynamically request more threads via 'thread_limits'.
+            if hints.n_jobs > 1:
+                blas_threads = 1
+            else:
+                # Single process mode: allow full CPU utilization (capped at 8 for diminishing returns)
+                blas_threads = min(8, max(1, cpu_cores))
 
-        os.environ.setdefault("OMP_NUM_THREADS", str(blas_threads))
-        os.environ.setdefault("MKL_NUM_THREADS", str(blas_threads))
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", str(blas_threads))
-        os.environ.setdefault("NUMEXPR_NUM_THREADS", str(blas_threads))  # numexpr often matches OMP
+        force_threads = local_rank is not None or per_gpu or budget
+        if force_threads:
+            os.environ["OMP_NUM_THREADS"] = str(blas_threads)
+            os.environ["MKL_NUM_THREADS"] = str(blas_threads)
+            os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
+            os.environ["NUMEXPR_NUM_THREADS"] = str(blas_threads)  # numexpr often matches OMP
+        else:
+            os.environ.setdefault("OMP_NUM_THREADS", str(blas_threads))
+            os.environ.setdefault("MKL_NUM_THREADS", str(blas_threads))
+            os.environ.setdefault("OPENBLAS_NUM_THREADS", str(blas_threads))
+            os.environ.setdefault("NUMEXPR_NUM_THREADS", str(blas_threads))  # numexpr often matches OMP
 
         try:
             import numexpr as _numexpr
@@ -443,6 +476,16 @@ class AutoTuner:
             pass  # Optional
         except Exception as e:
             logger.warning(f"NumExpr configuration failed: {e}")
+
+        # Align PyTorch intra-op/inter-op threads with the chosen budget.
+        try:
+            import torch
+
+            torch.set_num_threads(int(blas_threads))
+            # Keep inter-op small to avoid oversubscription in DDP.
+            torch.set_num_interop_threads(max(1, min(4, int(blas_threads))))
+        except Exception:
+            pass
 
     def _apply_feature_workers(self, hints: AutoTuneHints) -> None:
         """Set feature-engineering worker count if not explicitly provided."""
