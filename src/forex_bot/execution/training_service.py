@@ -67,6 +67,96 @@ class TrainingService:
         except Exception as exc:
             logger.warning(f"Failed to persist incremental progress: {exc}")
 
+    def _build_discovery_frames_for_tensor(
+        self,
+        frames: dict[str, pd.DataFrame],
+        news_feats: pd.DataFrame | None,
+        symbol: str | None,
+        base_dataset: PreparedDataset | None = None,
+    ) -> tuple[dict[str, pd.DataFrame], list[str]]:
+        """Build discovery frames with either base-TF propagation or full per-TF features."""
+        full_tf = str(os.environ.get("FOREX_BOT_DISCOVERY_FULL_TF_FEATURES", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        base_tf = self.settings.system.base_timeframe
+
+        cfg_tfs = list(getattr(self.settings.system, "higher_timeframes", []) or [])
+        if not cfg_tfs:
+            cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
+        timeframes = [base_tf] + cfg_tfs
+        timeframes = [tf for tf in dict.fromkeys(timeframes) if tf in frames]
+        for tf in frames.keys():
+            if tf not in timeframes:
+                timeframes.append(tf)
+        if not timeframes:
+            timeframes = list(frames.keys())
+
+        if not full_tf:
+            discovery_frames = frames.copy()
+            if base_tf in discovery_frames and base_dataset is not None:
+                rich_df = base_dataset.X.copy()
+                if "close" not in rich_df.columns:
+                    orig = discovery_frames[base_tf].reindex(rich_df.index).ffill()
+                    for col in ["open", "high", "low", "close"]:
+                        if col in orig.columns:
+                            rich_df[col] = orig[col]
+                discovery_frames[base_tf] = rich_df
+
+            reference_df = discovery_frames.get(base_tf)
+            aligned_frames = {}
+            for tf in timeframes:
+                if tf in frames and reference_df is not None:
+                    aligned = reference_df.reindex(frames[tf].index).ffill().fillna(0.0)
+                    aligned["open"] = frames[tf]["open"]
+                    aligned["high"] = frames[tf]["high"]
+                    aligned["low"] = frames[tf]["low"]
+                    aligned["close"] = frames[tf]["close"]
+                    aligned_frames[tf] = aligned
+            return aligned_frames if aligned_frames else discovery_frames, timeframes
+
+        # Full per-TF feature engineering (slow but pure)
+        per_tf = {}
+        for tf in timeframes:
+            if tf not in frames:
+                continue
+            try:
+                if base_dataset is not None and tf == base_tf:
+                    rich_df = base_dataset.X.copy()
+                else:
+                    tf_settings = self.settings.model_copy()
+                    tf_settings.system.base_timeframe = tf
+                    fe = FeatureEngineer(tf_settings)
+                    ds_tf = fe.prepare(frames, news_features=news_feats, symbol=symbol)
+                    rich_df = ds_tf.X.copy()
+                if "close" not in rich_df.columns:
+                    orig = frames[tf].reindex(rich_df.index).ffill()
+                    for col in ["open", "high", "low", "close"]:
+                        if col in orig.columns:
+                            rich_df[col] = orig[col]
+                per_tf[tf] = rich_df
+            except Exception as exc:
+                logger.warning(f"Discovery per-TF feature gen failed for {tf}: {exc}", exc_info=True)
+
+        if not per_tf:
+            return frames.copy(), timeframes
+
+        all_cols: list[str] = []
+        for df in per_tf.values():
+            all_cols.extend(list(df.columns))
+        # Preserve order, de-duplicate
+        all_cols = list(dict.fromkeys(all_cols))
+
+        aligned_frames = {}
+        for tf, df in per_tf.items():
+            aligned = df.reindex(columns=all_cols).ffill().fillna(0.0)
+            orig = frames[tf].reindex(aligned.index).ffill()
+            for col in ["open", "high", "low", "close"]:
+                if col in orig.columns:
+                    aligned[col] = orig[col]
+            aligned_frames[tf] = aligned
+
+        return aligned_frames, timeframes
+
     @staticmethod
     def _parse_int_env(name: str) -> int | None:
         raw = os.environ.get(name)
@@ -266,64 +356,13 @@ class TrainingService:
 
         logger.info("Launching GPU-Native Expert Discovery...")
         from ..strategy.discovery_tensor import TensorDiscoveryEngine
-        
-        # ENRICHMENT: Inject the engineered features (TA-Lib, etc.) into the frames for Discovery
-        # This allows the unsupervised engine to see the 200+ new features we just generated.
-        discovery_frames = frames.copy()
-        base_tf = self.settings.system.base_timeframe
-        
-        logger.debug(f"Base TF: {base_tf}. Dataset Shape: {dataset.X.shape}")
-        logger.debug(f"Dataset Columns (first 10): {list(dataset.X.columns)[:10]}")
-        
-        if base_tf in discovery_frames:
-             # Merge dataset.X (features) with original OHLC (needed for PnL)
-             rich_df = dataset.X.copy()
-             # Ensure OHLC exists (dataset.X might strictly be features)
-             if "close" not in rich_df.columns:
-                 orig = discovery_frames[base_tf].reindex(rich_df.index).ffill()
-                 for col in ["open", "high", "low", "close"]:
-                     if col in orig.columns:
-                         rich_df[col] = orig[col]
-             discovery_frames[base_tf] = rich_df
-             logger.debug(f"Enriched {base_tf} with {rich_df.shape[1]} columns.")
-        else:
-             logger.debug(f"Base TF {base_tf} not found in frames keys: {list(discovery_frames.keys())}")
 
-        # CRITICAL FIX: Tensor Discovery expects UNIFORM feature sets across timeframes.
-        # ...
-        
-        logger.debug("Aligning all discovery frames to enriched feature space...")
-        reference_df = discovery_frames[base_tf]
-        aligned_frames = {}
-
-        # Use config-driven timeframes (prefer higher_timeframes; fall back to required_timeframes)
-        cfg_tfs = list(getattr(self.settings.system, "higher_timeframes", []) or [])
-        if not cfg_tfs:
-            cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
-        timeframes = [base_tf] + cfg_tfs
-        timeframes = [tf for tf in dict.fromkeys(timeframes) if tf in frames]
-        # Always include any additional frames discovered at runtime.
-        for tf in frames.keys():
-            if tf not in timeframes:
-                timeframes.append(tf)
-        if not timeframes:
-            timeframes = list(frames.keys())
-
-        for tf in timeframes:
-            if tf in frames:
-                # Reindex reference (Rich Features) to target TF index
-                aligned = reference_df.reindex(frames[tf].index).ffill().fillna(0.0)
-                # Ensure OHLC is from the TARGET timeframe
-                aligned["open"] = frames[tf]["open"]
-                aligned["high"] = frames[tf]["high"]
-                aligned["low"] = frames[tf]["low"]
-                aligned["close"] = frames[tf]["close"]
-                aligned_frames[tf] = aligned
-        
-        # Update discovery frames to the aligned set
-        discovery_frames = aligned_frames
-        logger.debug(f"Alignment complete. Frames: {list(discovery_frames.keys())}")
-        # Validate one frame
+        discovery_frames, timeframes = self._build_discovery_frames_for_tensor(
+            frames,
+            news_feats,
+            symbol,
+            base_dataset=dataset,
+        )
         if "M1" in discovery_frames:
             logger.debug(f"M1 Columns: {len(discovery_frames['M1'].columns)}")
 
@@ -1054,35 +1093,26 @@ class TrainingService:
             # Now that all symbols are loaded in raw_frames_map, find global experts
             logger.info("Launching GPU-Native Expert Discovery (Multi-Symbol)...")
             from ..strategy.discovery_tensor import TensorDiscoveryEngine
-            discovery_tensor = TensorDiscoveryEngine(device="cuda", n_experts=100)
-            
+
             # We pick the largest symbol's timeframe set as the candidate for multi-TF discovery
             target_sym = "EURUSD" if "EURUSD" in raw_frames_map else next(iter(raw_frames_map.keys()))
-            
+
             # ENRICHMENT: Locate the prepared dataset for the target symbol to get rich features
             target_ds = next((ds for sym, ds in datasets if sym == target_sym), None)
-            discovery_frames = raw_frames_map[target_sym].copy()
-            
-            if target_ds:
+            if target_ds is not None:
                 print(f"DEBUG (Global): Enriching discovery with {target_ds.X.shape[1]} features.")
-                rich_df = target_ds.X.copy()
-                base_tf = self.settings.system.base_timeframe
-                if base_tf in discovery_frames:
-                    orig = discovery_frames[base_tf].reindex(rich_df.index).ffill()
-                    for col in ["open", "high", "low", "close"]:
-                        if col in orig.columns: rich_df[col] = orig[col]
-                    
-                    # Align all TFs to the rich feature space
-                    aligned_frames = {}
-                    for tf in ["M1", "M5", "M15", "H1", "H4", "D1"]:
-                        if tf in raw_frames_map[target_sym]:
-                            aligned = rich_df.reindex(raw_frames_map[target_sym][tf].index).ffill().fillna(0.0)
-                            aligned["open"] = raw_frames_map[target_sym][tf]["open"]
-                            aligned["high"] = raw_frames_map[target_sym][tf]["high"]
-                            aligned["low"] = raw_frames_map[target_sym][tf]["low"]
-                            aligned["close"] = raw_frames_map[target_sym][tf]["close"]
-                            aligned_frames[tf] = aligned
-                    discovery_frames = aligned_frames
+            discovery_frames, timeframes = self._build_discovery_frames_for_tensor(
+                raw_frames_map[target_sym],
+                news_map.get(target_sym) if news_map else None,
+                target_sym,
+                base_dataset=target_ds,
+            )
+
+            discovery_tensor = TensorDiscoveryEngine(
+                device="cuda",
+                n_experts=100,
+                timeframes=timeframes,
+            )
 
             discovery_tensor.run_unsupervised_search(
                 discovery_frames,
