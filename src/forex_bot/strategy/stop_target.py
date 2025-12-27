@@ -124,8 +124,6 @@ else:
         if s < 1e-12: return 0.5
         return math.log(r/s) / math.log(n)
 
-class StopTargetEngine: # Wrapper logic if needed
-
 
 def _vol_rogers_satchell(open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
     ho = _safe_log(high) - _safe_log(open_)
