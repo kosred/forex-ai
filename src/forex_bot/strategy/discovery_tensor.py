@@ -21,15 +21,13 @@ logger = logging.getLogger(__name__)
 class TensorDiscoveryEngine:
     """
     2025-Grade GPU Discovery Engine.
-    Cooperative Multi-GPU Architecture with True Global Reporting.
+    Cooperative Multi-GPU Architecture with Island Diversity.
     
     Features:
-    - Parallel Data Alignment (utilizing all CPU cores)
-    - FP16 Optimization (50% RAM reduction)
-    - Dynamic OOM Recovery (Auto-scales batch size on crash)
-    - Global Champion Reporting (Logs best metrics from all GPUs)
-    - Survival-Based Fitness (Gradient for early evolution)
-    - Monte-Carlo Lite (Consistency over 3 market regimes)
+    - Multi-Objective Islands (Profit vs Safety specialization)
+    - Dynamic Scout Resets (Forces exploration of new peaks)
+    - Parallel Data Alignment
+    - FP16 Optimization
     """
     
     def __init__(
@@ -64,9 +62,6 @@ class TensorDiscoveryEngine:
         self._auto_cap_override = auto_cap
 
     def _prepare_tensor_cube(self, frames: Dict[str, pd.DataFrame], news_map: Optional[Dict[str, pd.DataFrame]] = None):
-        """
-        Aligns data using parallel CPU processing and optimizes storage with FP16.
-        """
         logger.info(f"Aligning Multi-Timeframe Data (Auto-Parallelized)...")
         master_tf = "M1"
         if master_tf not in frames:
@@ -103,7 +98,6 @@ class TensorDiscoveryEngine:
                             num_cols = int(tf_df.select_dtypes(include=[np.number]).shape[1])
                         except Exception:
                             num_cols = int(tf_df.shape[1])
-                        # FP16 = 2 bytes per element
                         bytes_per_row += int((num_cols + 4) * 2) 
                     if bytes_per_row > 0:
                         auto_rows = int((avail_bytes * 0.75) / bytes_per_row)
@@ -193,8 +187,7 @@ class TensorDiscoveryEngine:
     def run_unsupervised_search(self, frames: Dict[str, pd.DataFrame], news_features: Optional[pd.DataFrame] = None, iterations: int = 1000):
         self._prepare_tensor_cube(frames, news_features)
         
-        # Global Reporting Setup
-        metrics_registry = {} 
+        metrics_registry = {}
         registry_lock = threading.Lock()
 
         preload = False
@@ -260,11 +253,11 @@ class TensorDiscoveryEngine:
                                 except torch.OutOfMemoryError:
                                     torch.cuda.empty_cache(); gc.collect()
                                     batch_size_map[gpu_idx] = int(current_batch * 0.5)
-                                    if batch_size_map[gpu_idx] < 128: return torch.full((chunk.shape[0],), 0.0)
+                                    if batch_size_map[gpu_idx] < 128: return torch.full((chunk.shape[0],), -1e9)
                                     continue
                         return torch.cat(fitness_all, dim=0)
                 except Exception as e: 
-                    logger.error(f"GPU {gpu_idx} fatal: {e}"); return torch.full((chunk.shape[0],), 0.0)
+                    logger.error(f"GPU {gpu_idx} fatal: {e}"); return torch.full((chunk.shape[0],), -1e9)
 
             def _eval_batch_safe(gpu_idx, dev, genomes, batch_size, n_samples, preload, 
                                  gpu_data_cubes, gpu_ohlc_cubes, gpu_news, month_ids):
@@ -289,8 +282,6 @@ class TensorDiscoveryEngine:
                 logic_weights = genomes[:, tf_count : tf_count + self.n_features].to(dtype=matmul_dtype)
                 thresholds = genomes[:, -2:]
                 
-                # --- GRADIENT RECOVERY TWEAK ---
-                # Bias thresholds HIGHER (1.5) to stop noise trading. 
                 buy_th = torch.maximum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) + 1.5
                 sell_th = torch.minimum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) - 1.5
 
@@ -343,7 +334,11 @@ class TensorDiscoveryEngine:
                     
                     running_equity.copy_(abs_equity[:, -1]); running_peak.copy_(batch_peaks[:, -1])
 
-                # --- NEW RECOVERY FITNESS ---
+                # --- ISLAND DIVERSITY LOGIC ---
+                # Even GPUs: Profit Focus (Sharpe)
+                # Odd GPUs: Safety Focus (Drawdown)
+                is_safety_island = (gpu_idx % 2 != 0)
+                
                 survival_ratio = survival_steps / n_samples
                 denom = torch.clamp(survival_steps, min=1.0)
                 mean_r = sum_ret / denom
@@ -353,16 +348,17 @@ class TensorDiscoveryEngine:
                 
                 segment_profitability = (seg_rets > 0).float().sum(dim=1)
                 consistency_bonus = (segment_profitability / n_segments) * 5.0
-                
-                # SOFT PENALTY (Fixes 0.00 Fitness)
-                # Reduced alpha from 30 -> 5 to allow gradient detection
                 dd_penalty = torch.where(max_dd > 0.08, (max_dd - 0.08) * 5.0, torch.tensor(0.0, device=dev))
-                
                 trade_density = trade_steps / denom
-                # Penalize zero trading or hyper-trading
                 trade_score = torch.where(trade_density > 0.0001, torch.tensor(1.0, device=dev), torch.tensor(0.0, device=dev))
                 
-                total_fitness = (survival_ratio * 10.0) + sharpe + consistency_bonus - dd_penalty + trade_score
+                if is_safety_island:
+                    # SAFETY ISLAND: Double penalty for drawdown, less reward for Sharpe
+                    total_fitness = (survival_ratio * 12.0) + (sharpe * 0.5) + consistency_bonus - (dd_penalty * 2.0) + trade_score
+                else:
+                    # PROFIT ISLAND: Standard weights
+                    total_fitness = (survival_ratio * 10.0) + sharpe + consistency_bonus - dd_penalty + trade_score
+                
                 bi = int(torch.argmax(total_fitness).item())
                 metadata = {
                     "fit": float(total_fitness[bi].item()), "surv": float(survival_ratio[bi].item()),
@@ -382,9 +378,7 @@ class TensorDiscoveryEngine:
         genome_dim = self.n_features + len(self.timeframes) + 2
         problem = Problem("max", fitness_func, initial_bounds=(-1.0, 1.0), solution_length=genome_dim, device="cpu", vectorized=True)
         
-        # --- AGGRESSIVE MUTATION SETTINGS ---
         pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 12000))
-        # Increased stdev_init from 0.5 to 1.2 for aggressive exploration
         searcher = CMAES(problem, popsize=pop_size, stdev_init=1.2)
         
         logger.info(f"Starting COOPERATIVE 8-GPU Discovery (Pop: {pop_size})...")
