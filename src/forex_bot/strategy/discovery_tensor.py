@@ -20,11 +20,13 @@ logger = logging.getLogger(__name__)
 class TensorDiscoveryEngine:
     """
     2025-Grade GPU Discovery Engine.
-    Cooperative Multi-GPU Architecture with Survive-and-Evolve logic.
+    Cooperative Multi-GPU Architecture with True Global Reporting.
     
     Features:
-    - Parallel Data Alignment (CPU)
-    - FP16 Optimization (GPU)
+    - Parallel Data Alignment (utilizing all CPU cores)
+    - FP16 Optimization (50% RAM reduction)
+    - Dynamic OOM Recovery (Auto-scales batch size on crash)
+    - Global Champion Reporting (Logs best metrics from all GPUs)
     - Survival-Based Fitness (Gradient for early evolution)
     - Monte-Carlo Lite (Consistency over 3 market regimes)
     """
@@ -61,6 +63,9 @@ class TensorDiscoveryEngine:
         self._auto_cap_override = auto_cap
 
     def _prepare_tensor_cube(self, frames: Dict[str, pd.DataFrame], news_map: Optional[Dict[str, pd.DataFrame]] = None):
+        """
+        Aligns data using parallel CPU processing and optimizes storage with FP16.
+        """
         logger.info(f"Aligning Multi-Timeframe Data (Auto-Parallelized)...")
         master_tf = "M1"
         if master_tf not in frames:
@@ -186,11 +191,13 @@ class TensorDiscoveryEngine:
     def run_unsupervised_search(self, frames: Dict[str, pd.DataFrame], news_features: Optional[pd.DataFrame] = None, iterations: int = 1000):
         self._prepare_tensor_cube(frames, news_features)
         
-        # Metrics Logging Control
-        log_metrics = True
-        log_metrics_every = 10
-        metrics_lock = threading.Lock()
-        metrics_state = {"gen": -1, "armed": False, "logged": False}
+        # Hyperparams & Global Reporting
+        try:
+            sharpe_cap = float(os.environ.get("FOREX_BOT_DISCOVERY_SHARPE_CAP", "20") or 20)
+        except Exception: sharpe_cap = 20.0
+        
+        metrics_registry = {} # Key: generation, Value: best metadata
+        registry_lock = threading.Lock()
 
         preload = False
         cuda_gpus = [g for g in self.gpu_list if str(g).startswith("cuda")]
@@ -213,10 +220,10 @@ class TensorDiscoveryEngine:
         num_gpus = max(1, len(self.gpu_list))
         batch_size_map = {}
         max_genomes_map = {}
+        gen_context = {"val": 0}
 
         @torch.no_grad()
         def fitness_func(genomes_all: torch.Tensor) -> torch.Tensor:
-            pop_size = genomes_all.shape[0]
             pop_chunks = genomes_all.chunk(num_gpus, dim=0)
             all_fitness_scores = []
             
@@ -244,9 +251,13 @@ class TensorDiscoveryEngine:
                             while True:
                                 current_batch = batch_size_map[gpu_idx]
                                 try:
-                                    res = _eval_batch_safe(gpu_idx, dev, genomes, current_batch, n_samples, preload, 
-                                                           gpu_data_cubes, gpu_ohlc_cubes, gpu_news, month_ids)
+                                    res, meta = _eval_batch_safe(gpu_idx, dev, genomes, current_batch, n_samples, preload, 
+                                                                 gpu_data_cubes, gpu_ohlc_cubes, gpu_news, month_ids)
                                     fitness_all.append(res)
+                                    with registry_lock:
+                                        cur_gen = gen_context["val"]
+                                        if cur_gen not in metrics_registry or meta["fit"] > metrics_registry[cur_gen]["fit"]:
+                                            metrics_registry[cur_gen] = meta
                                     break
                                 except torch.OutOfMemoryError:
                                     torch.cuda.empty_cache(); gc.collect()
@@ -260,20 +271,16 @@ class TensorDiscoveryEngine:
             def _eval_batch_safe(gpu_idx, dev, genomes, batch_size, n_samples, preload, 
                                  gpu_data_cubes, gpu_ohlc_cubes, gpu_news, month_ids):
                 local_pop = genomes.shape[0]
-                # MONTE-CARLO LITE: Track metrics for 3 time segments
                 n_segments = 3
                 seg_size = n_samples // n_segments
                 seg_rets = torch.zeros((local_pop, n_segments), device=dev, dtype=torch.float32)
-                seg_samples = torch.zeros((local_pop, n_segments), device=dev, dtype=torch.float32)
                 
                 sum_ret = torch.zeros(local_pop, device=dev, dtype=torch.float32)
                 sum_sq_ret = torch.zeros(local_pop, device=dev, dtype=torch.float32)
-                effective_samples = 0
                 max_dd = torch.zeros(local_pop, device=dev, dtype=torch.float32)
                 running_equity = torch.ones(local_pop, device=dev, dtype=torch.float32)
                 running_peak = torch.ones(local_pop, device=dev, dtype=torch.float32)
                 
-                # SURVIVAL GRADIENT
                 survival_steps = torch.zeros(local_pop, device=dev, dtype=torch.float32)
                 alive_mask = torch.ones(local_pop, device=dev, dtype=torch.bool)
 
@@ -282,7 +289,6 @@ class TensorDiscoveryEngine:
                 tf_weights = F.softmax(genomes[:, :tf_count], dim=1).to(dtype=matmul_dtype)
                 logic_weights = genomes[:, tf_count : tf_count + self.n_features].to(dtype=matmul_dtype)
                 thresholds = genomes[:, -2:]
-                # Evolve picky thresholds
                 buy_th = torch.maximum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) + 0.2
                 sell_th = torch.minimum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) - 0.2
 
@@ -293,11 +299,9 @@ class TensorDiscoveryEngine:
                     if preload:
                         data_slice = gpu_data_cubes[gpu_idx][:, start_idx:end_idx, :].to(dtype=matmul_dtype)
                         ohlc_slice = gpu_ohlc_cubes[gpu_idx][:, start_idx:end_idx, :].to(dtype=torch.float32)
-                        news_slice = gpu_news[gpu_idx][start_idx:end_idx] if self.news_tensor_cpu is not None else None
                     else:
                         data_slice = self.data_cube_cpu[:, start_idx:end_idx, :].to(dev, dtype=matmul_dtype, non_blocking=True)
                         ohlc_slice = self.ohlc_cube_cpu[:, start_idx:end_idx, :].to(dev, dtype=torch.float32, non_blocking=True)
-                        news_slice = self.news_tensor_cpu[start_idx:end_idx].to(dev, non_blocking=True) if self.news_tensor_cpu is not None else None
 
                     batch_len = end_idx - start_idx
                     data_2d = data_slice.reshape(tf_count * batch_len, self.n_features)
@@ -305,9 +309,6 @@ class TensorDiscoveryEngine:
                     tf_sig = tf_sig_2d.view(tf_count, batch_len, local_pop).permute(2, 0, 1)
                     signals = (tf_sig * tf_weights.unsqueeze(2)).sum(dim=1)
                     
-                    if news_slice is not None:
-                        signals.add_(news_slice[:, 0].to(dtype=matmul_dtype).unsqueeze(0) * 0.5)
-
                     actions = torch.where(signals > buy_th.unsqueeze(1), 1.0, 0.0)
                     actions = torch.where(signals < sell_th.unsqueeze(1), -1.0, actions)
 
@@ -315,70 +316,48 @@ class TensorDiscoveryEngine:
 
                     close_next = ohlc_slice[0, 1:, 3]; open_next = torch.clamp(ohlc_slice[0, 1:, 0], min=1e-6)
                     rets = (close_next - open_next) / open_next
-                    # 0.0002 cost = ~2 pips penalty per trade
                     batch_rets = (actions[:, :-1] * rets.unsqueeze(0)) - (torch.abs(actions[:, :-1]) * 0.0002)
                     
                     active_rets = torch.where(alive_mask.unsqueeze(1), batch_rets, torch.zeros_like(batch_rets))
                     sum_ret.add_(active_rets.sum(dim=1))
                     sum_sq_ret.add_((active_rets**2).sum(dim=1))
                     
-                    # Track segment returns for Monte Carlo Lite
                     for s in range(n_segments):
-                        s_start = s * seg_size
-                        s_end = (s + 1) * seg_size
-                        overlap_start = max(start_idx, s_start)
-                        overlap_end = min(end_idx - 1, s_end)
+                        overlap_start = max(start_idx, s * seg_size)
+                        overlap_end = min(end_idx - 1, (s + 1) * seg_size)
                         if overlap_end > overlap_start:
-                            b_s = overlap_start - start_idx
-                            b_e = overlap_end - start_idx
-                            seg_rets[:, s].add_(active_rets[:, b_s:b_e].sum(dim=1))
-                            seg_samples[:, s].add_(float(b_e - b_s))
+                            seg_rets[:, s].add_(active_rets[:, overlap_start-start_idx : overlap_end-start_idx].sum(dim=1))
 
                     survival_steps.add_(alive_mask.float() * batch_rets.shape[1])
-                    
                     equity_step = torch.clamp(1.0 + active_rets, min=1e-6)
                     batch_equity = torch.cumprod(equity_step, dim=1)
                     abs_equity = batch_equity * running_equity.unsqueeze(1)
                     batch_peaks = torch.maximum(torch.cummax(abs_equity, dim=1)[0], running_peak.unsqueeze(1))
                     dd = (batch_peaks - abs_equity) / torch.clamp(batch_peaks, min=1e-9)
                     
-                    # SOFT BREACH: If DD > 10%, mark as "struggling" but don't kill yet
                     max_dd = torch.maximum(dd.max(dim=1)[0], max_dd)
-                    # Hard stop only at 90% loss to keep gradient
                     alive_mask = alive_mask & (max_dd < 0.90)
                     
                     running_equity.copy_(abs_equity[:, -1]); running_peak.copy_(batch_peaks[:, -1])
 
-                # --- POSITIVE EVOLUTION FITNESS ---
-                # 1. Survival Score (0 to 10)
+                # --- FITNESS CALCULATION ---
                 survival_ratio = survival_steps / n_samples
-                fitness = survival_ratio * 10.0
-                
-                # 2. Risk-Adjusted Profit (Clamped Sharpe)
                 mean_r = sum_ret / torch.clamp(survival_steps, min=1.0)
                 std_r = torch.sqrt(torch.clamp((sum_sq_ret / torch.clamp(survival_steps, min=1.0)) - mean_r**2, min=1e-9)) + 1e-5
                 sharpe = (mean_r / std_r) * (252 * 1440)**0.5
-                sharpe = torch.clamp(sharpe, min=-5.0, max=10.0) # Conservative clamp
+                sharpe = torch.clamp(sharpe, min=-5.0, max=10.0)
                 
-                # 3. Monte Carlo Lite: Reward consistency across 3 market regimes
-                segment_profitability = (seg_rets > 0).float().sum(dim=1) # 0, 1, 2, or 3
+                segment_profitability = (seg_rets > 0).float().sum(dim=1)
                 consistency_bonus = (segment_profitability / n_segments) * 5.0
-                
-                # 4. Soft Penalty for Drawdown (Targeting FundedNext < 10%)
                 dd_penalty = torch.where(max_dd > 0.08, (max_dd - 0.08) * 50.0, torch.tensor(0.0, device=dev))
                 
-                # Final Combined Fitness
-                # We want: Max Survival + Max Sharpe + Max Consistency - DD Penalties
-                total_fitness = fitness + sharpe + consistency_bonus - dd_penalty
-                
-                if log_metrics and gpu_idx == 0 and not metrics_state["logged"]:
-                    with metrics_lock:
-                        if not metrics_state["logged"]:
-                            bi = int(torch.argmax(total_fitness).item())
-                            logger.info(f"Discovery (gen {metrics_state['gen']}): fit={total_fitness[bi]:.2f} surv={survival_ratio[bi]:.2f} shrp={sharpe[bi]:.2f} dd={max_dd[bi]:.2f} segs={segment_profitability[bi]:.0f}/3")
-                            metrics_state["logged"] = True
-                
-                return torch.nan_to_num(total_fitness, nan=0.0).detach().cpu()
+                total_fitness = (survival_ratio * 10.0) + sharpe + consistency_bonus - dd_penalty
+                bi = int(torch.argmax(total_fitness).item())
+                metadata = {
+                    "fit": float(total_fitness[bi].item()), "surv": float(survival_ratio[bi].item()),
+                    "shrp": float(sharpe[bi].item()), "dd": float(max_dd[bi].item()), "segs": int(segment_profitability[bi].item())
+                }
+                return torch.nan_to_num(total_fitness, nan=0.0).detach().cpu(), metadata
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_gpus) as executor:
                 futures = {executor.submit(_eval_on_gpu, pop_chunks[i], i): pop_chunks[i].shape[0] for i in range(num_gpus)}
@@ -393,10 +372,13 @@ class TensorDiscoveryEngine:
         pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 12000))
         searcher = CMAES(problem, popsize=pop_size, stdev_init=0.5)
         
-        logger.info(f"Starting COOPERATIVE 8-GPU Discovery (Pop: {pop_size})...")
+        logger.info(f"Starting COOPERATIVE {len(self.gpu_list)}-GPU Discovery (Pop: {pop_size})...")
         for i in range(iterations):
-            metrics_state["gen"] = i; metrics_state["armed"] = True; metrics_state["logged"] = False
+            gen_context["val"] = i
             searcher.step()
+            with registry_lock:
+                m = metrics_registry.get(i)
+                if m: logger.info(f"Discovery (gen {i}): fit={m['fit']:.2f} surv={m['surv']:.2f} shrp={m['shrp']:.2f} dd={m['dd']:.2f} segs={m['segs']}/3")
             if i % 10 == 0: logger.info(f"Generation {i}: Global Best Fitness = {float(searcher.status.get('best_eval', 0.0)):.4f}")
         
         final_pop = searcher.population.values.detach().cpu()
