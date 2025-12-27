@@ -56,6 +56,7 @@ class TensorDiscoveryEngine:
         self.best_experts = []
         self.month_ids_cpu = None
         self.month_count = 0
+        self.bar_change_cpu = None
         self.full_fp16 = False
         self._max_rows_override = max_rows
         self._stream_mode_override = stream_mode
@@ -115,9 +116,30 @@ class TensorDiscoveryEngine:
             master_idx = frames[master_tf].index
         
         if self.timeframes:
-            self.timeframes = [tf for tf in self.timeframes if tf in frames]
+            self.timeframes = [tf for tf in self.timeframes if tf in frames]    
         else:
             self.timeframes = list(frames.keys())
+
+        # Track TF bar changes aligned to master index (used for per-TF trading).
+        bar_changes = []
+        for tf in self.timeframes:
+            try:
+                tf_idx = frames[tf].index
+                if len(tf_idx) == 0:
+                    raise ValueError("empty index")
+                bar_ids = pd.Series(
+                    np.arange(len(tf_idx), dtype=np.int64),
+                    index=tf_idx,
+                )
+                aligned_ids = bar_ids.reindex(master_idx).ffill().bfill()
+                ids = aligned_ids.to_numpy(dtype=np.int64, copy=False)
+                change = np.zeros(len(ids), dtype=np.float32)
+                if len(ids) > 1:
+                    change[1:] = (ids[1:] != ids[:-1]).astype(np.float32)
+                bar_changes.append(torch.from_numpy(change))
+            except Exception:
+                bar_changes.append(torch.zeros(len(master_idx), dtype=torch.float32))
+        self.bar_change_cpu = torch.stack(bar_changes) if bar_changes else None
 
         try:
             cpu_workers = int(os.environ.get("FOREX_BOT_DISCOVERY_ALIGN_WORKERS", "0") or 0)
@@ -278,20 +300,28 @@ class TensorDiscoveryEngine:
 
         preload = False
         cuda_gpus = [g for g in self.gpu_list if str(g).startswith("cuda")]
+        gpu_data_cubes = []
+        gpu_ohlc_cubes = []
+        gpu_bar_changes = []
+        gpu_news = []
+        gpu_month_ids = []
         if cuda_gpus:
             try:
                 bytes_needed = (self.data_cube_cpu.nelement() * self.data_cube_cpu.element_size()) + \
                                (self.ohlc_cube_cpu.nelement() * self.ohlc_cube_cpu.element_size())
+                if self.bar_change_cpu is not None:
+                    bytes_needed += self.bar_change_cpu.nelement() * self.bar_change_cpu.element_size()
                 min_vram = min(torch.cuda.get_device_properties(g).total_memory for g in cuda_gpus)
                 if bytes_needed < (min_vram * 0.85):
                     preload = True
                     logger.info(f"Discovery: Preloading data ({bytes_needed/1024**3:.2f} GB) to GPUs.")
                     gpu_data_cubes = [self.data_cube_cpu.to(gpu) for gpu in cuda_gpus]
                     gpu_ohlc_cubes = [self.ohlc_cube_cpu.to(gpu) for gpu in cuda_gpus]
+                    gpu_bar_changes = [self.bar_change_cpu.to(gpu) for gpu in cuda_gpus] if self.bar_change_cpu is not None else []
                     gpu_news = [self.news_tensor_cpu.to(gpu) for gpu in cuda_gpus] if self.news_tensor_cpu is not None else []
                     gpu_month_ids = [self.month_ids_cpu.to(gpu) for gpu in cuda_gpus] if self.month_ids_cpu is not None else []
                 else:
-                    gpu_data_cubes, gpu_ohlc_cubes, gpu_news, gpu_month_ids = [], [], [], []
+                    gpu_data_cubes, gpu_ohlc_cubes, gpu_bar_changes, gpu_news, gpu_month_ids = [], [], [], [], []
             except Exception: preload = False
         
         num_gpus = max(1, len(self.gpu_list))
@@ -328,8 +358,19 @@ class TensorDiscoveryEngine:
                             while True:
                                 current_batch = batch_size_map[gpu_idx]
                                 try:
-                                    res, meta = _eval_batch_safe(gpu_idx, dev, genomes, current_batch, n_samples, preload, 
-                                                                 gpu_data_cubes, gpu_ohlc_cubes, gpu_news, month_ids)
+                                    res, meta = _eval_batch_safe(
+                                        gpu_idx,
+                                        dev,
+                                        genomes,
+                                        current_batch,
+                                        n_samples,
+                                        preload,
+                                        gpu_data_cubes,
+                                        gpu_ohlc_cubes,
+                                        gpu_bar_changes,
+                                        gpu_news,
+                                        month_ids,
+                                    )
                                     fitness_all.append(res)
                                     with registry_lock:
                                         cur_gen = gen_context["val"]
@@ -345,8 +386,19 @@ class TensorDiscoveryEngine:
                 except Exception as e: 
                     logger.error(f"GPU {gpu_idx} fatal: {e}"); return torch.full((chunk.shape[0],), -1e9)
 
-            def _eval_batch_safe(gpu_idx, dev, genomes, batch_size, n_samples, preload, 
-                                 gpu_data_cubes, gpu_ohlc_cubes, gpu_news, month_ids):
+            def _eval_batch_safe(
+                gpu_idx,
+                dev,
+                genomes,
+                batch_size,
+                n_samples,
+                preload,
+                gpu_data_cubes,
+                gpu_ohlc_cubes,
+                gpu_bar_changes,
+                gpu_news,
+                month_ids,
+            ):
                 local_pop = genomes.shape[0]
                 n_segments = 3
                 seg_size = n_samples // n_segments
@@ -362,6 +414,19 @@ class TensorDiscoveryEngine:
                 alive_mask = torch.ones(local_pop, device=dev, dtype=torch.bool)
                 trade_steps = torch.zeros(local_pop, device=dev, dtype=torch.float32)
 
+                try:
+                    tf_trading = str(os.environ.get("FOREX_BOT_DISCOVERY_TF_TRADING", "1") or "1").strip().lower() in {
+                        "1", "true", "yes", "on"
+                    }
+                except Exception:
+                    tf_trading = True
+                bar_change = None
+                if tf_trading and self.bar_change_cpu is not None:
+                    if preload and gpu_bar_changes:
+                        bar_change = gpu_bar_changes[gpu_idx]
+                    else:
+                        bar_change = self.bar_change_cpu.to(dev, non_blocking=True)
+
                 tf_count = self.data_cube_cpu.shape[0]
                 matmul_dtype = torch.float16 if dev.type == "cuda" else torch.float32
                 tf_weights = F.softmax(genomes[:, :tf_count], dim=1).to(dtype=matmul_dtype)
@@ -370,12 +435,12 @@ class TensorDiscoveryEngine:
                 
                 # Selective trading balance (tunable bias/scale to control activity)
                 try:
-                    threshold_bias = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_BIAS", "0.1") or 0.1)
+                    threshold_bias = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_BIAS", "0.05") or 0.05)
                 except Exception:
                     threshold_bias = 0.1
                 threshold_bias = max(threshold_bias, 0.0)
                 try:
-                    threshold_scale = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_SCALE", "0.25") or 0.25)
+                    threshold_scale = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_SCALE", "0.20") or 0.20)
                 except Exception:
                     threshold_scale = 0.25
                 threshold_scale = max(threshold_scale, 1e-6)
@@ -406,26 +471,55 @@ class TensorDiscoveryEngine:
                     signal_scale = max(signal_scale, 1e-6)
                     signals = signals * signal_scale
                     
-                    actions = torch.where(signals > buy_th.unsqueeze(1), 1.0, 0.0)
-                    actions = torch.where(signals < sell_th.unsqueeze(1), -1.0, actions)
+                    if (end_idx - start_idx) < 2:
+                        continue
 
-                    if (end_idx - start_idx) < 2: continue
+                    if tf_trading and bar_change is not None and tf_count > 1:
+                        bar_slice = bar_change[:, start_idx:end_idx]
+                        actions_tf = torch.where(
+                            tf_sig > buy_th.unsqueeze(1).unsqueeze(2),
+                            1.0,
+                            0.0,
+                        )
+                        actions_tf = torch.where(
+                            tf_sig < sell_th.unsqueeze(1).unsqueeze(2),
+                            -1.0,
+                            actions_tf,
+                        )
+                        close_next = ohlc_slice[:, 1:, 3]
+                        open_next = torch.clamp(ohlc_slice[:, 1:, 0], min=1e-6)
+                        rets_tf = (close_next - open_next) / open_next
+                        bar_mask_next = bar_slice[:, 1:]
+                        exec_actions = actions_tf[:, :, :-1] * bar_mask_next.unsqueeze(0)
+                        batch_rets_tf = (exec_actions * rets_tf.unsqueeze(0)) - (torch.abs(exec_actions) * 0.0002)
+                        batch_rets = (batch_rets_tf * tf_weights.unsqueeze(2)).sum(dim=1)
+                        prev_actions = exec_actions[:, :, :-1]
+                        curr_actions = exec_actions[:, :, 1:]
+                        entries = (prev_actions == 0) & (curr_actions != 0)
+                        flips = (prev_actions != 0) & (curr_actions != 0) & (prev_actions != curr_actions)
+                        trade_events = (entries | flips).float()
+                        trade_steps.add_(
+                            (trade_events * tf_weights.unsqueeze(2) * alive_mask.unsqueeze(1).float()).sum(dim=(1, 2))
+                        )
+                    else:
+                        actions = torch.where(signals > buy_th.unsqueeze(1), 1.0, 0.0)
+                        actions = torch.where(signals < sell_th.unsqueeze(1), -1.0, actions)
+                        close_next = ohlc_slice[0, 1:, 3]
+                        open_next = torch.clamp(ohlc_slice[0, 1:, 0], min=1e-6)
+                        rets = (close_next - open_next) / open_next
+                        batch_rets = (actions[:, :-1] * rets.unsqueeze(0)) - (torch.abs(actions[:, :-1]) * 0.0002)
+                        # Count actual trade entries (not time-in-position).
+                        prev_actions = actions[:, :-1]
+                        curr_actions = actions[:, 1:]
+                        entries = (prev_actions == 0) & (curr_actions != 0)
+                        flips = (prev_actions != 0) & (curr_actions != 0) & (prev_actions != curr_actions)
+                        trade_events = (entries | flips).float()
+                        # Count trades only while alive to avoid inflated density after death.
+                        trade_steps.add_((trade_events * alive_mask.unsqueeze(1).float()).sum(dim=1))
 
-                    close_next = ohlc_slice[0, 1:, 3]; open_next = torch.clamp(ohlc_slice[0, 1:, 0], min=1e-6)
-                    rets = (close_next - open_next) / open_next
-                    batch_rets = (actions[:, :-1] * rets.unsqueeze(0)) - (torch.abs(actions[:, :-1]) * 0.0002)
-                    
                     active_rets = torch.where(alive_mask.unsqueeze(1), batch_rets, torch.zeros_like(batch_rets))
                     sum_ret.add_(active_rets.sum(dim=1))
                     sum_sq_ret.add_((active_rets**2).sum(dim=1))
-                    # Count actual trade entries (not time-in-position).
-                    prev_actions = actions[:, :-1]
-                    curr_actions = actions[:, 1:]
-                    entries = (prev_actions == 0) & (curr_actions != 0)
-                    flips = (prev_actions != 0) & (curr_actions != 0) & (prev_actions != curr_actions)
-                    trade_events = (entries | flips).float()
-                    # Count trades only while alive to avoid inflated density after death.
-                    trade_steps.add_((trade_events * alive_mask.unsqueeze(1).float()).sum(dim=1))
                     
                     for s in range(n_segments):
                         overlap_start = max(start_idx, s * seg_size)
@@ -474,23 +568,23 @@ class TensorDiscoveryEngine:
 
                 # Weights (tunable)
                 try:
-                    survival_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_SURVIVAL_WEIGHT", "4.0") or 4.0)
+                    survival_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_SURVIVAL_WEIGHT", "2.0") or 2.0)
                 except Exception:
                     survival_weight = 4.0
                 try:
-                    sharpe_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_SHARPE_WEIGHT", "1.5") or 1.5)
+                    sharpe_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_SHARPE_WEIGHT", "2.0") or 2.0)
                 except Exception:
                     sharpe_weight = 1.5
                 try:
-                    consistency_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_CONSISTENCY_WEIGHT", "5.0") or 5.0)
+                    consistency_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_CONSISTENCY_WEIGHT", "4.0") or 4.0)
                 except Exception:
                     consistency_weight = 5.0
                 try:
-                    profit_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_PROFIT_WEIGHT", "12.0") or 12.0)
+                    profit_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_PROFIT_WEIGHT", "15.0") or 15.0)
                 except Exception:
                     profit_weight = 12.0
                 try:
-                    dd_penalty_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_DD_PENALTY_WEIGHT", "10.0") or 10.0)
+                    dd_penalty_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_DD_PENALTY_WEIGHT", "12.0") or 12.0)
                 except Exception:
                     dd_penalty_weight = 10.0
 
@@ -500,7 +594,8 @@ class TensorDiscoveryEngine:
                 dd_ratio = max_dd / torch.clamp(torch.tensor(dynamic_dd_limit, device=dev), min=1e-6)
                 dd_penalty = torch.clamp(dd_ratio - 1.0, min=0.0) * dd_penalty_weight
                 
-                trade_density = trade_steps / denom
+                total_steps = float(max(n_samples, 1))
+                trade_density = trade_steps / total_steps
                 try:
                     min_trade_density = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADE_DENSITY", str(1.0 / 1440.0)) or (1.0 / 1440.0))
                 except Exception:
@@ -525,7 +620,7 @@ class TensorDiscoveryEngine:
                 trade_score = 1.0 - torch.abs(trade_density - mid_density) / half_span
                 trade_score = torch.clamp(trade_score, min=-1.0, max=1.0)
                 try:
-                    trade_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_WEIGHT", "6.0") or 6.0)
+                    trade_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_WEIGHT", "10.0") or 10.0)
                 except Exception:
                     trade_weight = 6.0
                 trade_score = trade_score * trade_weight
@@ -539,7 +634,7 @@ class TensorDiscoveryEngine:
                     - dd_penalty
                 )
                 try:
-                    no_trade_penalty = float(os.environ.get("FOREX_BOT_DISCOVERY_NO_TRADE_PENALTY", "-5.0") or -5.0)
+                    no_trade_penalty = float(os.environ.get("FOREX_BOT_DISCOVERY_NO_TRADE_PENALTY", "-20.0") or -20.0)
                 except Exception:
                     no_trade_penalty = -5.0
                 total_fitness = torch.where(trade_gate, total_fitness, torch.full_like(total_fitness, no_trade_penalty))
@@ -549,7 +644,7 @@ class TensorDiscoveryEngine:
                 metadata = {
                     "fit": float(total_fitness[bi].item()), "surv": float(survival_ratio[bi].item()),
                     "shrp": float(sharpe[bi].item()), "dd": float(max_dd_safe[bi].item()), 
-                    "segs": int(segment_profitability[bi].item()), "trade": float(trade_density[bi].item()),
+                    "segs": int(segment_profitability[bi].item()), "trade": float(trade_density[bi].item() * 1440.0),
                     "limit": dynamic_dd_limit
                 }
                 return torch.nan_to_num(total_fitness, nan=0.0).detach().cpu(), metadata
@@ -574,7 +669,7 @@ class TensorDiscoveryEngine:
 
         logger.info(f"Starting COOPERATIVE 8-GPU Discovery (Pop: {pop_size})...")
         try:
-            stagnation_gens = int(os.environ.get("FOREX_BOT_DISCOVERY_STAGNATION_GENS", "25") or 25)
+            stagnation_gens = int(os.environ.get("FOREX_BOT_DISCOVERY_STAGNATION_GENS", "20") or 20)
         except Exception:
             stagnation_gens = 25
         try:
@@ -582,7 +677,7 @@ class TensorDiscoveryEngine:
         except Exception:
             stagnation_eps = 1e-3
         try:
-            mutation_boost = float(os.environ.get("FOREX_BOT_DISCOVERY_MUTATION_BOOST", "0.3") or 0.3)
+            mutation_boost = float(os.environ.get("FOREX_BOT_DISCOVERY_MUTATION_BOOST", "0.5") or 0.5)
         except Exception:
             mutation_boost = 0.3
         stagnation_gens = max(stagnation_gens, 5)

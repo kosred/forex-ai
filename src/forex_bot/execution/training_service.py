@@ -76,7 +76,7 @@ class TrainingService:
         base_dataset: PreparedDataset | None = None,
     ) -> tuple[dict[str, pd.DataFrame], list[str]]:
         """Build discovery frames with either base-TF propagation or full per-TF features."""
-        full_tf = str(os.environ.get("FOREX_BOT_DISCOVERY_FULL_TF_FEATURES", "0") or "0").strip().lower() in {
+        full_tf = str(os.environ.get("FOREX_BOT_DISCOVERY_FULL_TF_FEATURES", "1") or "1").strip().lower() in {
             "1", "true", "yes", "on"
         }
         base_tf = self.settings.system.base_timeframe
@@ -113,7 +113,12 @@ class TrainingService:
                     aligned["low"] = frames[tf]["low"]
                     aligned["close"] = frames[tf]["close"]
                     aligned_frames[tf] = aligned
-            return aligned_frames if aligned_frames else discovery_frames, timeframes
+            aligned_frames = self._inject_discovery_mixer_signals(
+                aligned_frames if aligned_frames else discovery_frames,
+                base_tf=base_tf,
+                per_tf=False,
+            )
+            return aligned_frames, timeframes
 
         # Full per-TF feature engineering (slow but pure)
         per_tf = {}
@@ -156,7 +161,108 @@ class TrainingService:
                     aligned[col] = orig[col]
             aligned_frames[tf] = aligned
 
+        aligned_frames = self._inject_discovery_mixer_signals(
+            aligned_frames,
+            base_tf=base_tf,
+            per_tf=True,
+        )
         return aligned_frames, timeframes
+
+    def _inject_discovery_mixer_signals(
+        self,
+        frames: dict[str, pd.DataFrame],
+        *,
+        base_tf: str,
+        per_tf: bool,
+    ) -> dict[str, pd.DataFrame]:
+        use_mixer = str(os.environ.get("FOREX_BOT_DISCOVERY_USE_TALIB_MIXER", "1") or "1").strip().lower()
+        if use_mixer not in {"1", "true", "yes", "on"}:
+            return frames
+
+        try:
+            from ..features.talib_mixer import TALibStrategyMixer, TALIB_AVAILABLE
+        except Exception as exc:
+            logger.warning(f"Discovery: TA-Lib mixer import failed: {exc}")
+            return frames
+        if not TALIB_AVAILABLE:
+            logger.warning("Discovery: TA-Lib not available; skipping mixer signals.")
+            return frames
+
+        try:
+            n_strategies = int(os.environ.get("FOREX_BOT_DISCOVERY_MIXER_STRATEGIES", "8") or 8)
+        except Exception:
+            n_strategies = 8
+        if n_strategies <= 0:
+            return frames
+        try:
+            max_indicators = int(os.environ.get("FOREX_BOT_DISCOVERY_MIXER_MAX_INDICATORS", "6") or 6)
+        except Exception:
+            max_indicators = 6
+        max_indicators = max(1, max_indicators)
+
+        try:
+            import torch
+
+            mixer_device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            mixer_device = "cpu"
+
+        mixer = TALibStrategyMixer(
+            device=mixer_device,
+            use_volume_features=bool(getattr(self.settings.system, "use_volume_features", False)),
+        )
+        if not getattr(mixer, "available_indicators", []):
+            logger.warning("Discovery: TA-Lib mixer has no available indicators; skipping.")
+            return frames
+
+        genes = [mixer.generate_random_strategy(max_indicators=max_indicators) for _ in range(n_strategies)]
+
+        def _apply(df: pd.DataFrame) -> pd.DataFrame:
+            if df is None or df.empty:
+                return df
+            local = df.copy()
+            cache = mixer.bulk_calculate_indicators(local, genes)
+            for idx, gene in enumerate(genes):
+                col = f"tmx_sig_{idx}"
+                if col in local.columns:
+                    continue
+                try:
+                    sig = mixer.compute_signals(local, gene, cache=cache)
+                    if isinstance(sig, pd.Series):
+                        local[col] = sig.to_numpy(dtype=np.float32, copy=False)
+                    else:
+                        local[col] = np.asarray(sig, dtype=np.float32)
+                except Exception as exc:
+                    logger.warning(f"Discovery: mixer signal {idx} failed: {exc}")
+                    local[col] = np.zeros(len(local), dtype=np.float32)
+            return local
+
+        if per_tf:
+            out = {}
+            for tf, df in frames.items():
+                out[tf] = _apply(df)
+            logger.info(f"Discovery: Injected {n_strategies} TA-Lib mixer signals per TF.")
+            return out
+
+        if base_tf not in frames:
+            return frames
+        base_df = _apply(frames[base_tf])
+        sig_cols = [c for c in base_df.columns if c.startswith("tmx_sig_")]
+        out = {base_tf: base_df}
+        for tf, df in frames.items():
+            if tf == base_tf:
+                continue
+            if not sig_cols:
+                out[tf] = df
+                continue
+            aligned = base_df[sig_cols].reindex(df.index).ffill().fillna(0.0)
+            local = df.copy()
+            for col in sig_cols:
+                if col not in local.columns:
+                    local[col] = aligned[col].to_numpy(dtype=np.float32, copy=False)
+            out[tf] = local
+        logger.info(f"Discovery: Injected {len(sig_cols)} TA-Lib mixer signals (base TF aligned).")
+        return out
 
     @staticmethod
     def _parse_int_env(name: str) -> int | None:
