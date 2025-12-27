@@ -97,35 +97,36 @@ IMPORT_TO_PYPI = {
     "transformer_engine": "transformer-engine",
 }
 
-# Optional imports can be skipped unless explicitly enabled via env vars.
-# Set FOREX_BOT_INSTALL_ALL=1 to force-install everything.
+# Optional imports can be skipped via env vars.
+# Default behavior is FULL install unless FOREX_BOT_DEPS_MODE=minimal
+# or a specific FOREX_BOT_SKIP_* flag is set.
 OPTIONAL_IMPORTS: dict[str, tuple[str, bool]] = {
-    # Heavy GPU stacks (RAPIDS) - off by default
-    "cudf": ("FOREX_BOT_INSTALL_RAPIDS", False),
-    "cuml": ("FOREX_BOT_INSTALL_RAPIDS", False),
+    # Heavy GPU stacks (RAPIDS)
+    "cudf": ("FOREX_BOT_SKIP_RAPIDS", True),
+    "cuml": ("FOREX_BOT_SKIP_RAPIDS", True),
     # GPU array stack (optional; use only if you want GPU indicators)
-    "cupy": ("FOREX_BOT_INSTALL_CUPY", False),
-    # RL stack (very heavy) - off by default
-    "ray": ("FOREX_BOT_INSTALL_RL", False),
-    "stable_baselines3": ("FOREX_BOT_INSTALL_RL", False),
-    "gymnasium": ("FOREX_BOT_INSTALL_RL", False),
-    "sb3_contrib": ("FOREX_BOT_INSTALL_RL", False),
-    # Bayesian optimization (Ax/Botorch) - off by default
-    "ax": ("FOREX_BOT_INSTALL_BO", False),
-    "botorch": ("FOREX_BOT_INSTALL_BO", False),
-    # Forecasting stack - off by default (often constrains torch<=2.6)
-    "neuralforecast": ("FOREX_BOT_INSTALL_NEURALFORECAST", False),
-    # ONNX export/runtime - off by default
-    "onnx": ("FOREX_BOT_INSTALL_ONNX", False),
-    "onnxruntime": ("FOREX_BOT_INSTALL_ONNX", False),
-    "onnxmltools": ("FOREX_BOT_INSTALL_ONNX", False),
-    "skl2onnx": ("FOREX_BOT_INSTALL_ONNX", False),
-    # Flash attention + transformer engine - optional
-    "flash_attn": ("FOREX_BOT_INSTALL_FLASH_ATTN", False),
-    "transformer_engine": ("FOREX_BOT_INSTALL_TRANSFORMER_ENGINE", False),
+    "cupy": ("FOREX_BOT_SKIP_CUPY", True),
+    # RL stack (very heavy)
+    "ray": ("FOREX_BOT_SKIP_RL", True),
+    "stable_baselines3": ("FOREX_BOT_SKIP_RL", True),
+    "gymnasium": ("FOREX_BOT_SKIP_RL", True),
+    "sb3_contrib": ("FOREX_BOT_SKIP_RL", True),
+    # Bayesian optimization (Ax/Botorch)
+    "ax": ("FOREX_BOT_SKIP_BO", True),
+    "botorch": ("FOREX_BOT_SKIP_BO", True),
+    # Forecasting stack (often constrains torch<=2.6)
+    "neuralforecast": ("FOREX_BOT_SKIP_NEURALFORECAST", True),
+    # ONNX export/runtime
+    "onnx": ("FOREX_BOT_SKIP_ONNX", True),
+    "onnxruntime": ("FOREX_BOT_SKIP_ONNX", True),
+    "onnxmltools": ("FOREX_BOT_SKIP_ONNX", True),
+    "skl2onnx": ("FOREX_BOT_SKIP_ONNX", True),
+    # Flash attention + transformer engine
+    "flash_attn": ("FOREX_BOT_SKIP_FLASH_ATTN", True),
+    "transformer_engine": ("FOREX_BOT_SKIP_TRANSFORMER_ENGINE", True),
     # Optional data engines
-    "polars": ("FOREX_BOT_INSTALL_POLARS", False),
-    "duckdb": ("FOREX_BOT_INSTALL_DUCKDB", False),
+    "polars": ("FOREX_BOT_SKIP_POLARS", True),
+    "duckdb": ("FOREX_BOT_SKIP_DUCKDB", True),
 }
 
 # Known Standard Library modules to exclude (Python 3.10+)
@@ -239,23 +240,25 @@ def ensure_dependencies() -> None:
             return False
         return str(val).strip().lower() in {"1", "true", "yes", "on"}
 
-    install_all = _truthy(os.environ.get("FOREX_BOT_INSTALL_ALL"))
+    deps_mode = (os.environ.get("FOREX_BOT_DEPS_MODE") or "full").strip().lower()
+    minimal_mode = deps_mode in {"minimal", "core"}
     # Enable cupy by default when a GPU is present, unless explicitly disabled.
     default_cupy = bool(shutil.which("nvidia-smi"))
 
     def _optional_enabled(mod: str) -> bool:
-        if install_all:
-            return True
+        if minimal_mode:
+            return False
         opt = OPTIONAL_IMPORTS.get(mod)
         if not opt:
             return True
         env_key, default_val = opt
-        if env_key == "FOREX_BOT_INSTALL_CUPY":
+        if env_key == "FOREX_BOT_SKIP_CUPY":
             default_val = default_cupy
         env_val = os.environ.get(env_key)
         if env_val is None:
             return default_val
-        return _truthy(env_val)
+        # Skip flags: TRUE means skip
+        return not _truthy(env_val)
     
     # 3. Resolve to PyPI packages
     required_packages = set()
@@ -277,7 +280,7 @@ def ensure_dependencies() -> None:
 
         if not _optional_enabled(mod):
             logger.info(
-                "Skipping optional dependency '%s'. Enable via %s=1 or FOREX_BOT_INSTALL_ALL=1.",
+                "Skipping dependency '%s'. Set FOREX_BOT_DEPS_MODE=full or clear %s.",
                 pkg,
                 OPTIONAL_IMPORTS[mod][0],
             )
@@ -322,10 +325,23 @@ def ensure_dependencies() -> None:
 
     # Prefer a pinned torch bundle to avoid pip solving/downloading multiple versions.
     torch_bundle = None
+    torch_target = None
     if torch_missing:
         torch_bundle = _torch_bundle_for_env(py_ver)
+        if torch_bundle:
+            torch_target = torch_bundle[0].split("==")[-1]
         # Remove bare torch entries from missing; we'll install the pinned bundle.
         missing = [p for p in missing if p not in {"torch", "torchvision", "torchaudio"}]
+
+    # Guard against known dependency conflicts (e.g., neuralforecast forcing torch<=2.6)
+    allow_torch_downgrade = _truthy(os.environ.get("FOREX_BOT_ALLOW_TORCH_DOWNGRADE"))
+    if torch_target and torch_target >= "2.7":
+        if "neuralforecast" in missing and not allow_torch_downgrade:
+            logger.warning(
+                "Skipping neuralforecast to keep torch>=2.7. "
+                "Set FOREX_BOT_ALLOW_TORCH_DOWNGRADE=1 to allow torch<=2.6."
+            )
+            missing = [p for p in missing if p != "neuralforecast"]
 
     for pkg in missing:
         # Only core torch libs are on the special index; evotorch is on standard PyPI
