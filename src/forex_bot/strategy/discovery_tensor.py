@@ -435,11 +435,11 @@ class TensorDiscoveryEngine:
             searcher.step()
             with registry_lock:
                 m = metrics_registry.get(i)
-                    if m: logger.info(
-                        f"Discovery (gen {i}): fit={m['fit']:.2f} surv={m['surv']:.2f} "
-                        f"psr={m['psr']:.2f} ret={m['ret']:.2f} dd={m['dd']:.2f} "
-                        f"segs={m['segs']}/3 trade={m['trade']:.3f}"
-                    )
+                if m: logger.info(
+                    f"Discovery (gen {i}): fit={m['fit']:.2f} surv={m['surv']:.2f} "
+                    f"psr={m['psr']:.2f} ret={m['ret']:.2f} dd={m['dd']:.2f} "
+                    f"segs={m['segs']}/3 trade={m['trade']:.3f}"
+                )
             if i % 10 == 0: logger.info(f"Generation {i}: Global Best Fitness = {float(searcher.status.get('best_eval', 0.0)):.4f}")
         
         final_pop = searcher.population.values.detach().cpu()
