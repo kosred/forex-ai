@@ -273,9 +273,14 @@ class GeneticStrategyEvolution:
             if getattr(gene, "evaluated", False):
                 continue
             pass_fits: list[float] = []
+            slice_scores: list[float] = []
             fail_count = 0
             slice_metrics: list[tuple[float, float, float, float, float, float, int]] = []
             try:
+                dd_cap = float(getattr(self.settings.risk, "total_drawdown_limit", 0.07) or 0.07)
+                daily_dd_cap = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
+                pfloor = 1.0
+
                 for sname, df in slices:
                     close = df["close"].to_numpy(dtype=np.float64)
                     high = df["high"].to_numpy(dtype=np.float64)
@@ -318,29 +323,26 @@ class GeneticStrategyEvolution:
                     daily_dd = float(arr[10]) if len(arr) > 10 else 0.0
                     slice_metrics.append((net_profit, sharpe, max_dd, win_rate, profit_factor, expectancy, trades))
 
-                    # Slice-level gates
-                    min_trades = 30
-                    dd_cap = 0.10
-                    daily_dd_cap = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
-                    pfloor = 1.0
+                    # Slice-level gates (no minimum trades)
+                    dd_penalty = 10.0 * max(0.0, max_dd - dd_cap)
+                    base_score = sharpe + (net_profit / 10_000.0) - dd_penalty
+                    slice_scores.append(base_score)
 
-                    if trades < min_trades or max_dd >= dd_cap or daily_dd >= daily_dd_cap or profit_factor <= pfloor:
+                    if max_dd >= dd_cap or daily_dd >= daily_dd_cap or profit_factor <= pfloor:
                         fail_count += 1
                         continue
-                    dd_penalty = 10.0 * max(0.0, max_dd - 0.05)
-                    pass_fits.append(sharpe + (net_profit / 10_000.0) - dd_penalty)
+                    pass_fits.append(base_score)
 
                 total_slices = len(slices)
-                max_fail_allowed = max(1, total_slices // 3 + 1)
-
-                if not pass_fits or fail_count >= max_fail_allowed:
-                    fitness = -1e9
-                else:
-                    fitness = float(np.mean(pass_fits) - 0.5 * fail_count)
+                fail_ratio = (fail_count / total_slices) if total_slices > 0 else 1.0
+                score_pool = pass_fits if pass_fits else slice_scores
+                base_fit = float(np.mean(score_pool)) if score_pool else 0.0
+                penalty_factor = max(0.1, 1.0 - (0.7 * fail_ratio))
+                fitness = float(base_fit * penalty_factor - fail_ratio)
 
                 # Aggregate metrics over passed slices (or all if none passed)
                 if pass_fits:
-                    passed = [m for m in slice_metrics if m[6] >= 30 and m[2] < 0.10 and m[4] > 1.0]
+                    passed = [m for m in slice_metrics if m[2] < dd_cap and m[4] > 1.0]
                 else:
                     passed = slice_metrics
                 if passed:
@@ -360,7 +362,7 @@ class GeneticStrategyEvolution:
                 gene.profit_factor = avg_pf
                 gene.expectancy = 0.0
                 gene.trades_count = avg_trades
-                gene.slice_pass_rate = float(len(pass_fits) / total_slices)
+                gene.slice_pass_rate = float((total_slices - fail_count) / total_slices) if total_slices > 0 else 0.0
                 gene.evaluated = True
             except Exception as exc:
                 logger.debug(f"Gene evaluation failed for {gene.strategy_id}: {exc}", exc_info=True)

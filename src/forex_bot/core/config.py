@@ -107,7 +107,7 @@ class RiskConfig(BaseModel):
     min_risk_per_trade: float = 0.005
     max_risk_per_trade: float = 0.030
     risk_per_trade: float = 0.015
-    daily_drawdown_limit: float = 0.045
+    daily_drawdown_limit: float = 0.04
     total_drawdown_limit: float = 0.07
     min_risk_reward: float = 2.0
     spread_guard_multiplier: float = 2.5
@@ -252,7 +252,7 @@ class ModelsConfig(BaseModel):
     embargo_minutes: int = 120
     prop_metric_weight: float = 1.0
     prop_accuracy_weight: float = 0.1
-    prop_min_trades: int = 30
+    prop_min_trades: int = 0
     prop_conf_threshold: float = 0.55
     enable_cpcv: bool = True
     cpcv_n_splits: int = 5

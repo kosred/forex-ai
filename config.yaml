@@ -37,7 +37,7 @@ risk:
   min_risk_per_trade: 0.005
   max_risk_per_trade: 0.030
   risk_per_trade: 0.015
-  daily_drawdown_limit: 0.045
+  daily_drawdown_limit: 0.04
   total_drawdown_limit: 0.07
   min_risk_reward: 2.0
   spread_guard_multiplier: 2.5
@@ -155,7 +155,7 @@ models:
   phase5_core_models: [transformer, nbeats, tide, tabnet, kan]
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
-  prop_min_trades: 30
+  prop_min_trades: 0
   prop_conf_threshold: 0.55
   walkforward_splits: 20  # time-based walk-forward splits for OOS validation
   embargo_minutes: 120

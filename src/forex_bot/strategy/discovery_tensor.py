@@ -202,9 +202,10 @@ class TensorDiscoveryEngine:
         
         # Initialize Metrics
         debug_metrics = os.environ.get("FOREX_BOT_DISCOVERY_DEBUG_METRICS", "1").strip().lower() not in {"0", "false", "no", "off"}
+        debug_validity = os.environ.get("FOREX_BOT_DISCOVERY_DEBUG_VALIDITY", "0").strip().lower() in {"1", "true", "yes", "on"}
         debug_snapshot = {
-            "fitness": None, "sharpe": None, "mean_ret": None, "std_ret": None, 
-            "max_dd": None, "profitable_chunks": None, "consistency": None, 
+            "fitness": None, "sharpe": None, "mean_ret": None, "std_ret": None,
+            "max_dd": None, "profitable_chunks": None, "consistency": None,
             "samples": None, "pass_rate": None, "median_month": None
         }
         import threading
@@ -248,6 +249,7 @@ class TensorDiscoveryEngine:
         batch_size_map = {}
         # Cache auto max-genomes per GPU
         max_genomes_map = {}
+        invalid_logged = set()
         
         @torch.no_grad()
         def fitness_func(genomes_all: torch.Tensor) -> torch.Tensor:
@@ -431,6 +433,7 @@ class TensorDiscoveryEngine:
                     tf_sig = tf_sig_2d.view(tf_count, batch_len, local_pop).permute(2, 0, 1)
                     # Weighted sum over timeframes -> [Pop, Batch]
                     signals = (tf_sig * tf_weights.unsqueeze(2)).sum(dim=1)
+                    signals = torch.nan_to_num(signals, nan=0.0, posinf=0.0, neginf=0.0)
 
                     if news_slice is not None:
                         # Add Sentiment Bias (match dtype for in-place add)
@@ -445,11 +448,14 @@ class TensorDiscoveryEngine:
                     if (end_idx - start_idx) < 2: continue
 
                     # Vectorized Returns
-                    close_next = ohlc_slice[0, 1:, 3] # Shifted Close
-                    open_next = ohlc_slice[0, 1:, 0]  # Shifted Open
+                    close_next = torch.nan_to_num(ohlc_slice[0, 1:, 3], nan=0.0, posinf=0.0, neginf=0.0) # Shifted Close
+                    open_next = torch.nan_to_num(ohlc_slice[0, 1:, 0], nan=0.0, posinf=0.0, neginf=0.0)  # Shifted Open
+                    open_next = torch.clamp(open_next, min=1e-6)
                     actions_aligned = actions[:, :-1]
-                    
-                    rets = (close_next - open_next) / (open_next + 1e-9)
+
+                    rets = (close_next - open_next) / open_next
+                    rets = torch.nan_to_num(rets, nan=0.0, posinf=0.0, neginf=0.0)
+                    rets = torch.clamp(rets, min=-1.0, max=1.0)
                     batch_rets = actions_aligned * rets.unsqueeze(0)
                     batch_rets_acc = batch_rets.to(dtype=accum_dtype)
                     
@@ -497,6 +503,16 @@ class TensorDiscoveryEngine:
                 fitness = sharpe * (profitable_chunks / 10.0)
                 # Penalties
                 fitness = torch.where(max_dd > 0.15, torch.tensor(-1.0, device=dev), fitness)
+                if debug_validity:
+                    nan_count = int(torch.isnan(fitness).sum().item())
+                    inf_count = int(torch.isinf(fitness).sum().item())
+                    if (nan_count or inf_count) and debug_lock is not None:
+                        with debug_lock:
+                            if gpu_idx not in invalid_logged:
+                                logger.warning(
+                                    f"GPU {gpu_idx}: invalid fitness detected (nan={nan_count}, inf={inf_count})."
+                                )
+                                invalid_logged.add(gpu_idx)
                 # Guard against NaN/Inf so CMA-ES doesn't crash
                 fitness = torch.nan_to_num(fitness, nan=-1e9, posinf=-1e9, neginf=-1e9)
                 

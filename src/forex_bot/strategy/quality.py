@@ -55,7 +55,7 @@ class StrategyQualityAnalyzer:
         self.min_calmar = 1.0
         self.min_profit_factor = 1.5
         self.min_win_rate = 0.50
-        self.min_trades = 50
+        self.min_trades = 0
         self.max_dd_acceptable = float(getattr(settings.risk, "total_drawdown_limit", 0.15) or 0.15)
         self.min_monthly_return_pct = float(
             getattr(settings.risk, "monthly_profit_target_pct", 0.04) or 0.04
@@ -66,7 +66,7 @@ class StrategyQualityAnalyzer:
     def analyze_strategy(
         self, strategy_id: str, trades: pd.DataFrame, initial_balance: float = 100_000
     ) -> StrategyMetrics:
-        if trades.empty or len(trades) < 10:
+        if trades.empty or len(trades) < 1:
             return self._empty_metrics(strategy_id)
 
         if "pnl" not in trades.columns:
@@ -341,7 +341,7 @@ class StrategyQualityAnalyzer:
             and metrics.max_drawdown_pct <= self.max_dd_acceptable
             and metrics.avg_monthly_return_pct >= self.min_monthly_return_pct
             and metrics.statistical_significance <= self.edge_significance_pvalue
-            and metrics.total_trades >= self.min_trades
+            and (self.min_trades <= 0 or metrics.total_trades >= self.min_trades)
         )
 
         if metrics.quality_score >= 80:

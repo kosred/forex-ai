@@ -151,14 +151,9 @@ class PropAwareStrategySearch:
             daily_dd,
         ) = metrics
 
-        if (
-            max_dd >= self.settings.risk.total_drawdown_limit
-            or max_dd >= 0.10
-            or daily_dd >= float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
-        ):
-            return -1e9
-        if trades < 30:
-            return -1e6
+        dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.07) or 0.07)
+        daily_limit = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
+        # No minimum trades requirement
 
         monthly_ret_pct = (net_profit / self.actual_balance) * 100.0
         target_monthly_pct = 4.0
@@ -170,7 +165,21 @@ class PropAwareStrategySearch:
         fitness += 0.5 * sharpe
         fitness += 0.2 * profit_factor
         fitness += 0.1 * (win_rate * 100.0)
-        fitness -= 50.0 * max(0.0, max_dd - 0.04)
+        fitness -= 50.0 * max(0.0, max_dd - dd_limit)
+
+        # Soft penalties for drawdown violations (no hard-kill)
+        excess_dd = max(0.0, max_dd - dd_limit)
+        excess_daily = max(0.0, daily_dd - daily_limit)
+        denom = 1.0
+        if dd_limit > 0:
+            denom += 10.0 * (excess_dd / dd_limit)
+        else:
+            denom += 10.0 * excess_dd
+        if daily_limit > 0:
+            denom += 10.0 * (excess_daily / daily_limit)
+        else:
+            denom += 10.0 * excess_daily
+        fitness = fitness / denom
 
         return float(fitness)
 

@@ -87,7 +87,7 @@ class HyperparameterOptimizer:
         model_thresh = float(getattr(self.settings.models, "prop_conf_threshold", 0.55))
         self.prop_conf_threshold = max(risk_thresh, model_thresh)
 
-        self.prop_min_trades = int(getattr(self.settings.models, "prop_min_trades", 30))
+        self.prop_min_trades = int(getattr(self.settings.models, "prop_min_trades", 0))
         self.prop_weight = float(getattr(self.settings.models, "prop_metric_weight", 1.0))
         self.acc_weight = float(getattr(self.settings.models, "prop_accuracy_weight", 0.1))
         dev_pref = normalize_device_preference(getattr(self.settings.system, "enable_gpu_preference", "auto"))
@@ -293,6 +293,8 @@ class HyperparameterOptimizer:
 
     def _prop_required_trades(self, meta_val: pd.DataFrame | None) -> float:
         base = float(self.prop_min_trades)
+        if base <= 0:
+            return 0.0
         if not bool(getattr(self.settings.risk, "prop_firm_rules", False)):
             return base
         if meta_val is None:
@@ -307,7 +309,7 @@ class HyperparameterOptimizer:
             days_per_month = 21.0
         days_per_month = max(1.0, float(days_per_month))
         required = base * (trading_days / days_per_month)
-        return max(1.0, float(required))
+        return max(0.0, float(required))
 
     @staticmethod
     def _pad_probs(probs: np.ndarray) -> np.ndarray:
@@ -538,7 +540,7 @@ class HyperparameterOptimizer:
                 weighted_pf += float(trades) * float(profit_factor)
 
             required = float(self._prop_required_trades(meta_val))
-            if total_trades < required:
+            if required > 0 and total_trades < required:
                 return _invalid(max_dd, max_daily)
             denom = max(total_trades, 1.0)
             return {
@@ -598,7 +600,8 @@ class HyperparameterOptimizer:
         )
 
         net_profit, _sharpe, sortino, dd, win_rate, profit_factor, _exp, _sqn, trades, _r2, daily_dd = metrics
-        if trades < float(self._prop_required_trades(meta_val)):
+        required = float(self._prop_required_trades(meta_val))
+        if required > 0 and trades < required:
             return _invalid(dd, daily_dd)
 
         monthly_ret = (net_profit / 100000.0) / months
