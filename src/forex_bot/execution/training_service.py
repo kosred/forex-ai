@@ -4,6 +4,7 @@ import json
 import logging
 import multiprocessing
 import os
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -1149,6 +1150,27 @@ class TrainingService:
                 except Exception as e:
                     logger.error(f"Failed to save HPC datasets: {e}")
 
+        # --- DDP NON-ZERO RANKS EXIT EARLY (avoid long discovery/barrier timeouts) ---
+        if is_ddp and rank != 0:
+            logger.info(f"Rank {rank}: Waiting for dataset cache at {cache_path}...")
+            wait_seconds = int(os.environ.get("FOREX_BOT_HPC_CACHE_WAIT", "600") or 600)
+            waited = 0
+            while waited < wait_seconds and not cache_path.exists():
+                time.sleep(2)
+                waited += 2
+            if cache_path.exists():
+                try:
+                    datasets = joblib.load(cache_path)
+                except Exception as e:
+                    logger.error(f"Rank {rank} failed to load datasets: {e}")
+            logger.info(f"Rank {rank}: Exiting (discovery/training handled on rank 0).")
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+            return
+
+        if rank == 0:
             # --- EXPERT DISCOVERY (Rank 0 only) ---
             # Now that all symbols are loaded in raw_frames_map, find global experts
             logger.info("Launching GPU-Native Expert Discovery (Multi-Symbol)...")
@@ -1183,26 +1205,6 @@ class TrainingService:
                 iterations=1000
             )
             discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
-
-        # --- BARRIER ---
-        if is_ddp:
-            logger.info(f"Rank {rank}: Waiting for data preparation...")
-            dist.barrier()
-
-            if rank > 0:
-                logger.info(f"Rank {rank}: Loading datasets from {cache_path}...")
-                try:
-                    datasets = joblib.load(cache_path)
-                except Exception as e:
-                    logger.error(f"Rank {rank} failed to load datasets: {e}")
-                    return
-
-            # Allow distributed training for deep models only.
-            if rank != 0:
-                # For non-deep models, skip training on non-zero ranks to avoid duplication.
-                # Deep models will handle DDP internally when enabled.
-                logger.info(f"Rank {rank}: Skipping non-deep training to avoid duplicated work.")
-                return
 
         if not datasets:
             logger.error("HPC: No datasets generated.")
