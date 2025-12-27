@@ -107,8 +107,14 @@ class TensorDiscoveryEngine:
             self.timeframes = list(frames.keys())
 
         # --- PARALLEL ALIGNMENT ---
-        # Using all available cores to speed up the CPU-heavy alignment phase
-        cpu_workers = min(64, os.cpu_count() or 1)
+        # Use all available cores by default (override with FOREX_BOT_DISCOVERY_ALIGN_WORKERS).
+        try:
+            cpu_workers = int(os.environ.get("FOREX_BOT_DISCOVERY_ALIGN_WORKERS", "0") or 0)
+        except Exception:
+            cpu_workers = 0
+        if cpu_workers <= 0:
+            cpu_workers = os.cpu_count() or 1
+        cpu_workers = max(1, cpu_workers)
         logger.info(f"Using {cpu_workers} concurrent threads for data alignment.")
         
         # Full FP16 mode (default auto -> enabled on CUDA)
