@@ -422,6 +422,8 @@ class TensorDiscoveryEngine:
                 fitness = sharpe * (profitable_chunks / 10.0)
                 # Penalties
                 fitness = torch.where(max_dd > 0.15, torch.tensor(-1.0, device=dev), fitness)
+                # Guard against NaN/Inf so CMA-ES doesn't crash
+                fitness = torch.nan_to_num(fitness, nan=-1e9, posinf=-1e9, neginf=-1e9)
                 
                 # Check metrics for debug
                 if debug_lock is not None:
@@ -438,8 +440,19 @@ class TensorDiscoveryEngine:
                     except Exception as e:
                         logger.error(f"Worker failed: {e}")
                         all_fitness_scores.append(torch.full((futures[future],), -1e9))
-            
-            return torch.cat(all_fitness_scores, dim=0)
+
+            if not all_fitness_scores:
+                return torch.full((pop_size,), -1e9)
+            scores = torch.cat(all_fitness_scores, dim=0)
+            if scores.numel() != pop_size:
+                if scores.numel() > pop_size:
+                    scores = scores[:pop_size]
+                else:
+                    scores = torch.cat([scores, torch.full((pop_size - scores.numel(),), -1e9)], dim=0)
+            scores = torch.nan_to_num(scores, nan=-1e9, posinf=-1e9, neginf=-1e9).float()
+            if not torch.isfinite(scores).any():
+                scores = torch.full((pop_size,), -1e9)
+            return scores
 
         # 2. Start Evolution
         genome_dim = self.n_features + len(self.timeframes) + 2
@@ -454,7 +467,21 @@ class TensorDiscoveryEngine:
         # Main Loop
         best_val = -1e9
         for i in range(iterations):
-            searcher.step()
+            try:
+                searcher.step()
+            except Exception as exc:
+                logger.error(f"Discovery step failed at gen {i}: {exc}", exc_info=True)
+                # Fallback: evaluate a fresh random population to avoid crashing
+                try:
+                    rnd = torch.empty((pop_size, genome_dim)).uniform_(-1.0, 1.0)
+                    scores = fitness_func(rnd)
+                    if scores.numel() == pop_size:
+                        indices = torch.argsort(scores, descending=True)
+                        self.best_experts = rnd[indices[:self.n_experts]].detach().cpu()
+                        logger.warning("Discovery fallback: saved best experts from random population.")
+                except Exception:
+                    pass
+                break
             current_best = searcher.status.get("best_eval", 0.0)
             if current_best > best_val:
                 best_val = current_best

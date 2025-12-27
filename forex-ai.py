@@ -76,6 +76,9 @@ os.chdir(str(SCRIPT_DIR))
 # Disable torch.compile to prevent nvvmAddNVVMContainerToProgram/JIT errors on some drivers
 os.environ.setdefault("FOREX_BOT_DISABLE_COMPILE", "1")
 
+# Fix PyTorch Memory Fragmentation (Modern Config)
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 # Tuning for 16GB+ VRAM Cards (A4000/A6000)
 os.environ.setdefault("FOREX_BOT_GLOBAL_POOL_MEM_FRAC", "0.20")
 os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", "auto")
