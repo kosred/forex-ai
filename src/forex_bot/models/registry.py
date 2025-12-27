@@ -40,6 +40,15 @@ MODEL_MAPPING = {
     "unsupervised": ("unsupervised", "ClusterExpert"),
 }
 
+def register_model(name: str, module_path: str, class_name: str) -> None:
+    """Dynamically registers a new model type."""
+    with _REGISTRY_LOCK:
+        MODEL_MAPPING[name] = (module_path, class_name)
+        # Clear cache if overwriting
+        if name in _CLASS_CACHE:
+            del _CLASS_CACHE[name]
+        logger.info(f"Registered new model: {name} -> {module_path}.{class_name}")
+
 def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
     """Thread-safe lazy-imports the requested model class."""
     with _REGISTRY_LOCK:
