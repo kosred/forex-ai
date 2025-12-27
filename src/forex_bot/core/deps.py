@@ -304,9 +304,9 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
     # 2025 GLOBAL BOOTSTRAP: Use --user to keep system clean, --upgrade to avoid stale junk,
     # and --break-system-packages to allow global pip usage on modern Linux (Debian/Ubuntu).
     cmd = [
-        sys.executable, "-m", "pip", "install", 
-        "--user", "--upgrade", 
-        "--timeout", "120", 
+        sys.executable, "-m", "pip", "install",
+        "--user", "--upgrade",
+        "--timeout", "120",
         "--break-system-packages"
     ]
     if pre:
@@ -342,7 +342,22 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
 
     if final_pkgs:
         logger.info(f"Running pip: {' '.join(cmd + final_pkgs)}")
-        subprocess.check_call(cmd + final_pkgs)
+        try:
+            result = subprocess.run(
+                cmd + final_pkgs,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "")
+            if "--break-system-packages" in cmd and "no such option: --break-system-packages" in stderr:
+                logger.warning("pip does not support --break-system-packages; retrying without it.")
+                cmd_no_break = [c for c in cmd if c != "--break-system-packages"]
+                subprocess.check_call(cmd_no_break + final_pkgs)
+            else:
+                raise
     if flash_build:
         build_cmd = list(cmd) + ["--no-build-isolation"]
         logger.info(f"Running pip (flash-attn source build): {' '.join(build_cmd + flash_build)}")
