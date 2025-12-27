@@ -281,9 +281,14 @@ class TensorDiscoveryEngine:
                 tf_weights = F.softmax(genomes[:, :tf_count], dim=1).to(dtype=matmul_dtype)
                 logic_weights = genomes[:, tf_count : tf_count + self.n_features].to(dtype=matmul_dtype)
                 thresholds = genomes[:, -2:]
-                
-                buy_th = torch.maximum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) + 1.5
-                sell_th = torch.minimum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) - 1.5
+                try:
+                    th_bias = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_BIAS", "0.5") or 0.5)
+                except Exception:
+                    th_bias = 0.5
+                th_bias = max(th_bias, 0.0)
+
+                buy_th = torch.maximum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) + th_bias
+                sell_th = torch.minimum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) - th_bias
 
                 for start_idx in range(0, n_samples, batch_size):
                     if not alive_mask.any(): break
@@ -350,7 +355,24 @@ class TensorDiscoveryEngine:
                 consistency_bonus = (segment_profitability / n_segments) * 5.0
                 dd_penalty = torch.where(max_dd > 0.08, (max_dd - 0.08) * 5.0, torch.tensor(0.0, device=dev))
                 trade_density = trade_steps / denom
-                trade_score = torch.where(trade_density > 0.0001, torch.tensor(1.0, device=dev), torch.tensor(0.0, device=dev))
+                try:
+                    min_trade_density = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADE_DENSITY", "0.00035") or 0.00035)
+                except Exception:
+                    min_trade_density = 0.00035
+                min_trade_density = max(min_trade_density, 1e-6)
+                lazy_mask = trade_density < min_trade_density
+                survival_ratio = torch.where(lazy_mask, torch.zeros_like(survival_ratio), survival_ratio)
+
+                try:
+                    target_min_per_day = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_MIN_PER_DAY", "1.0") or 1.0)
+                    target_max_per_day = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_MAX_PER_DAY", "5.0") or 5.0)
+                except Exception:
+                    target_min_per_day, target_max_per_day = 1.0, 5.0
+                target_min_per_day = max(target_min_per_day, 0.1)
+                target_max_per_day = max(target_max_per_day, target_min_per_day)
+                min_density = target_min_per_day / 1440.0
+                max_density = target_max_per_day / 1440.0
+                trade_score = torch.clamp((trade_density - min_density) / max(max_density - min_density, 1e-6), 0.0, 1.0)
                 
                 if is_safety_island:
                     # SAFETY ISLAND: Double penalty for drawdown, less reward for Sharpe
