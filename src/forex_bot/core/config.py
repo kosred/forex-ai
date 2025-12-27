@@ -124,7 +124,7 @@ class RiskConfig(BaseModel):
     enhanced_features: bool = True
     uncertainty_quantification: bool = True
     max_trades_per_day: int = 8
-    daily_profit_stop_pct: float = 0.025
+    daily_profit_stop_pct: float = 0.0
     recovery_mode_enabled: bool = True
     feature_drift_threshold: float = 0.30  # fraction of features allowed to drift beyond 3 std
     high_quality_confidence: float = 0.65

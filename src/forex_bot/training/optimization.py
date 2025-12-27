@@ -436,6 +436,18 @@ class HyperparameterOptimizer:
                 "trades": 0.0,
             }
 
+        def _penalty_factor(drawdown: float, daily_dd: float, monthly_ret: float) -> float:
+            penalty = 1.0
+            if dd_limit > 0 and drawdown > dd_limit:
+                excess = max(0.0, drawdown - dd_limit)
+                penalty *= max(0.1, 1.0 - (excess / dd_limit))
+            if daily_dd_limit > 0 and daily_dd > daily_dd_limit:
+                excess = max(0.0, daily_dd - daily_dd_limit)
+                penalty *= max(0.1, 1.0 - (excess / daily_dd_limit))
+            if min_monthly > 0 and monthly_ret < min_monthly:
+                penalty *= max(0.1, monthly_ret / min_monthly)
+            return float(penalty)
+
         sym_series = meta_val["symbol"] if "symbol" in meta_val.columns else None
         if sym_series is not None:
             sym_arr = np.asarray(sym_series)
@@ -506,13 +518,9 @@ class HyperparameterOptimizer:
                 net_profit, _sharpe, sortino, dd, _win_rate, profit_factor, _exp, _sqn, trades, _r2, daily_dd = metrics
                 max_dd = max(max_dd, float(dd))
                 max_daily = max(max_daily, float(daily_dd))
-                if dd >= dd_limit or daily_dd >= daily_dd_limit:
-                    return _invalid(max_dd, max_daily)
                 if trades <= 0:
                     continue
                 monthly_ret = (net_profit / 100000.0) / months
-                if monthly_ret < min_monthly:
-                    return _invalid(max_dd, max_daily)
                 calmar = (monthly_ret / dd) if dd > 1e-9 else 0.0
                 prop_score = (
                     monthly_ret * 100.0
@@ -521,6 +529,7 @@ class HyperparameterOptimizer:
                     + 0.2 * profit_factor
                     - 50.0 * max(0.0, dd - dd_limit)
                 )
+                prop_score *= _penalty_factor(float(dd), float(daily_dd), float(monthly_ret))
                 total_trades += float(trades)
                 weighted_score += float(trades) * float(prop_score)
                 weighted_monthly += float(trades) * float(monthly_ret)
@@ -589,14 +598,10 @@ class HyperparameterOptimizer:
         )
 
         net_profit, _sharpe, sortino, dd, win_rate, profit_factor, _exp, _sqn, trades, _r2, daily_dd = metrics
-        if trades < float(self._prop_required_trades(meta_val)) or dd >= dd_limit:
-            return _invalid(dd, daily_dd)
-        if daily_dd >= daily_dd_limit:
+        if trades < float(self._prop_required_trades(meta_val)):
             return _invalid(dd, daily_dd)
 
         monthly_ret = (net_profit / 100000.0) / months
-        if monthly_ret < min_monthly:
-            return _invalid(dd, daily_dd)
         calmar = (monthly_ret / dd) if dd > 1e-9 else 0.0
         prop_score = (
             monthly_ret * 100.0
@@ -606,6 +611,7 @@ class HyperparameterOptimizer:
             + 0.1 * (win_rate * 100.0)
             - 50.0 * max(0.0, dd - 0.04)
         )
+        prop_score *= _penalty_factor(float(dd), float(daily_dd), float(monthly_ret))
         return {
             "prop_score": float(self.prop_weight * prop_score + self.acc_weight * acc),
             "drawdown": float(dd),
@@ -686,7 +692,8 @@ class HyperparameterOptimizer:
         dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.08) or 0.08)
         daily_dd_limit = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
         outcome_constraints = []
-        if meta_val is not None and {"close", "high", "low"}.issubset(set(meta_val.columns)):
+        strict_constraints = str(os.environ.get("FOREX_BOT_HPO_STRICT_CONSTRAINTS", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        if strict_constraints and meta_val is not None and {"close", "high", "low"}.issubset(set(meta_val.columns)):
             outcome_constraints = [
                 f"drawdown <= {dd_limit}",
                 f"daily_dd <= {daily_dd_limit}",

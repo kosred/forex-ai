@@ -54,7 +54,7 @@ risk:
   enhanced_features: true
   uncertainty_quantification: true
   max_trades_per_day: 8
-  daily_profit_stop_pct: 0.025
+  daily_profit_stop_pct: 0.0
   high_quality_confidence: 0.65
   high_quality_risk_pct: 0.030
   high_quality_rr: 2.0
