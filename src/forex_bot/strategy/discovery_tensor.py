@@ -244,9 +244,10 @@ class TensorDiscoveryEngine:
         num_gpus = max(1, len(self.gpu_list))
         
         # Shared batch size state for auto-tuning
-        # We start with a conservative guess, then grow or shrink
         # Keys: gpu_idx -> current_batch_size
-        batch_size_map = {} 
+        batch_size_map = {}
+        # Cache auto max-genomes per GPU
+        max_genomes_map = {}
         
         @torch.no_grad()
         def fitness_func(genomes_all: torch.Tensor) -> torch.Tensor:
@@ -259,14 +260,65 @@ class TensorDiscoveryEngine:
                 dev = torch.device(self.gpu_list[gpu_idx])
                 is_cuda = dev.type == "cuda"
                 
-                # Initialize batch size for this GPU if not set
+                # Initialize batch size and max-genomes for this GPU if not set
                 if gpu_idx not in batch_size_map:
-                    # Heuristic start: 10000 or env override
-                    try:
-                        batch_start = int(os.environ.get("FOREX_BOT_DISCOVERY_BATCH_START", "10000") or 10000)
-                    except Exception:
-                        batch_start = 10000
+                    # Auto-derive max-genomes unless explicitly set
+                    env_max_genomes = os.environ.get("FOREX_BOT_DISCOVERY_MAX_GENOMES")
+                    if env_max_genomes:
+                        try:
+                            max_genomes_map[gpu_idx] = int(env_max_genomes)
+                        except Exception:
+                            max_genomes_map[gpu_idx] = 256
+                    else:
+                        if is_cuda:
+                            try:
+                                total_mem_gb = torch.cuda.get_device_properties(dev).total_memory / (1024**3)
+                            except Exception:
+                                total_mem_gb = 0.0
+                            if total_mem_gb >= 80:
+                                max_genomes_map[gpu_idx] = 2048
+                            elif total_mem_gb >= 48:
+                                max_genomes_map[gpu_idx] = 1024
+                            elif total_mem_gb >= 32:
+                                max_genomes_map[gpu_idx] = 768
+                            elif total_mem_gb >= 24:
+                                max_genomes_map[gpu_idx] = 512
+                            else:
+                                max_genomes_map[gpu_idx] = 256
+                        else:
+                            max_genomes_map[gpu_idx] = 256
+
+                    # Heuristic batch start: env override or VRAM-based estimate
+                    env_batch_start = os.environ.get("FOREX_BOT_DISCOVERY_BATCH_START")
+                    if env_batch_start:
+                        try:
+                            batch_start = int(env_batch_start)
+                        except Exception:
+                            batch_start = 10000
+                    else:
+                        if is_cuda:
+                            try:
+                                total_mem = torch.cuda.get_device_properties(dev).total_memory
+                            except Exception:
+                                total_mem = 0
+                            tf_count = self.data_cube_cpu.shape[0]
+                            elem_size = 2 if (self.full_fp16) else 4
+                            pop_sub = max_genomes_map[gpu_idx]
+                            # Rough upper-bound estimate of per-batch memory
+                            per_batch = elem_size * (
+                                pop_sub * (tf_count * 2 + 4) + tf_count * (self.n_features + 4)
+                            )
+                            target = int(total_mem * (0.35 if self.full_fp16 else 0.25))
+                            batch_start = int(target / max(1, per_batch))
+                        else:
+                            batch_start = 10000
+
+                    # Clamp to safe bounds
+                    batch_start = max(1024, min(int(batch_start), 65536))
                     batch_size_map[gpu_idx] = batch_start
+                    logger.info(
+                        f"GPU {gpu_idx}: auto batch start={batch_start}, max_genomes={max_genomes_map[gpu_idx]}"
+                    )
                 
                 try:
                     if is_cuda: torch.cuda.set_device(dev)
@@ -281,10 +333,12 @@ class TensorDiscoveryEngine:
                                      self.month_ids_cpu.to(dev, non_blocking=True)) if self.month_ids_cpu is not None else None
 
                         # Sub-batching for Genomes (to avoid OOM on huge populations)
-                        try:
-                            max_genomes = int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_GENOMES", "256") or 256)
-                        except Exception:
-                            max_genomes = 256
+                        max_genomes = max_genomes_map.get(gpu_idx)
+                        if max_genomes is None:
+                            try:
+                                max_genomes = int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_GENOMES", "256") or 256)
+                            except Exception:
+                                max_genomes = 256
                         
                         fitness_all = []
                         for g_start in range(0, chunk.shape[0], max_genomes):
@@ -364,19 +418,19 @@ class TensorDiscoveryEngine:
                         ohlc_slice = self.ohlc_cube_cpu[:, start_idx:end_idx, :].to(dev, non_blocking=True)
                         news_slice = self.news_tensor_cpu[start_idx:end_idx].to(dev, non_blocking=True) if has_news else None
 
-                    # FP16 Computation
-                    signals = torch.zeros((local_pop, end_idx - start_idx), device=dev, dtype=matmul_dtype)
-                    
-                    # Logic: Linear Combination of Features
-                    for i in range(tf_count):
-                        # Matmul: (Batch, Feat) x (Pop, Feat)^T -> (Batch, Pop)
-                        # We need (Pop, Batch)
-                        # data_cube is [TF, Rows, Feat]. Slice is [TF, Batch, Feat].
-                        # data_slice[i] is [Batch, Feat].
-                        # logic_weights is [Pop, Feat].
-                        # result: [Batch, Pop]. Transpose to [Pop, Batch].
-                        tf_sig = torch.matmul(data_slice[i].to(dtype=matmul_dtype), logic_weights.t()).t()
-                        signals.add_(tf_weights[:, i].unsqueeze(1) * tf_sig)
+                    # Vectorized computation across timeframes to maximize GPU utilization
+                    batch_len = end_idx - start_idx
+                    data_slice = data_slice.to(dtype=matmul_dtype)
+                    # data_slice: [TF, Batch, Feat] -> [TF*Batch, Feat]
+                    data_2d = data_slice.reshape(tf_count * batch_len, self.n_features)
+                    # logic_weights: [Pop, Feat] -> [Feat, Pop]
+                    logic_t = logic_weights.t().contiguous()
+                    # Single large matmul: [TF*Batch, Feat] x [Feat, Pop] -> [TF*Batch, Pop]
+                    tf_sig_2d = torch.matmul(data_2d, logic_t)
+                    # Reshape to [Pop, TF, Batch]
+                    tf_sig = tf_sig_2d.view(tf_count, batch_len, local_pop).permute(2, 0, 1)
+                    # Weighted sum over timeframes -> [Pop, Batch]
+                    signals = (tf_sig * tf_weights.unsqueeze(2)).sum(dim=1)
 
                     if news_slice is not None:
                         # Add Sentiment Bias (match dtype for in-place add)
