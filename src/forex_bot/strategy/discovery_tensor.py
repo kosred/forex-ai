@@ -186,8 +186,94 @@ class TensorDiscoveryEngine:
 
     def run_unsupervised_search(self, frames: Dict[str, pd.DataFrame], news_features: Optional[pd.DataFrame] = None, iterations: int = 1000):
         self._prepare_tensor_cube(frames, news_features)
-        
-        metrics_registry = {} 
+
+        def _preflight_report():
+            try:
+                if str(os.environ.get("FOREX_BOT_DISCOVERY_PREFLIGHT", "1") or "1").strip().lower() in {"0", "false", "no"}:
+                    return
+                try:
+                    sample_n = int(os.environ.get("FOREX_BOT_DISCOVERY_PREFLIGHT_SAMPLES", "200000") or 200000)
+                except Exception:
+                    sample_n = 200000
+                sample_n = max(1000, sample_n)
+                n_samples = int(self.ohlc_cube_cpu.shape[1])
+                if n_samples < 2:
+                    return
+                sample_n = min(sample_n, n_samples)
+                start_idx = max(0, n_samples - sample_n)
+
+                ohlc = self.ohlc_cube_cpu[0, start_idx:start_idx + sample_n].to(dtype=torch.float32)
+                open_ = ohlc[:, 0]
+                close_ = ohlc[:, 3]
+                open_next = torch.clamp(open_[1:], min=1e-6)
+                close_next = close_[1:]
+                rets = (close_next - open_next) / open_next
+
+                nan_open = torch.isnan(open_).sum().item()
+                nan_close = torch.isnan(close_).sum().item()
+                nonpos_open = (open_ <= 0).sum().item()
+                nonpos_close = (close_ <= 0).sum().item()
+                nan_rets = torch.isnan(rets).sum().item()
+                zero_rets = (rets == 0).sum().item()
+
+                logger.info(
+                    f"Preflight: samples={sample_n} open[min={open_.min().item():.6f} max={open_.max().item():.6f} "
+                    f"nan={nan_open} <=0={nonpos_open}] close[min={close_.min().item():.6f} max={close_.max().item():.6f} "
+                    f"nan={nan_close} <=0={nonpos_close}]"
+                )
+                logger.info(
+                    f"Preflight: returns[min={rets.min().item():.6f} max={rets.max().item():.6f} "
+                    f"mean={rets.mean().item():.6f} std={rets.std(unbiased=False).item():.6f} "
+                    f"nan={nan_rets} zero={zero_rets} ({(zero_rets / max(1, rets.numel())):.4f})]"
+                )
+
+                def _baseline_metrics(name: str, actions: torch.Tensor) -> None:
+                    if actions.numel() != rets.numel():
+                        return
+                    batch_rets = (actions * rets) - (torch.abs(actions) * 0.0002)
+                    equity = torch.cumprod(1.0 + batch_rets, dim=0)
+                    peak = torch.cummax(equity, dim=0)[0]
+                    max_dd = ((peak - equity) / torch.clamp(peak, min=1e-9)).max().item()
+                    total_ret = equity[-1].item() - 1.0
+                    std_r = batch_rets.std(unbiased=False).item()
+                    sharpe = (batch_rets.mean().item() / (std_r + 1e-9)) * (252 * 1440) ** 0.5
+
+                    prev_actions = actions[:-1]
+                    curr_actions = actions[1:]
+                    entries = (prev_actions == 0) & (curr_actions != 0)
+                    flips = (prev_actions != 0) & (curr_actions != 0) & (prev_actions != curr_actions)
+                    trade_count = (entries | flips).float().sum().item()
+                    trade_density = trade_count / max(1, actions.numel())
+                    trades_per_day = trade_density * 1440.0
+
+                    logger.info(
+                        f"Preflight baseline [{name}]: ret={total_ret:.4f} sharpe={sharpe:.2f} "
+                        f"max_dd={max_dd:.2f} trades/day={trades_per_day:.2f}"
+                    )
+
+                # Baseline 1: always long
+                _baseline_metrics("always_long", torch.ones_like(rets))
+                # Baseline 2: always short
+                _baseline_metrics("always_short", -torch.ones_like(rets))
+                # Baseline 3: sparse random (about 1-2 trades/day)
+                try:
+                    target_mid_per_day = float(os.environ.get("FOREX_BOT_DISCOVERY_PREFLIGHT_TRADES_PER_DAY", "1.5") or 1.5)
+                except Exception:
+                    target_mid_per_day = 1.5
+                prob = max(target_mid_per_day / 1440.0, 1e-6)
+                rnd = torch.rand_like(rets)
+                actions = torch.zeros_like(rets)
+                mask = rnd < prob
+                if mask.any():
+                    signs = torch.where(torch.rand(int(mask.sum())) < 0.5, 1.0, -1.0)
+                    actions[mask] = signs.to(actions.dtype)
+                _baseline_metrics("random_sparse", actions)
+            except Exception as e:
+                logger.warning(f"Preflight failed: {e}")
+
+        _preflight_report()
+
+        metrics_registry = {}
         registry_lock = threading.Lock()
 
         preload = False
