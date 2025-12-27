@@ -253,10 +253,17 @@ class TensorDiscoveryEngine:
         except Exception:
             dd_cap = 0.15
         try:
-            dd_penalty_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_DD_PENALTY", "5.0") or 5.0)
+            dd_penalty_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_DD_PENALTY", "1.0") or 1.0)
         except Exception:
-            dd_penalty_weight = 5.0
+            dd_penalty_weight = 1.0
         debug_validity = os.environ.get("FOREX_BOT_DISCOVERY_DEBUG_VALIDITY", "0").strip().lower() in {"1", "true", "yes", "on"}
+        log_metrics = str(os.environ.get("FOREX_BOT_DISCOVERY_LOG_METRICS", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        try:
+            log_metrics_every = int(os.environ.get("FOREX_BOT_DISCOVERY_LOG_METRICS_EVERY", "10") or 10)
+        except Exception:
+            log_metrics_every = 10
         debug_snapshot = {
             "fitness": None, "sharpe": None, "mean_ret": None, "std_ret": None,
             "max_dd": None, "profitable_chunks": None, "consistency": None,
@@ -264,6 +271,8 @@ class TensorDiscoveryEngine:
         }
         import threading
         debug_lock = threading.Lock() if debug_metrics else None
+        metrics_lock = threading.Lock()
+        metrics_state = {"gen": -1, "armed": False, "logged": False}
 
         # --- AUTO-TUNING HARDWARE CONFIG ---
         # 1. GPU Preload: Only if we fit safely in VRAM
@@ -565,8 +574,28 @@ class TensorDiscoveryEngine:
                 fitness = sharpe * (profitable_chunks.to(dtype=torch.float32) / 10.0)
                 # Penalties (soft drawdown penalty)
                 if dd_cap > 0 and dd_penalty_weight > 0:
-                    dd_penalty = torch.clamp((max_dd.to(dtype=torch.float32) - dd_cap) / max(dd_cap, 1e-9), min=0.0, max=1.0)
-                    fitness = fitness - (dd_penalty_weight * dd_penalty)
+                    dd_excess = torch.clamp(max_dd.to(dtype=torch.float32) - dd_cap, min=0.0)
+                    fitness = fitness - (dd_penalty_weight * dd_excess)
+                if log_metrics and metrics_state.get("armed") and gpu_idx == 0 and not metrics_state.get("logged"):
+                    with metrics_lock:
+                        if metrics_state.get("armed") and not metrics_state.get("logged"):
+                            try:
+                                best_idx = int(torch.argmax(fitness).item())
+                                logger.info(
+                                    "Discovery metrics (gen %s): best_fit=%.4f sharpe=%.4f max_dd=%.4f "
+                                    "mean_ret=%.6f std_ret=%.6f prof_chunks=%.2f samples=%d",
+                                    metrics_state.get("gen"),
+                                    float(fitness[best_idx].item()),
+                                    float(sharpe[best_idx].item()),
+                                    float(max_dd[best_idx].item()),
+                                    float(mean_ret[best_idx].item()),
+                                    float(std_ret[best_idx].item()),
+                                    float(profitable_chunks[best_idx].item()),
+                                    int(effective_samples),
+                                )
+                            except Exception:
+                                pass
+                            metrics_state["logged"] = True
                 if debug_validity:
                     nan_count = int(torch.isnan(fitness).sum().item())
                     inf_count = int(torch.isinf(fitness).sum().item())
@@ -638,6 +667,12 @@ class TensorDiscoveryEngine:
         best_val = -1e9
         no_improve = 0
         for i in range(iterations):
+            if log_metrics and log_metrics_every > 0 and (i % log_metrics_every == 0):
+                metrics_state["gen"] = i
+                metrics_state["armed"] = True
+                metrics_state["logged"] = False
+            else:
+                metrics_state["armed"] = False
             try:
                 searcher.step()
             except Exception as exc:
@@ -666,9 +701,17 @@ class TensorDiscoveryEngine:
             # Periodic checkpoint (best experts so far)
             if ckpt_every > 0 and (i % ckpt_every == 0):
                 try:
-                    pop = searcher.population.values.detach().cpu()
-                    evals = searcher.population.evaluations.detach().cpu()
-                    if evals.numel() == pop.shape[0]:
+                    pop_batch = searcher.population
+                    pop_vals = getattr(pop_batch, "values", pop_batch)
+                    pop = pop_vals.detach().cpu() if torch.is_tensor(pop_vals) else torch.as_tensor(pop_vals).detach().cpu()
+                    evals = None
+                    for attr in ("evals", "evaluations", "evaluation"):
+                        if hasattr(pop_batch, attr):
+                            evals = getattr(pop_batch, attr)
+                            break
+                    if evals is not None and torch.is_tensor(evals):
+                        evals = evals.detach().cpu()
+                    if evals is not None and evals.numel() == pop.shape[0]:
                         idx = torch.argsort(evals, descending=True)
                         best_experts = pop[idx[: self.n_experts]]
                     else:
