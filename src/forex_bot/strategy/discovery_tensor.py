@@ -553,6 +553,9 @@ class TensorDiscoveryEngine:
                                 else:
                                     fitness = torch.where(median_month < monthly_floor, fitness * 0.1, fitness)
 
+                            # Guard against NaN/Inf propagating into CMA-ES.
+                            fitness = torch.nan_to_num(fitness, nan=-1e9, posinf=-1e9, neginf=-1e9)
+
                             if debug_lock is not None:
                                 try:
                                     best_idx = int(torch.argmax(fitness).item())
@@ -598,9 +601,21 @@ class TensorDiscoveryEngine:
                         chunk_size = futures.get(future, 0)
                         logger.error(f"GPU worker failed: {e}", exc_info=True)
                         all_fitness_scores.append(torch.full((chunk_size,), -1e9))
-            
-            # Re-assemble and return to EvoTorch master
-            return torch.cat(all_fitness_scores, dim=0)
+
+            # Re-assemble and return to EvoTorch master (guarantee finite values)
+            if not all_fitness_scores:
+                return torch.full((pop_size,), -1e9)
+            scores = torch.cat(all_fitness_scores, dim=0)
+            if scores.numel() != pop_size:
+                if scores.numel() > pop_size:
+                    scores = scores[:pop_size]
+                else:
+                    pad = torch.full((pop_size - scores.numel(),), -1e9)
+                    scores = torch.cat([scores, pad], dim=0)
+            scores = torch.nan_to_num(scores, nan=-1e9, posinf=-1e9, neginf=-1e9)
+            if not torch.isfinite(scores).any():
+                scores = torch.full((pop_size,), -1e9)
+            return scores
 
         # 2. Start Centralized Evolution (Master)
         genome_dim = self.n_features + len(self.timeframes) + 2
