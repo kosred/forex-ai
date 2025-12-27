@@ -14,6 +14,16 @@ Auto-detects HPC environments (CUDA, multiple GPUs) and optimizes accordingly.
 
 import os
 import sys
+
+# --- 0. HPC Thread Safety (MUST BE FIRST) ---
+# Prevent numexpr from crashing on high-core machines (>64 cores)
+os.environ["NUMEXPR_MAX_THREADS"] = "64"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import subprocess
 from pathlib import Path
 
