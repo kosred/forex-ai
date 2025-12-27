@@ -81,12 +81,22 @@ def to_numpy_safe(data: Any) -> np.ndarray:
 
 def _feature_cpu_budget() -> int:
     """Best-effort CPU budget per rank/process for feature work."""
+    local_rank = os.environ.get("LOCAL_RANK")
     per_gpu = os.environ.get("FOREX_BOT_CPU_THREADS_PER_GPU")
-    if per_gpu and os.environ.get("LOCAL_RANK") is not None:
-        try:
-            return max(1, int(per_gpu))
-        except Exception:
-            pass
+    if local_rank is not None:
+        if per_gpu:
+            try:
+                return max(1, int(per_gpu))
+            except Exception:
+                pass
+        for key in ("FOREX_BOT_CPU_BUDGET", "FOREX_BOT_CPU_THREADS"):
+            val = os.environ.get(key)
+            if val:
+                try:
+                    return max(1, int(val))
+                except Exception:
+                    pass
+        return 20
     for key in ("FOREX_BOT_CPU_BUDGET", "FOREX_BOT_CPU_THREADS"):
         val = os.environ.get(key)
         if val:
