@@ -19,7 +19,7 @@ class AutonomousDiscoveryEngine:
         self.ledger = StrategyLedger(str(cache_dir / "strategy_ledger.sqlite"), symbol="DISCOVERY")
         self.n_jobs = n_jobs
         self.mixer = TALibStrategyMixer(use_volume_features=True)
-        self.evolution = GeneticStrategyEvolution(self.mixer, population_size=100)
+        self.evolution = GeneticStrategyEvolution(population_size=100, mixer=self.mixer)
 
     def run_discovery_cycle(self, df: pd.DataFrame, population_size: int = 100) -> None:
         logger.info(f"Starting autonomous discovery cycle (Pop: {population_size})...")
