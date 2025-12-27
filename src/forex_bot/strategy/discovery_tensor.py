@@ -263,7 +263,7 @@ class TensorDiscoveryEngine:
                                 except torch.OutOfMemoryError:
                                     torch.cuda.empty_cache(); gc.collect()
                                     batch_size_map[gpu_idx] = int(current_batch * 0.5)
-                                        if batch_size_map[gpu_idx] < 128: return torch.full((chunk.shape[0],), 0.0)
+                                    if batch_size_map[gpu_idx] < 128: return torch.full((chunk.shape[0],), 0.0)
                                     continue
                         return torch.cat(fitness_all, dim=0)
                 except Exception as e: 
@@ -283,8 +283,8 @@ class TensorDiscoveryEngine:
                 running_peak = torch.ones(local_pop, device=dev, dtype=torch.float32)
                 
                 survival_steps = torch.zeros(local_pop, device=dev, dtype=torch.float32)
-                    alive_mask = torch.ones(local_pop, device=dev, dtype=torch.bool)
-                    trade_steps = torch.zeros(local_pop, device=dev, dtype=torch.float32)
+                alive_mask = torch.ones(local_pop, device=dev, dtype=torch.bool)
+                trade_steps = torch.zeros(local_pop, device=dev, dtype=torch.float32)
 
                 tf_count = self.data_cube_cpu.shape[0]
                 matmul_dtype = torch.float16 if dev.type == "cuda" else torch.float32
