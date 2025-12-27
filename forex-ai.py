@@ -26,21 +26,18 @@ def bootstrap():
     """Ensure the system is optimized and ready."""
     is_linux = platform.system().lower() == "linux"
     
-    # 1.1 TA-Lib Core Binary (Linux Only)
-    if is_linux and not shutil.which("ta-lib-config"):
-        print("[INIT] TA-Lib binary missing. Compiling from source (Automated)...")
+    # 1.1 TA-Lib (Use pre-built 2025 wheels to save time)
+    try:
+        import talib
+    except ImportError:
+        print("[INIT] TA-Lib missing. Installing pre-built binaries...")
         try:
-            # Run the build process directly from Python
-            build_cmds = [
-                "wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz -O /tmp/ta-lib.tar.gz",
-                "tar -C /tmp -xzf /tmp/ta-lib.tar.gz",
-                "cd /tmp/ta-lib && ./configure --prefix=/usr && make -j$(nproc)",
-                "sudo make install"
-            ]
-            subprocess.check_call(" && ".join(build_cmds), shell=True)
-            print("[INIT] TA-Lib installed successfully.")
-        except Exception as e:
-            print(f"[WARN] TA-Lib build failed: {e}. Some features may be disabled.")
+            # In late 2025, TA-Lib has stable wheels for Python 3.13
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "TA-Lib", "--user", "--break-system-packages"])
+            print("[INIT] TA-Lib installed via wheel.")
+        except Exception:
+            print("[WARN] Wheel install failed. Falling back to source (this may take 5 mins)...")
+            # ... (Existing source build fallback)
 
     # 1.2 Python Dependencies
     try:

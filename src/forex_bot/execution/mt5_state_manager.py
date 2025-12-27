@@ -233,6 +233,12 @@ class MT5StateManager:
 
             self.last_sync_time = datetime.now(UTC)
             return True
+        except Exception as e:
+            self.consecutive_sync_failures += 1
+            logger.error(f"MT5 sync failed (attempt {self.consecutive_sync_failures}): {e}")
+            if self.consecutive_sync_failures >= self.max_consecutive_sync_failures:
+                raise RuntimeError("MT5 sync failed too many times.") from e
+            return False
 
     async def _get_history_deals(self, from_date: datetime, to_date: datetime) -> list[MT5Deal]:
         """Fetch historical deals (closed trades) from MT5"""
