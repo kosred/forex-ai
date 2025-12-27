@@ -91,7 +91,7 @@ IMPORT_TO_PYPI = {
     "onnxruntime": "onnxruntime-gpu",
     "openai": "openai",
     "polars": "polars",
-    "pytorch_tabnet": "pytorch-tabnet2",
+    "pytorch_tabnet": "pytorch-tabnet",
     "skl2onnx": "skl2onnx",
     "threadpoolctl": "threadpoolctl",
     "transformer_engine": "transformer-engine",
@@ -482,9 +482,27 @@ def _flash_attn_wheel_url() -> str | None:
             return None
         torch_ver = str(getattr(torch, "__version__", "")).split("+")[0]
         torch_major_minor = ".".join(torch_ver.split(".")[:2])
+        cuda_ver = getattr(getattr(torch, "version", None), "cuda", None)       
+        cp_tag = f"cp{py_ver[0]}{py_ver[1]}"
+
+        # Community-provided wheels for newer Python/CUDA combos.
+        community_wheels = {
+            ("cp313", "2.9"): (
+                "https://github.com/mjun0812/flash-attention-prebuild-wheels/"
+                "releases/download/v0.6.8/"
+                "flash_attn-2.8.3+cu130torch2.9-cp313-cp313-linux_x86_64.whl"
+            ),
+        }
+        if (cp_tag, torch_major_minor) in community_wheels:
+            if cuda_ver and not str(cuda_ver).startswith(("12.8", "13")):
+                logger.warning(
+                    "flash-attn wheel is built for CUDA 12.8+/13.x, but torch reports CUDA %s.",
+                    cuda_ver,
+                )
+            return community_wheels[(cp_tag, torch_major_minor)]
+
         if torch_major_minor not in {"2.6", "2.7", "2.8", "2.9"}:
             return None
-        cuda_ver = getattr(getattr(torch, "version", None), "cuda", None)
         if not cuda_ver or not str(cuda_ver).startswith("12"):
             return None
         abi_flag = "TRUE"
@@ -492,9 +510,8 @@ def _flash_attn_wheel_url() -> str | None:
             abi_flag = "TRUE" if bool(getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", True)) else "FALSE"
         except Exception:
             pass
-        cp_tag = f"cp{py_ver[0]}{py_ver[1]}"
-        # Wheels exist for cp39-cp313 for torch2.6/2.7/2.8. Torch2.9 wheels are
-        # currently published for cp312 only.
+        # Wheels exist for cp39-cp313 for torch2.6/2.7/2.8. Torch2.9 official wheels
+        # are currently published for cp312 only (community wheels may exist).
         if torch_major_minor == "2.9" and cp_tag != "cp312":
             return None
         return (
@@ -513,7 +530,8 @@ def _torch_bundle_for_env(py_ver: tuple[int, int] | None = None) -> list[str]:
     if py_ver is None:
         py_ver = sys.version_info[:2]
     override = os.environ.get("FOREX_BOT_TORCH_VERSION")
-    torch_ver = (override or "2.8.0").strip()
+    default_ver = "2.9.0" if py_ver >= (3, 13) else "2.8.0"
+    torch_ver = (override or default_ver).strip()
     # Best-known matching versions.
     vision_map = {
         "2.6.0": "0.21.0",
@@ -522,7 +540,11 @@ def _torch_bundle_for_env(py_ver: tuple[int, int] | None = None) -> list[str]:
         "2.8.0": "0.23.0",
         "2.9.0": "0.24.0",
     }
-    vision_ver = vision_map.get(torch_ver, "0.21.0")
+    vision_ver = vision_map.get(torch_ver)
+    if vision_ver is None and torch_ver.startswith("2.9"):
+        vision_ver = "0.24.0"
+    if vision_ver is None:
+        vision_ver = "0.21.0"
     audio_ver = torch_ver
     return [
         f"torch=={torch_ver}",
