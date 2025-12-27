@@ -31,7 +31,7 @@ from .cpu.indicators import (
 from .cpu.labeling import compute_meta_labels_atr_numba
 from .gpu.indicators import CUPY_AVAILABLE, atr_wicks_cupy, rsi_cupy, talib_gpu
 from .prep_utils import have_cudf
-from .smc import NUMBA_AVAILABLE
+from .smc import NUMBA_AVAILABLE, njit
 from .specialized import add_smc_features, compute_obi_features, compute_volume_profile_features
 from .talib_mixer import TALIB_AVAILABLE, talib, ALL_INDICATORS, abstract
 
