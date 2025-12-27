@@ -320,7 +320,14 @@ class TensorDiscoveryEngine:
                     active_rets = torch.where(alive_mask.unsqueeze(1), batch_rets, torch.zeros_like(batch_rets))
                     sum_ret.add_(active_rets.sum(dim=1))
                     sum_sq_ret.add_((active_rets**2).sum(dim=1))
-                    trade_steps.add_(torch.abs(actions[:, :-1]).sum(dim=1))
+                    # Count actual trade entries (not time-in-position).
+                    prev_actions = actions[:, :-1]
+                    curr_actions = actions[:, 1:]
+                    entries = (prev_actions == 0) & (curr_actions != 0)
+                    flips = (prev_actions != 0) & (curr_actions != 0) & (prev_actions != curr_actions)
+                    trade_events = (entries | flips).float()
+                    # Count trades only while alive to avoid inflated density after death.
+                    trade_steps.add_((trade_events * alive_mask.unsqueeze(1).float()).sum(dim=1))
                     
                     for s in range(n_segments):
                         overlap_start = max(start_idx, s * seg_size)
@@ -355,18 +362,45 @@ class TensorDiscoveryEngine:
                 std_r = torch.sqrt(torch.clamp((sum_sq_ret / denom) - mean_r**2, min=1e-9)) + 1e-5
                 sharpe = (mean_r / std_r) * (252 * 1440)**0.5
                 sharpe = torch.clamp(sharpe, min=-5.0, max=10.0)
-                
+
                 segment_profitability = (seg_rets > 0).float().sum(dim=1)
-                consistency_bonus = (segment_profitability / n_segments) * 5.0
-                
-                # SOFTER PENALTY (Fixes -90 plateau)
-                # Multiplier reduced from 100 to 30
-                dd_excess = torch.clamp(max_dd - dynamic_dd_limit, min=0.0)
-                dd_penalty = dd_excess * 30.0
-                
-                # DAILY CLIFF (Slides with limit)
-                daily_cliff_val = dynamic_dd_limit + 0.01
-                daily_cliff = torch.where(max_dd > daily_cliff_val, torch.tensor(10.0, device=dev), torch.tensor(0.0, device=dev))
+
+                # Profit from compounded equity
+                total_ret = running_equity - 1.0
+                try:
+                    profit_target = float(os.environ.get("FOREX_BOT_DISCOVERY_PROFIT_TARGET", "0.10") or 0.10)
+                except Exception:
+                    profit_target = 0.10
+                profit_target = max(profit_target, 1e-6)
+                profit_score = torch.tanh(total_ret / profit_target)
+
+                # Weights (tunable)
+                try:
+                    survival_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_SURVIVAL_WEIGHT", "4.0") or 4.0)
+                except Exception:
+                    survival_weight = 4.0
+                try:
+                    sharpe_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_SHARPE_WEIGHT", "1.5") or 1.5)
+                except Exception:
+                    sharpe_weight = 1.5
+                try:
+                    consistency_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_CONSISTENCY_WEIGHT", "5.0") or 5.0)
+                except Exception:
+                    consistency_weight = 5.0
+                try:
+                    profit_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_PROFIT_WEIGHT", "12.0") or 12.0)
+                except Exception:
+                    profit_weight = 12.0
+                try:
+                    dd_penalty_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_DD_PENALTY_WEIGHT", "10.0") or 10.0)
+                except Exception:
+                    dd_penalty_weight = 10.0
+
+                consistency_bonus = (segment_profitability / n_segments) * consistency_weight
+
+                # Drawdown penalty relative to dynamic limit (soft, no cliff)
+                dd_ratio = max_dd / torch.clamp(torch.tensor(dynamic_dd_limit, device=dev), min=1e-6)
+                dd_penalty = torch.clamp(dd_ratio - 1.0, min=0.0) * dd_penalty_weight
                 
                 trade_density = trade_steps / denom
                 try:
@@ -386,15 +420,31 @@ class TensorDiscoveryEngine:
                 max_density = target_max_per_day / 1440.0
                 min_trade_density = max(min_trade_density, min_density)
                 trade_gate = trade_density >= min_trade_density
-                trade_bonus = torch.where(
-                    (trade_density >= min_density) & (trade_density <= max_density),
-                    torch.tensor(2.0, device=dev),
-                    torch.tensor(0.0, device=dev),
+
+                # Trade activity score peaks within [min_density, max_density]
+                mid_density = (min_density + max_density) / 2.0
+                half_span = max((max_density - min_density) / 2.0, 1e-9)
+                trade_score = 1.0 - torch.abs(trade_density - mid_density) / half_span
+                trade_score = torch.clamp(trade_score, min=-1.0, max=1.0)
+                try:
+                    trade_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_WEIGHT", "6.0") or 6.0)
+                except Exception:
+                    trade_weight = 6.0
+                trade_score = trade_score * trade_weight
+
+                total_fitness = (
+                    (survival_ratio * survival_weight)
+                    + (sharpe * sharpe_weight)
+                    + consistency_bonus
+                    + (profit_score * profit_weight)
+                    + trade_score
+                    - dd_penalty
                 )
-                
-                # INCREASED SURVIVAL REWARD (From 10 to 20)
-                total_fitness = (survival_ratio * 20.0) + sharpe + consistency_bonus - dd_penalty - daily_cliff + trade_bonus
-                total_fitness = torch.where(trade_gate, total_fitness, torch.zeros_like(total_fitness))
+                try:
+                    no_trade_penalty = float(os.environ.get("FOREX_BOT_DISCOVERY_NO_TRADE_PENALTY", "-5.0") or -5.0)
+                except Exception:
+                    no_trade_penalty = -5.0
+                total_fitness = torch.where(trade_gate, total_fitness, torch.full_like(total_fitness, no_trade_penalty))
                 
                 max_dd_safe = torch.nan_to_num(max_dd, nan=1.0)
                 bi = int(torch.argmax(total_fitness).item())
