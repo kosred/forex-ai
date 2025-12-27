@@ -189,15 +189,15 @@ class TrainingService:
             return frames
 
         try:
-            n_strategies = int(os.environ.get("FOREX_BOT_DISCOVERY_MIXER_STRATEGIES", "8") or 8)
+            n_strategies = int(os.environ.get("FOREX_BOT_DISCOVERY_MIXER_STRATEGIES", "24") or 24)
         except Exception:
-            n_strategies = 8
+            n_strategies = 24
         if n_strategies <= 0:
             return frames
         try:
-            max_indicators = int(os.environ.get("FOREX_BOT_DISCOVERY_MIXER_MAX_INDICATORS", "6") or 6)
+            max_indicators = int(os.environ.get("FOREX_BOT_DISCOVERY_MIXER_MAX_INDICATORS", "20") or 20)
         except Exception:
-            max_indicators = 6
+            max_indicators = 20
         max_indicators = max(1, max_indicators)
 
         try:
@@ -215,6 +215,7 @@ class TrainingService:
             logger.warning("Discovery: TA-Lib mixer has no available indicators; skipping.")
             return frames
 
+        max_indicators = min(max_indicators, max(1, len(mixer.available_indicators)))
         genes = [mixer.generate_random_strategy(max_indicators=max_indicators) for _ in range(n_strategies)]
 
         def _apply(df: pd.DataFrame) -> pd.DataFrame:
@@ -1116,10 +1117,127 @@ class TrainingService:
         raw_frames_map: dict[str, dict[str, pd.DataFrame]] = {}
         news_map: dict[str, pd.DataFrame | None] = {}
         skip_rank0_heavy = False
+        cache_ready = reuse_cache and cache_path.exists()
 
-        if rank == 0:
+        # --- DDP FEATURE SHARDING (use all ranks to build datasets) ---
+        if distributed_features and not cache_ready:
+            target_sym = "EURUSD" if "EURUSD" in symbols else symbols[0]
+            ordered_symbols = [target_sym] + [s for s in symbols if s != target_sym]
+            shard_symbols = [sym for idx, sym in enumerate(ordered_symbols) if idx % world_size == rank]
+            logger.info(
+                f"HPC (Rank {rank}): DDP feature shard {len(shard_symbols)}/{len(ordered_symbols)} symbols."
+            )
+
+            analyzer = None
+            if self.settings.news.enable_news:
+                try:
+                    analyzer = await get_sentiment_analyzer(self.settings)
+                except Exception as exc:
+                    logger.warning(f"News analyzer unavailable (rank {rank}): {exc}")
+
+            local_frames_map: dict[str, dict[str, pd.DataFrame]] = {}
+            local_news_map: dict[str, pd.DataFrame | None] = {}
+            local_datasets: list[tuple[str, PreparedDataset]] = []
+            for sym in shard_symbols:
+                try:
+                    self.settings.system.symbol = sym
+                    await self.data_loader.ensure_history(sym)
+                    frames = await self.data_loader.get_training_data(sym)
+                    if not isinstance(frames, dict) or not frames:
+                        logger.warning(f"HPC (Rank {rank}): Missing frames for {sym}")
+                        continue
+                    local_frames_map[sym] = frames
+                    if analyzer is not None:
+                        local_news_map[sym] = self._build_news_features(analyzer, sym, frames)
+                    ds = self.feature_engineer.prepare(
+                        frames,
+                        news_features=local_news_map.get(sym),
+                        symbol=sym,
+                    )
+                    local_datasets.append((sym, ds))
+                except Exception as exc:
+                    logger.error(f"HPC (Rank {rank}) feature gen failed for {sym}: {exc}", exc_info=True)
+
+            shard_path = cache_path.with_name(f"hpc_datasets_rank{rank}.pkl")
+            try:
+                joblib.dump(
+                    {"datasets": local_datasets, "frames": local_frames_map, "news": local_news_map},
+                    shard_path,
+                )
+            except Exception as exc:
+                logger.error(f"HPC (Rank {rank}) failed to write shard: {exc}")
+
+            if is_ddp:
+                dist.barrier()
+
+            if rank == 0:
+                merged: list[tuple[str, PreparedDataset]] = []
+                for r in range(world_size):
+                    p = cache_path.with_name(f"hpc_datasets_rank{r}.pkl")
+                    if not p.exists():
+                        logger.warning(f"HPC (Rank 0): Missing shard {p}")
+                        continue
+                    try:
+                        payload = joblib.load(p)
+                    except Exception as exc:
+                        logger.warning(f"HPC (Rank 0): Failed to load shard {p}: {exc}")
+                        continue
+                    if isinstance(payload, dict):
+                        merged.extend(payload.get("datasets", []) or [])
+                        frames_payload = payload.get("frames") or {}
+                        news_payload = payload.get("news") or {}
+                        if target_sym in frames_payload:
+                            raw_frames_map[target_sym] = frames_payload[target_sym]
+                            if target_sym in news_payload:
+                                news_map[target_sym] = news_payload[target_sym]
+                    elif isinstance(payload, list):
+                        merged.extend(payload)
+                datasets = merged
+                datasets_loaded = bool(merged)
+                skip_rank0_heavy = datasets_loaded
+                if datasets_loaded:
+                    logger.info(
+                        f"HPC (Rank 0): Merged {len(datasets)}/{len(symbols)} datasets from {world_size} ranks."
+                    )
+                    try:
+                        joblib.dump(datasets, cache_path)
+                    except Exception as exc:
+                        logger.warning(f"HPC (Rank 0): Failed to write merged cache: {exc}")
+                if target_sym not in raw_frames_map:
+                    try:
+                        self.settings.system.symbol = target_sym
+                        await self.data_loader.ensure_history(target_sym)
+                        frames = await self.data_loader.get_training_data(target_sym)
+                        if isinstance(frames, dict) and frames:
+                            raw_frames_map[target_sym] = frames
+                            if analyzer is not None:
+                                news_map[target_sym] = self._build_news_features(
+                                    analyzer, target_sym, frames
+                                )
+                    except Exception as exc:
+                        logger.warning(
+                            f"HPC (Rank 0): Failed to load discovery frames for {target_sym}: {exc}"
+                        )
+                for r in range(world_size):
+                    p = cache_path.with_name(f"hpc_datasets_rank{r}.pkl")
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            if is_ddp:
+                dist.barrier()
+            if rank != 0:
+                logger.info(f"Rank {rank}: Exiting (feature shard complete; rank 0 continues).")
+                try:
+                    dist.destroy_process_group()
+                except Exception:
+                    pass
+                return
+
+        if rank == 0 and not skip_rank0_heavy:
             # --- RANK 0: Heavy Lifting ---
-            # Optional dataset reuse to avoid re-running feature engineering
+            # Optional dataset reuse to avoid re-running feature engineering    
             if reuse_cache and cache_path.exists():
                 try:
                     cached = joblib.load(cache_path)

@@ -435,12 +435,12 @@ class TensorDiscoveryEngine:
                 
                 # Selective trading balance (tunable bias/scale to control activity)
                 try:
-                    threshold_bias = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_BIAS", "0.05") or 0.05)
+                    threshold_bias = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_BIAS", "0.02") or 0.02)
                 except Exception:
                     threshold_bias = 0.1
                 threshold_bias = max(threshold_bias, 0.0)
                 try:
-                    threshold_scale = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_SCALE", "0.20") or 0.20)
+                    threshold_scale = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_SCALE", "0.12") or 0.12)
                 except Exception:
                     threshold_scale = 0.25
                 threshold_scale = max(threshold_scale, 1e-6)
@@ -493,13 +493,17 @@ class TensorDiscoveryEngine:
                         exec_actions = actions_tf[:, :, :-1] * bar_mask_next.unsqueeze(0)
                         batch_rets_tf = (exec_actions * rets_tf.unsqueeze(0)) - (torch.abs(exec_actions) * 0.0002)
                         batch_rets = (batch_rets_tf * tf_weights.unsqueeze(2)).sum(dim=1)
-                        prev_actions = exec_actions[:, :, :-1]
-                        curr_actions = exec_actions[:, :, 1:]
+                        prev_actions = torch.cat(
+                            [torch.zeros_like(exec_actions[:, :, :1]), exec_actions[:, :, :-1]],
+                            dim=2,
+                        )
+                        curr_actions = exec_actions
                         entries = (prev_actions == 0) & (curr_actions != 0)
                         flips = (prev_actions != 0) & (curr_actions != 0) & (prev_actions != curr_actions)
-                        trade_events = (entries | flips)
-                        trade_any = trade_events.sum(dim=1) > 0
-                        trade_steps.add_(trade_any.float().sum(dim=1))
+                        trade_events = (entries | flips).float()
+                        trade_steps.add_(
+                            (trade_events * alive_mask.unsqueeze(1).unsqueeze(2).float()).sum(dim=(1, 2))
+                        )
                     else:
                         actions = torch.where(signals > buy_th.unsqueeze(1), 1.0, 0.0)
                         actions = torch.where(signals < sell_th.unsqueeze(1), -1.0, actions)
@@ -508,8 +512,11 @@ class TensorDiscoveryEngine:
                         rets = (close_next - open_next) / open_next
                         batch_rets = (actions[:, :-1] * rets.unsqueeze(0)) - (torch.abs(actions[:, :-1]) * 0.0002)
                         # Count actual trade entries (not time-in-position).
-                        prev_actions = actions[:, :-1]
-                        curr_actions = actions[:, 1:]
+                        prev_actions = torch.cat(
+                            [torch.zeros_like(actions[:, :1]), actions[:, :-1]],
+                            dim=1,
+                        )
+                        curr_actions = actions
                         entries = (prev_actions == 0) & (curr_actions != 0)
                         flips = (prev_actions != 0) & (curr_actions != 0) & (prev_actions != curr_actions)
                         trade_events = (entries | flips).float()
@@ -604,6 +611,8 @@ class TensorDiscoveryEngine:
                 target_max_per_day = max(target_max_per_day, target_min_per_day)
                 min_trades_required = max(target_min_per_day * days, 1.0)
                 trade_gate = trade_steps >= min_trades_required
+                # Activity factor: survival/profit shouldn't be rewarded if we don't trade enough.
+                activity_scale = torch.clamp(trade_density / max(target_min_per_day, 1e-6), min=0.0, max=1.0)
 
                 # Trade activity score: penalize under/over-trading, reward within range.
                 mid_density = (target_min_per_day + target_max_per_day) / 2.0
@@ -617,17 +626,17 @@ class TensorDiscoveryEngine:
                 trade_score = trade_score * trade_weight
 
                 total_fitness = (
-                    (survival_ratio * survival_weight)
+                    (survival_ratio * activity_scale * survival_weight)
                     + (sharpe * sharpe_weight)
-                    + consistency_bonus
-                    + (profit_score * profit_weight)
+                    + (consistency_bonus * activity_scale)
+                    + (profit_score * activity_scale * profit_weight)
                     + trade_score
                     - dd_penalty
                 )
                 try:
-                    no_trade_penalty = float(os.environ.get("FOREX_BOT_DISCOVERY_NO_TRADE_PENALTY", "-20.0") or -20.0)
+                    no_trade_penalty = float(os.environ.get("FOREX_BOT_DISCOVERY_NO_TRADE_PENALTY", "-25.0") or -25.0)
                 except Exception:
-                    no_trade_penalty = -20.0
+                    no_trade_penalty = -25.0
                 no_trade_penalty = min(no_trade_penalty, -1e-3)
                 total_fitness = torch.where(trade_gate, total_fitness, torch.full_like(total_fitness, no_trade_penalty))
                 
@@ -679,25 +688,35 @@ class TensorDiscoveryEngine:
                 pop_vals = ckpt.get("population")
                 if pop_vals is not None:
                     try:
-                        cur_vals = searcher.population.values
-                        if cur_vals.shape == pop_vals.shape:
-                            cur_vals.copy_(pop_vals.to(cur_vals.device, dtype=cur_vals.dtype))
+                        if hasattr(searcher.population, "set_values"):
+                            searcher.population.set_values(pop_vals)
                             logger.info(f"Discovery resume: restored population from {checkpoint_path}.")
                         else:
-                            logger.warning(
-                                f"Discovery resume skipped: population shape mismatch "
-                                f"{tuple(cur_vals.shape)} vs {tuple(pop_vals.shape)}."
-                            )
+                            cur_vals = searcher.population.values
+                            if cur_vals.shape == pop_vals.shape:
+                                cur_vals.copy_(pop_vals.to(cur_vals.device, dtype=cur_vals.dtype))
+                                logger.info(f"Discovery resume: restored population from {checkpoint_path}.")
+                            else:
+                                logger.warning(
+                                    f"Discovery resume skipped: population shape mismatch "
+                                    f"{tuple(cur_vals.shape)} vs {tuple(pop_vals.shape)}."
+                                )
                     except Exception as e:
                         logger.warning(f"Discovery resume population load failed: {e}")
                 pop_evals = ckpt.get("evaluations")
-                if pop_evals is not None and hasattr(searcher.population, "evaluations"):
-                    try:
-                        cur_evals = searcher.population.evaluations
-                        if cur_evals is not None and cur_evals.shape == pop_evals.shape:
-                            cur_evals.copy_(pop_evals.to(cur_evals.device, dtype=cur_evals.dtype))
-                    except Exception as e:
-                        logger.warning(f"Discovery resume evaluations load failed: {e}")
+                if pop_evals is not None:
+                    eval_attr = None
+                    for attr in ("evaluations", "evals"):
+                        if hasattr(searcher.population, attr):
+                            eval_attr = attr
+                            break
+                    if eval_attr is not None:
+                        try:
+                            cur_evals = getattr(searcher.population, eval_attr)
+                            if cur_evals is not None and cur_evals.shape == pop_evals.shape:
+                                cur_evals.copy_(pop_evals.to(cur_evals.device, dtype=cur_evals.dtype))
+                        except Exception as e:
+                            logger.warning(f"Discovery resume {eval_attr} load failed: {e}")
                 ckpt_gen = int(ckpt.get("gen", 0) or 0)
                 start_gen = max(0, ckpt_gen + 1)
                 resume_best = ckpt.get("best_eval", None)
@@ -748,11 +767,16 @@ class TensorDiscoveryEngine:
                     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
                     pop_vals = searcher.population.values.detach().cpu()
                     pop_evals = None
-                    if hasattr(searcher.population, "evaluations"):
-                        try:
-                            pop_evals = searcher.population.evaluations.detach().cpu()
-                        except Exception:
-                            pop_evals = None
+                    for attr in ("evaluations", "evals"):
+                        if hasattr(searcher.population, attr):
+                            try:
+                                cur = getattr(searcher.population, attr)
+                                if cur is not None:
+                                    pop_evals = cur.detach().cpu()
+                                break
+                            except Exception:
+                                pop_evals = None
+                                break
                     torch.save(
                         {
                             "gen": i,
@@ -768,7 +792,19 @@ class TensorDiscoveryEngine:
                     logger.warning(f"Discovery checkpoint failed: {e}")
         
         final_pop = searcher.population.values.detach().cpu()
-        final_scores = searcher.population.evaluations.detach().cpu()
+        final_scores = None
+        for attr in ("evaluations", "evals"):
+            if hasattr(searcher.population, attr):
+                try:
+                    cur = getattr(searcher.population, attr)
+                    if cur is not None:
+                        final_scores = cur.detach().cpu()
+                    break
+                except Exception:
+                    final_scores = None
+                    break
+        if final_scores is None:
+            final_scores = torch.zeros(final_pop.shape[0], dtype=torch.float32)
         self.best_experts = final_pop[torch.argsort(final_scores, descending=True)[:self.n_experts]]
         
     def save_experts(self, path: str): torch.save({"genomes": self.best_experts, "timeframes": self.timeframes, "n_features": self.n_features}, path)

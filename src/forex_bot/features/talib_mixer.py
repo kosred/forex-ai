@@ -1012,8 +1012,10 @@ class TALibStrategyMixer:
         # Parallelism is fine for computation speed, bottleneck is usually GIL for light ops
         # or pure CPU for heavy ops. Threading works for TA-Lib (C-ext).
 
-        env_workers = os.environ.get("FOREX_BOT_TALIB_WORKERS") or os.environ.get(
-            "FOREX_BOT_CPU_THREADS"
+        env_workers = (
+            os.environ.get("FOREX_BOT_TALIB_WORKERS")
+            or os.environ.get("FOREX_BOT_CPU_BUDGET")
+            or os.environ.get("FOREX_BOT_CPU_THREADS")
         )
         if env_workers:
             try:
