@@ -251,6 +251,13 @@ def ensure_dependencies() -> None:
     gpu_libs = []
     standard_libs = []
 
+    torch_missing = any(x in missing for x in ("torch", "torchvision", "torchaudio"))
+    if not torch_missing:
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            torch_missing = True
+
     # Prefer a pinned torch bundle to avoid pip solving/downloading multiple versions.
     torch_bundle = None
     if torch_missing:
@@ -267,12 +274,7 @@ def ensure_dependencies() -> None:
 
     post_torch_libs = []
     needs_torch = {"flash-attn", "transformer-engine"}
-    torch_missing = any(x in missing for x in ("torch", "torchvision", "torchaudio"))
-    if not torch_missing:
-        try:
-            import torch  # noqa: F401
-        except Exception:
-            torch_missing = True
+    # Defer packages that need torch if torch is missing right now.
     if torch_missing:
         for pkg in list(standard_libs):
             if pkg in needs_torch:
