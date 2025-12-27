@@ -1102,11 +1102,24 @@ class TrainingService:
 
         datasets: list[tuple[str, PreparedDataset]] = []
         datasets_loaded = False
+        # Optional dataset reuse to avoid re-running feature engineering
+        reuse_cache = str(os.environ.get("FOREX_BOT_HPC_DATASET_CACHE", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        # Allow DDP ranks to contribute to feature engineering.
+        distributed_features = is_ddp and str(
+            os.environ.get("FOREX_BOT_HPC_DDP_FEATURES", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        raw_frames_map: dict[str, dict[str, pd.DataFrame]] = {}
+        news_map: dict[str, pd.DataFrame | None] = {}
+        skip_rank0_heavy = False
 
         if rank == 0:
             # --- RANK 0: Heavy Lifting ---
             # Optional dataset reuse to avoid re-running feature engineering
-            reuse_cache = str(os.environ.get("FOREX_BOT_HPC_DATASET_CACHE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
             if reuse_cache and cache_path.exists():
                 try:
                     cached = joblib.load(cache_path)

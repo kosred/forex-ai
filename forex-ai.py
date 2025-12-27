@@ -192,8 +192,11 @@ if __name__ == "__main__":
                 print(f"[HPC] Relaunching with torch.distributed.run across {gpu_count} GPUs...", flush=True)
                 env = os.environ.copy()
                 env["FOREX_BOT_DDP_LAUNCHED"] = "1"
-                # OMP_NUM_THREADS=1 prevents CPU oversubscription in DDP
-                env["OMP_NUM_THREADS"] = "1" 
+                # Allow controlled CPU usage per rank (defaults to per-GPU threads)
+                env["OMP_NUM_THREADS"] = str(threads_per_worker)
+                env["MKL_NUM_THREADS"] = str(threads_per_worker)
+                env["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
+                env["NUMEXPR_NUM_THREADS"] = str(threads_per_worker)
                 
                 cmd = [
                     sys.executable,
