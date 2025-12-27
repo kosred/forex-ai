@@ -368,12 +368,18 @@ class TensorDiscoveryEngine:
                 logic_weights = genomes[:, tf_count : tf_count + self.n_features].to(dtype=matmul_dtype)
                 thresholds = genomes[:, -2:]
                 
-                # Selective trading balance (tunable bias to control activity)
+                # Selective trading balance (tunable bias/scale to control activity)
                 try:
-                    threshold_bias = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_BIAS", "0.5") or 0.5)
+                    threshold_bias = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_BIAS", "0.1") or 0.1)
                 except Exception:
-                    threshold_bias = 0.5
+                    threshold_bias = 0.1
                 threshold_bias = max(threshold_bias, 0.0)
+                try:
+                    threshold_scale = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_SCALE", "0.25") or 0.25)
+                except Exception:
+                    threshold_scale = 0.25
+                threshold_scale = max(threshold_scale, 1e-6)
+                thresholds = thresholds * threshold_scale
                 buy_th = torch.maximum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) + threshold_bias
                 sell_th = torch.minimum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) - threshold_bias
 
@@ -393,6 +399,12 @@ class TensorDiscoveryEngine:
                     tf_sig_2d = torch.matmul(data_2d, logic_weights.t().contiguous())
                     tf_sig = tf_sig_2d.view(tf_count, batch_len, local_pop).permute(2, 0, 1)
                     signals = (tf_sig * tf_weights.unsqueeze(2)).sum(dim=1)
+                    try:
+                        signal_scale = float(os.environ.get("FOREX_BOT_DISCOVERY_SIGNAL_SCALE", "2.0") or 2.0)
+                    except Exception:
+                        signal_scale = 2.0
+                    signal_scale = max(signal_scale, 1e-6)
+                    signals = signals * signal_scale
                     
                     actions = torch.where(signals > buy_th.unsqueeze(1), 1.0, 0.0)
                     actions = torch.where(signals < sell_th.unsqueeze(1), -1.0, actions)
@@ -553,12 +565,50 @@ class TensorDiscoveryEngine:
         genome_dim = self.n_features + len(self.timeframes) + 2
         problem = Problem("max", fitness_func, initial_bounds=(-1.0, 1.0), solution_length=genome_dim, device="cpu", vectorized=True)
         pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 12000))
-        searcher = CMAES(problem, popsize=pop_size, stdev_init=1.2)
-        
+        try:
+            stdev_init = float(os.environ.get("FOREX_BOT_DISCOVERY_CMAES_STDEV", "1.5") or 1.5)
+        except Exception:
+            stdev_init = 1.5
+        stdev_init = max(stdev_init, 0.1)
+        searcher = CMAES(problem, popsize=pop_size, stdev_init=stdev_init)
+
         logger.info(f"Starting COOPERATIVE 8-GPU Discovery (Pop: {pop_size})...")
+        try:
+            stagnation_gens = int(os.environ.get("FOREX_BOT_DISCOVERY_STAGNATION_GENS", "25") or 25)
+        except Exception:
+            stagnation_gens = 25
+        try:
+            stagnation_eps = float(os.environ.get("FOREX_BOT_DISCOVERY_STAGNATION_EPS", "1e-3") or 1e-3)
+        except Exception:
+            stagnation_eps = 1e-3
+        try:
+            mutation_boost = float(os.environ.get("FOREX_BOT_DISCOVERY_MUTATION_BOOST", "0.3") or 0.3)
+        except Exception:
+            mutation_boost = 0.3
+        stagnation_gens = max(stagnation_gens, 5)
+        mutation_boost = max(mutation_boost, 0.0)
+        best_seen = None
+        stagnant = 0
         for i in range(iterations):
             gen_context["val"] = i
             searcher.step()
+            current_best = float(searcher.status.get("best_eval", 0.0) or 0.0)
+            if best_seen is None or current_best > (best_seen + stagnation_eps):
+                best_seen = current_best
+                stagnant = 0
+            else:
+                stagnant += 1
+            if mutation_boost > 0.0 and stagnant >= stagnation_gens:
+                try:
+                    vals = searcher.population.values
+                    noise = torch.randn_like(vals) * mutation_boost
+                    vals.add_(noise).clamp_(-1.0, 1.0)
+                    logger.warning(
+                        f"Discovery: stagnation ({stagnant} gens). Applied mutation boost {mutation_boost:.3f}."
+                    )
+                except Exception as e:
+                    logger.warning(f"Discovery: mutation boost failed: {e}")
+                stagnant = 0
             with registry_lock:
                 m = metrics_registry.get(i)
                 if m: logger.info(f"Discovery (gen {i}): fit={m['fit']:.2f} surv={m['surv']:.2f} shrp={m['shrp']:.2f} dd={m['dd']:.2f} (lim={m['limit']:.3f}) segs={m['segs']}/3 trade={m['trade']:.3f}")
