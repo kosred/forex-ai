@@ -19,12 +19,13 @@ logger = logging.getLogger(__name__)
 class TensorDiscoveryEngine:
     """
     2025-Grade GPU Discovery Engine.
-    Cooperative Multi-GPU Architecture with True Auto-Tuning. 
+    Cooperative Multi-GPU Architecture with True Auto-Tuning.
     
     Features:
     - Parallel Data Alignment (utilizing all CPU cores)
     - FP16 Optimization (50% RAM reduction)
     - Dynamic OOM Recovery (Auto-scales batch size on crash)
+    - Robust Statistics (Clamped Sharpe to prevent anomalies)
     """
     
     def __init__(
@@ -127,7 +128,7 @@ class TensorDiscoveryEngine:
             self.timeframes = list(frames.keys())
 
         # --- PARALLEL ALIGNMENT ---
-        # Use all available cores by default (override with FOREX_BOT_DISCOVERY_ALIGN_WORKERS).
+        # Use all available cores by default
         try:
             cpu_workers = int(os.environ.get("FOREX_BOT_DISCOVERY_ALIGN_WORKERS", "0") or 0)
         except Exception:
@@ -151,21 +152,17 @@ class TensorDiscoveryEngine:
         def _process_frame(tf_name):
             try:
                 # Forward-fill to avoid look-ahead
-                raw = frames[tf_name].reindex(master_idx).ffill()
-
-                # Features: fill remaining NaNs with 0 (safe for indicators)
-                feat_df = raw.fillna(0.0)
-                feats = feat_df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+                df = frames[tf_name].reindex(master_idx).ffill().fillna(0.0)
+                
+                # Extract numeric features
+                feats = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
                 f_std = np.maximum(feats.std(axis=0), 1e-6)
                 norm = (feats - feats.mean(axis=0)) / f_std
-
+                
                 # OPTIMIZATION: Convert to Float16 immediately to save RAM
                 norm_fp16 = norm.astype(np.float16)
                 ohlc_dtype = np.float16 if self.full_fp16 else np.float32
-                # OHLC: avoid zero-filled gaps by using ffill+bfill
-                ohlc_df = raw[['open', 'high', 'low', 'close']].copy()
-                ohlc_df = ohlc_df.ffill().bfill()
-                ohlc_arr = ohlc_df.to_numpy(dtype=ohlc_dtype)
+                ohlc_arr = df[['open', 'high', 'low', 'close']].to_numpy(dtype=ohlc_dtype)
 
                 return tf_name, torch.from_numpy(norm_fp16), torch.from_numpy(ohlc_arr)
             except Exception as e:
@@ -363,7 +360,7 @@ class TensorDiscoveryEngine:
                         try:
                             batch_start = int(env_batch_start)
                         except Exception:
-                            batch_start = 10000
+                            batch_start = 5000 # SAFER DEFAULT to prevent Kill
                     else:
                         if is_cuda:
                             try:
@@ -377,10 +374,11 @@ class TensorDiscoveryEngine:
                             per_batch = elem_size * (
                                 pop_sub * (tf_count * 2 + 4) + tf_count * (self.n_features + 4)
                             )
-                            target = int(total_mem * (0.35 if self.full_fp16 else 0.25))
+                            # Reduced target ratio for safety
+                            target = int(total_mem * (0.25 if self.full_fp16 else 0.18))
                             batch_start = int(target / max(1, per_batch))
                         else:
-                            batch_start = 10000
+                            batch_start = 5000
 
                     # Clamp to safe bounds
                     batch_start = max(1024, min(int(batch_start), 65536))
@@ -569,11 +567,20 @@ class TensorDiscoveryEngine:
 
                 # Finalize
                 if effective_samples <= 1:
-                    return torch.full((local_pop,), -1e9, device=dev, dtype=torch.float32)
+                    return torch.full((local_pop,), 0.0, device=dev, dtype=torch.float32)
                 mean_ret = (sum_ret / effective_samples).to(dtype=torch.float32)
                 var = (sum_sq_ret / effective_samples).to(dtype=torch.float32) - mean_ret**2
                 std_ret = torch.sqrt(torch.clamp(var, min=1e-9)) + 1e-6
-                sharpe = (mean_ret / std_ret) * (252 * 1440)**0.5
+                
+                # --- STATISTICAL SAFEGUARDS ---
+                # Clamp volatility to prevent "infinite" Sharpe on flat lines
+                # Minimum annualized volatility of 1% (~0.00004 per minute)
+                min_vol = 0.00004
+                safe_std = torch.maximum(std_ret, torch.tensor(min_vol, device=dev, dtype=torch.float32))
+                
+                sharpe = (mean_ret / safe_std) * (252 * 1440)**0.5
+                
+                # Additional Clamp: Real-world strategies almost never exceed Sharpe 20.0
                 if sharpe_cap > 0:
                     sharpe = torch.clamp(sharpe, min=-sharpe_cap, max=sharpe_cap)
 
@@ -613,7 +620,7 @@ class TensorDiscoveryEngine:
                                 )
                                 invalid_logged.add(gpu_idx)
                 # Guard against NaN/Inf so CMA-ES doesn't crash
-                fitness = torch.nan_to_num(fitness, nan=-1e9, posinf=-1e9, neginf=-1e9)
+                fitness = torch.nan_to_num(fitness, nan=0.0, posinf=0.0, neginf=0.0)
                 
                 # Check metrics for debug
                 if debug_lock is not None:
