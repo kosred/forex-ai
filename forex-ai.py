@@ -20,6 +20,15 @@ from pathlib import Path
 def _is_truthy(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
+def _get_ddp_rank() -> int | None:
+    value = os.environ.get("LOCAL_RANK")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
 
 def _ensure_global_python() -> None:
     """Enforce global Python (no venv/conda) to avoid stale env junk."""
@@ -94,6 +103,13 @@ if sys.platform.startswith("linux"):
             os.environ["LD_LIBRARY_PATH"] = f"{cuda_lib}:{current_ld}"
 
 if __name__ == "__main__":
+    ddp_rank = _get_ddp_rank()
+    is_ddp_worker = os.environ.get("FOREX_BOT_DDP_LAUNCHED") == "1" and ddp_rank is not None
+    is_rank0 = (not is_ddp_worker) or (ddp_rank == 0)
+    if not is_rank0:
+        # Avoid repeated bootstrap work and noisy logs on non-zero ranks.
+        os.environ.setdefault("FOREX_BOT_SKIP_DEPS", "1")
+
     if "--_worker" in sys.argv[1:]:
         import logging
 
@@ -104,34 +120,36 @@ if __name__ == "__main__":
 
         sys.exit(run_worker(worker_argv))
 
-    print("=" * 60)
-    try:
-        print("?? FOREX AI TRADING BOT (Universal Launcher)")
-    except UnicodeEncodeError:
-        print("FOREX AI TRADING BOT (Universal Launcher)")
-    print("=" * 60)
+    if is_rank0:
+        print("=" * 60)
+        try:
+            print("?? FOREX AI TRADING BOT (Universal Launcher)")
+        except UnicodeEncodeError:
+            print("FOREX AI TRADING BOT (Universal Launcher)")
+        print("=" * 60)
 
     # --- 3. Dependency Check ---
-    try:
-        if os.environ.get("FOREX_BOT_SKIP_DEPS", "0") != "1":
-            print("[INIT] Checking and auto-installing dependencies (Global Mode)...", flush=True)
-            from forex_bot.core.deps import ensure_dependencies
+    if is_rank0:
+        try:
+            if os.environ.get("FOREX_BOT_SKIP_DEPS", "0") != "1":
+                print("[INIT] Checking and auto-installing dependencies (Global Mode)...", flush=True)
+                from forex_bot.core.deps import ensure_dependencies
 
-            ensure_dependencies()
-            
-            # 2025 SMART LINKING: Force user-level editable install.
-            # This ensures that even in global mode, the 'forex_bot' name 
-            # points directly to our local /src directory.
-            print("[INIT] Syncing global environment with local source code...", flush=True)
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--no-deps", "-e", "."], cwd=SCRIPT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                print("[INIT] Global environment synced (pip install --user -e .).")
-            except Exception as e:
-                print(f"[WARN] Local link failed (non-critical): {e}")
-        else:
-            print("[INIT] Skipping dependency bootstrap (FOREX_BOT_SKIP_DEPS=1).", flush=True)
-    except Exception as dep_err:
-        print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
+                ensure_dependencies()
+
+                # 2025 SMART LINKING: Force user-level editable install.
+                # This ensures that even in global mode, the 'forex_bot' name 
+                # points directly to our local /src directory.
+                print("[INIT] Syncing global environment with local source code...", flush=True)
+                try:
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--no-deps", "-e", "."], cwd=SCRIPT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print("[INIT] Global environment synced (pip install --user -e .).")
+                except Exception as e:
+                    print(f"[WARN] Local link failed (non-critical): {e}")
+            else:
+                print("[INIT] Skipping dependency bootstrap (FOREX_BOT_SKIP_DEPS=1).", flush=True)
+        except Exception as dep_err:
+            print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
 
     # --- 4. Hardware Detection & DDP Launch ---
     try:
@@ -140,7 +158,8 @@ if __name__ == "__main__":
             gpu_count = torch.cuda.device_count()
             cpu_cores = os.cpu_count() or 1
             
-            print(f"[INIT] Detected {gpu_count} GPUs. Tuning for performance...")
+            if is_rank0:
+                print(f"[INIT] Detected {gpu_count} GPUs. Tuning for performance...")
             
             # Use all visible GPUs unless user overrides.
             os.environ.setdefault("FOREX_BOT_MAX_GPUS", str(gpu_count))
@@ -189,10 +208,11 @@ if __name__ == "__main__":
     if "--train" in sys.argv: mode_desc = "TRAINING (Forced)"
     if "--run" in sys.argv: mode_desc = "LIVE TRADING (Forced)"
     
-    print(f"Mode: {mode_desc}")
-    print(f"Working Directory: {os.getcwd()}")
-    print(f"Python: {sys.version.split()[0]}")
-    print("=" * 60)
+    if is_rank0:
+        print(f"Mode: {mode_desc}")
+        print(f"Working Directory: {os.getcwd()}")
+        print(f"Python: {sys.version.split()[0]}")
+        print("=" * 60)
 
     try:
         main()
