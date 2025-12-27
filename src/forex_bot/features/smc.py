@@ -74,8 +74,49 @@ if NUMBA_AVAILABLE:
         # Pre-calculate pivots in parallel (using all 252 cores)
         is_high, is_low = _find_pivots_parallel(h, l, lookback)
         
-        # ... (Sequential state-dependent logic like BOS/CHOCH remains, but is now much faster)
-        # because the expensive pivot search is already done.
+        fvg = np.zeros(n, dtype=np.int8)
+        sweep = np.zeros(n, dtype=np.int8)
+        ob = np.zeros(n, dtype=np.int8)
+        bos = np.zeros(n, dtype=np.int8)
+        choch = np.zeros(n, dtype=np.int8)
+        trend_arr = np.zeros(n, dtype=np.int8)
+        dist_liq = np.zeros(n, dtype=np.float32)
+        dist_fvg = np.zeros(n, dtype=np.float32)
+        premium_discount = np.zeros(n, dtype=np.int8)
+        inducement = np.zeros(n, dtype=np.int8)
+
+        trend = 0
+        last_high_idx = -1
+        last_low_idx = -1
+        last_bullish_fvg_idx = -1
+        last_bearish_fvg_idx = -1
+        
+        recent_highs = np.full(10, -1, dtype=np.int32)
+        recent_lows = np.full(10, -1, dtype=np.int32)
+
+        for i in range(lookback, n):
+            # Update Pivots
+            if is_high[i - lookback]:
+                last_high_idx = i - lookback
+                for k in range(9, 0, -1): recent_highs[k] = recent_highs[k-1]
+                recent_highs[0] = last_high_idx
+            if is_low[i - lookback]:
+                last_low_idx = i - lookback
+                for k in range(9, 0, -1): recent_lows[k] = recent_lows[k-1]
+                recent_lows[0] = last_low_idx
+
+            # FVG Detection
+            if i >= 2:
+                body = abs(c[i-1] - o[i-1])
+                rng = h[i-1] - l[i-1]
+                displacement_ok = body > atr_displacement * max(atr[i-1], 1e-6)
+                
+                if (l[i] > h[i-2]) and (c[i-1] > o[i-1]) and body > 0.5 * rng and displacement_ok:
+                    fvg[i] = 1
+                    last_bullish_fvg_idx = i
+                elif (h[i] < l[i-2]) and (c[i-1] < o[i-1]) and body > 0.5 * rng and displacement_ok:
+                    fvg[i] = -1
+                    last_bearish_fvg_idx = i
 
             if last_low_idx != -1 and last_low_idx < i - lookback:
                 prev_low = l[last_low_idx]
