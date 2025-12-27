@@ -142,7 +142,7 @@ class RiskManager:
                 if sys.platform != "win32":
                     fcntl.flock(f, fcntl.LOCK_UN)
         except Exception as e:
-            # ...
+            logger.error(f"Failed to save risk state: {e}")
 
     def load_state(self) -> None:
         if not self.state_file.exists():
