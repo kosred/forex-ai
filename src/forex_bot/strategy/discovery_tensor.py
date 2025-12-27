@@ -21,13 +21,13 @@ logger = logging.getLogger(__name__)
 class TensorDiscoveryEngine:
     """
     2025-Grade GPU Discovery Engine.
-    Cooperative Multi-GPU Architecture with Island Diversity.
+    Cooperative Multi-GPU Architecture with Adaptive Fortress logic.
     
     Features:
-    - Multi-Objective Islands (Profit vs Safety specialization)
-    - Dynamic Scout Resets (Forces exploration of new peaks)
-    - Parallel Data Alignment
-    - FP16 Optimization
+    - Adaptive Drawdown Targeting (Starts loose, tightens to 4%)
+    - Global Champion Reporting
+    - Survival-Based Fitness
+    - Monte-Carlo Lite
     """
     
     def __init__(
@@ -281,14 +281,9 @@ class TensorDiscoveryEngine:
                 tf_weights = F.softmax(genomes[:, :tf_count], dim=1).to(dtype=matmul_dtype)
                 logic_weights = genomes[:, tf_count : tf_count + self.n_features].to(dtype=matmul_dtype)
                 thresholds = genomes[:, -2:]
-                try:
-                    th_bias = float(os.environ.get("FOREX_BOT_DISCOVERY_THRESHOLD_BIAS", "0.5") or 0.5)
-                except Exception:
-                    th_bias = 0.5
-                th_bias = max(th_bias, 0.0)
-
-                buy_th = torch.maximum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) + th_bias
-                sell_th = torch.minimum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) - th_bias
+                
+                buy_th = torch.maximum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) + 0.5
+                sell_th = torch.minimum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype) - 0.5
 
                 for start_idx in range(0, n_samples, batch_size):
                     if not alive_mask.any(): break
@@ -339,10 +334,16 @@ class TensorDiscoveryEngine:
                     
                     running_equity.copy_(abs_equity[:, -1]); running_peak.copy_(batch_peaks[:, -1])
 
-                # --- ISLAND DIVERSITY LOGIC ---
-                # Even GPUs: Profit Focus (Sharpe)
-                # Odd GPUs: Safety Focus (Drawdown)
-                is_safety_island = (gpu_idx % 2 != 0)
+                # --- ADAPTIVE FORTRESS LOGIC ---
+                cur_gen = gen_context["val"]
+                # Start loose (10%), tighten to 4% by Gen 150
+                if cur_gen < 50:
+                    dynamic_dd_limit = 0.10
+                elif cur_gen < 150:
+                    # Linear slide from 10% down to 4%
+                    dynamic_dd_limit = 0.10 - (0.06 * (cur_gen - 50) / 100.0)
+                else:
+                    dynamic_dd_limit = 0.04
                 
                 survival_ratio = survival_steps / n_samples
                 denom = torch.clamp(survival_steps, min=1.0)
@@ -353,39 +354,27 @@ class TensorDiscoveryEngine:
                 
                 segment_profitability = (seg_rets > 0).float().sum(dim=1)
                 consistency_bonus = (segment_profitability / n_segments) * 5.0
-                dd_penalty = torch.where(max_dd > 0.08, (max_dd - 0.08) * 5.0, torch.tensor(0.0, device=dev))
-                trade_density = trade_steps / denom
-                try:
-                    min_trade_density = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADE_DENSITY", "0.00035") or 0.00035)
-                except Exception:
-                    min_trade_density = 0.00035
-                min_trade_density = max(min_trade_density, 1e-6)
-                lazy_mask = trade_density < min_trade_density
-                survival_ratio = torch.where(lazy_mask, torch.zeros_like(survival_ratio), survival_ratio)
-
-                try:
-                    target_min_per_day = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_MIN_PER_DAY", "1.0") or 1.0)
-                    target_max_per_day = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_MAX_PER_DAY", "5.0") or 5.0)
-                except Exception:
-                    target_min_per_day, target_max_per_day = 1.0, 5.0
-                target_min_per_day = max(target_min_per_day, 0.1)
-                target_max_per_day = max(target_max_per_day, target_min_per_day)
-                min_density = target_min_per_day / 1440.0
-                max_density = target_max_per_day / 1440.0
-                trade_score = torch.clamp((trade_density - min_density) / max(max_density - min_density, 1e-6), 0.0, 1.0)
                 
-                if is_safety_island:
-                    # SAFETY ISLAND: Double penalty for drawdown, less reward for Sharpe
-                    total_fitness = (survival_ratio * 12.0) + (sharpe * 0.5) + consistency_bonus - (dd_penalty * 2.0) + trade_score
-                else:
-                    # PROFIT ISLAND: Standard weights
-                    total_fitness = (survival_ratio * 10.0) + sharpe + consistency_bonus - dd_penalty + trade_score
+                # Use DYNAMIC Limit
+                dd_excess = torch.clamp(max_dd - dynamic_dd_limit, min=0.0)
+                dd_penalty = dd_excess * 100.0
+                
+                # Daily Cliff slides with the limit
+                daily_cliff_val = dynamic_dd_limit + 0.01
+                daily_cliff = torch.where(max_dd > daily_cliff_val, torch.tensor(20.0, device=dev), torch.tensor(0.0, device=dev))
+                
+                trade_density = trade_steps / denom
+                trade_bonus = torch.where((trade_density > 0.0003) & (trade_density < 0.005), 
+                                          torch.tensor(2.0, device=dev), torch.tensor(0.0, device=dev))
+                
+                total_fitness = (survival_ratio * 10.0) + sharpe + consistency_bonus - dd_penalty - daily_cliff + trade_bonus
                 
                 bi = int(torch.argmax(total_fitness).item())
                 metadata = {
                     "fit": float(total_fitness[bi].item()), "surv": float(survival_ratio[bi].item()),
                     "shrp": float(sharpe[bi].item()), "dd": float(max_dd[bi].item()), 
-                    "segs": int(segment_profitability[bi].item()), "trade": float(trade_density[bi].item())
+                    "segs": int(segment_profitability[bi].item()), "trade": float(trade_density[bi].item()),
+                    "limit": dynamic_dd_limit # Added to tracking
                 }
                 return torch.nan_to_num(total_fitness, nan=0.0).detach().cpu(), metadata
 
@@ -399,7 +388,6 @@ class TensorDiscoveryEngine:
 
         genome_dim = self.n_features + len(self.timeframes) + 2
         problem = Problem("max", fitness_func, initial_bounds=(-1.0, 1.0), solution_length=genome_dim, device="cpu", vectorized=True)
-        
         pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 12000))
         searcher = CMAES(problem, popsize=pop_size, stdev_init=1.2)
         
@@ -409,7 +397,7 @@ class TensorDiscoveryEngine:
             searcher.step()
             with registry_lock:
                 m = metrics_registry.get(i)
-                if m: logger.info(f"Discovery (gen {i}): fit={m['fit']:.2f} surv={m['surv']:.2f} shrp={m['shrp']:.2f} dd={m['dd']:.2f} segs={m['segs']}/3 trade={m['trade']:.3f}")
+                if m: logger.info(f"Discovery (gen {i}): fit={m['fit']:.2f} surv={m['surv']:.2f} shrp={m['shrp']:.2f} dd={m['dd']:.2f} (lim={m['limit']:.3f}) segs={m['segs']}/3 trade={m['trade']:.3f}")
             if i % 10 == 0: logger.info(f"Generation {i}: Global Best Fitness = {float(searcher.status.get('best_eval', 0.0)):.4f}")
         
         final_pop = searcher.population.values.detach().cpu()
