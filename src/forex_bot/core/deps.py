@@ -438,21 +438,38 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
         # Disable hash enforcement if set globally; we don't use pinned hashes here.
         env.setdefault("PIP_REQUIRE_HASHES", "0")
         env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        try:
-            result = subprocess.run(
-                cmd + final_pkgs,
-                check=True,
+        env.setdefault("PIP_NO_INPUT", "1")
+        env.setdefault("PIP_PROGRESS_BAR", "on")
+
+        def _run_pip(cmdline: list[str]) -> str:
+            output_lines: list[str] = []
+            proc = subprocess.Popen(
+                cmdline,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 env=env,
             )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                # Stream pip output so installs don't appear "stuck".
+                print(line, end="", flush=True)
+                output_lines.append(line)
+                if len(output_lines) > 2000:
+                    output_lines = output_lines[-2000:]
+            rc = proc.wait()
+            if rc != 0:
+                raise subprocess.CalledProcessError(rc, cmdline, output="".join(output_lines))
+            return "".join(output_lines)
+
+        try:
+            _run_pip(cmd + final_pkgs)
         except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "")
-            if "--break-system-packages" in cmd and "no such option: --break-system-packages" in stderr:
+            output = getattr(exc, "output", "") or ""
+            if "--break-system-packages" in cmd and "no such option: --break-system-packages" in output:
                 logger.warning("pip does not support --break-system-packages; retrying without it.")
                 cmd_no_break = [c for c in cmd if c != "--break-system-packages"]
-                subprocess.check_call(cmd_no_break + final_pkgs, env=env)
+                _run_pip(cmd_no_break + final_pkgs)
             else:
                 raise
     if flash_build:
@@ -461,7 +478,21 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
         env = os.environ.copy()
         env.setdefault("PIP_REQUIRE_HASHES", "0")
         env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        subprocess.check_call(build_cmd + flash_build, env=env)
+        env.setdefault("PIP_NO_INPUT", "1")
+        env.setdefault("PIP_PROGRESS_BAR", "on")
+        proc = subprocess.Popen(
+            build_cmd + flash_build,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+        rc = proc.wait()
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, build_cmd + flash_build)
 
 
 def _flash_attn_wheel_url() -> str | None:
