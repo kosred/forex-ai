@@ -449,9 +449,19 @@ class AutoTuner:
         if os.environ.get("FOREX_BOT_FEATURE_WORKERS") or os.environ.get("FEATURE_WORKERS"):
             return
         target = max(1, int(getattr(hints, "feature_workers", 1) or 1))
+        # If feature engineering is CPU-only, prefer "all cores minus one" for stability.
+        try:
+            force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        except Exception:
+            force_cpu = True
+        if force_cpu:
+            cpu_cores = max(1, int(getattr(self.profile, "cpu_cores", 1) or 1))
+            target = max(1, cpu_cores - 1)
         try:
             num_gpus = max(0, int(getattr(hints, "num_gpus", 0) or 0))
-            if num_gpus > 0:
+            if num_gpus > 0 and not force_cpu:
                 # Default to one worker per GPU to avoid OOM in feature-engineering workers.
                 target = min(target, max(1, num_gpus))
         except Exception:
