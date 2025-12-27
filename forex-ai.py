@@ -167,9 +167,17 @@ if __name__ == "__main__":
             os.environ.setdefault("SYSTEM__ENABLE_GPU_PREFERENCE", "auto")
             os.environ.setdefault("FOREX_BOT_TREE_DEVICE", "auto")
             
-            # Cap threads per worker to avoid CPU thrash
-            threads_per_worker = max(2, min(16, cpu_cores // max(1, gpu_count)))
+            # Cap threads per worker to avoid CPU thrash (allow higher HPC defaults)
+            try:
+                per_gpu_threads = int(os.environ.get("FOREX_BOT_CPU_THREADS_PER_GPU", "20") or 20)
+            except Exception:
+                per_gpu_threads = 20
+            per_gpu_threads = max(1, per_gpu_threads)
+            threads_per_worker = max(2, min(per_gpu_threads, cpu_cores // max(1, gpu_count)))
             os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(threads_per_worker))
+            # Total CPU budget for parallel workers (e.g., 20 cores per GPU)
+            cpu_budget = min(cpu_cores, threads_per_worker * max(1, gpu_count))
+            os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
             
             # Feature workers are auto-tuned later in core.system.AutoTuner.
 

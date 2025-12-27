@@ -1012,7 +1012,23 @@ class TALibStrategyMixer:
         # Parallelism is fine for computation speed, bottleneck is usually GIL for light ops
         # or pure CPU for heavy ops. Threading works for TA-Lib (C-ext).
 
-        max_workers = min(32, (os.cpu_count() or 1) * 2)
+        env_workers = os.environ.get("FOREX_BOT_TALIB_WORKERS") or os.environ.get(
+            "FOREX_BOT_CPU_THREADS"
+        )
+        if env_workers:
+            try:
+                max_workers = max(1, int(env_workers))
+            except Exception:
+                max_workers = min(32, (os.cpu_count() or 1) * 2)
+        else:
+            try:
+                cpu_budget = int(os.environ.get("FOREX_BOT_CPU_BUDGET", "0") or 0)
+            except Exception:
+                cpu_budget = 0
+            if cpu_budget > 0:
+                max_workers = max(1, min(cpu_budget, os.cpu_count() or 1))
+            else:
+                max_workers = min(32, (os.cpu_count() or 1) * 2)
         if mem.percent > 85:
             max_workers = max(1, max_workers // 2)
             logger.warning(f"High RAM ({mem.percent}%), throttling indicator calc to {max_workers} workers.")
