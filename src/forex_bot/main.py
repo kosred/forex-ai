@@ -570,26 +570,6 @@ async def main_async():
     if getattr(args, "features_device", None):
         os.environ["FOREX_BOT_FEATURES_DEVICE"] = str(args.features_device)
 
-    # Optional deep purge before training to prevent stale artifacts.
-    try:
-        deep_mode = getattr(args, "deep_purge", None) or getattr(
-            base_settings.system, "deep_purge_mode", "off"
-        )
-        deep_mode = str(deep_mode or "off").strip().lower()
-        if deep_mode not in {"off", "cache", "all"}:
-            deep_mode = "off"
-        deep_on_train = bool(getattr(base_settings.system, "deep_purge_on_train", True))
-        will_train = bool(getattr(args, "train", False)) or (
-            not getattr(args, "run", False) and not _global_models_exist()
-        )
-        if deep_mode != "off" and (not deep_on_train or will_train):
-            import clean_artifacts as cleaner
-
-            logger.info(f"[CLEAN] Deep purge requested (mode={deep_mode})...")
-            cleaner.deep_purge(mode=deep_mode)
-    except Exception as exc:
-        logger.warning(f"Deep purge failed: {exc}", exc_info=True)
-
     # Hardware auto-tune (single source of truth).
     try:
         from forex_bot.core.system import AutoTuner, HardwareProbe
