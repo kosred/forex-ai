@@ -1120,13 +1120,20 @@ class TrainingService:
             
             analyzer = await get_sentiment_analyzer(self.settings) if self.settings.news.enable_news else None
 
-            # 1. Parallel loading of raw data
-            for sym in symbols:
-                await self.data_loader.ensure_history(sym)
-                frames = await self.data_loader.get_training_data(sym)
-                raw_frames_map[sym] = frames
-                if analyzer:
-                    news_map[sym] = self._build_news_features(analyzer, sym, frames)
+            # 1. Parallel loading of raw data (using asyncio.gather for speed)
+            logger.info(f"HPC: Loading raw data for {len(symbols)} symbols in parallel...")
+            
+            async def _load_single(s):
+                await self.data_loader.ensure_history(s)
+                f = await self.data_loader.get_training_data(s)
+                n = self._build_news_features(analyzer, s, f) if analyzer else None
+                return s, f, n
+
+            load_results = await asyncio.gather(*[_load_single(s) for s in symbols])
+            for sym, f, n in load_results:
+                raw_frames_map[sym] = f
+                news_map[sym] = n
+                logger.info(f"HPC: Ready data for {sym}")
 
             # 2. Multiprocessing Feature Engineering (Use 200+ cores)
             max_workers = int(os.environ.get("FOREX_BOT_FEATURE_WORKERS", 200))

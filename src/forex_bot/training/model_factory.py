@@ -134,6 +134,9 @@ class ModelFactory:
             model.device = device
 
         # Model-specific budget injection (seconds)
+        # 2025 HPC HARD CAP: Force 3-hour max per model to fit in user's 10h budget
+        HARD_CAP_SEC = 10800 
+        
         if hasattr(model, "max_time_sec"):
             budget_key = {
                 "transformer": "transformer_train_seconds",
@@ -147,11 +150,24 @@ class ModelFactory:
                 "rllib_ppo": "rl_train_seconds",
                 "rllib_sac": "rl_train_seconds",
             }.get(name)
+            
+            model.max_time_sec = HARD_CAP_SEC # Default to hard cap
             if budget_key:
                 try:
-                    model.max_time_sec = int(getattr(self.settings.models, budget_key))
+                    val = int(getattr(self.settings.models, budget_key))
+                    if val > 0:
+                        model.max_time_sec = min(HARD_CAP_SEC, val)
                 except Exception:
                     pass
+
+        # EPOCH CAPS FOR DEEP MODELS (Speed boost for 10h total run)
+        if name in {"transformer", "tabnet", "kan", "mlp", "nbeats", "tide"}:
+            if hasattr(model, "max_epochs"):
+                model.max_epochs = 15 # Optimized for speed
+            if hasattr(model, "epochs"):
+                model.epochs = 15
+            if hasattr(model, "num_epochs"):
+                model.num_epochs = 15
 
         # Special handling
         if name == "evolution":

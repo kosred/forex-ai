@@ -19,32 +19,36 @@ from evotorch.algorithms import CMAES
 logger = logging.getLogger(__name__)
 
 
-def _discovery_cpu_budget() -> int:
-    """Best-effort CPU budget per rank/process for discovery prep."""
-    local_rank = os.environ.get("LOCAL_RANK")
-    per_gpu = os.environ.get("FOREX_BOT_CPU_THREADS_PER_GPU")
-    if local_rank is not None:
-        if per_gpu:
-            try:
-                return max(1, int(per_gpu))
-            except Exception:
-                pass
-        for key in ("FOREX_BOT_CPU_BUDGET", "FOREX_BOT_CPU_THREADS"):
-            val = os.environ.get(key)
-            if val:
-                try:
-                    return max(1, int(val))
-                except Exception:
-                    pass
-        return 20
-    for key in ("FOREX_BOT_CPU_BUDGET", "FOREX_BOT_CPU_THREADS"):
-        val = os.environ.get(key)
-        if val:
-            try:
-                return max(1, int(val))
-            except Exception:
-                pass
-    return os.cpu_count() or 1
+
+def _align_worker_static(tf_name, df, master_idx, full_fp16):
+
+    """Static worker for ProcessPoolExecutor to avoid GIL bottlenecks."""
+
+    try:
+
+        raw = df.reindex(master_idx).ffill()
+
+        feat_df = raw.fillna(0.0)
+
+        feats = feat_df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+
+        f_std = np.maximum(feats.std(axis=0), 1e-6)
+
+        norm = (feats - feats.mean(axis=0)) / f_std
+
+        norm_fp16 = norm.astype(np.float16)
+
+        ohlc_dtype = np.float16 if full_fp16 else np.float32
+
+        ohlc_arr = raw[['open', 'high', 'low', 'close']].ffill().bfill().to_numpy(dtype=ohlc_dtype)
+
+        return tf_name, torch.from_numpy(norm_fp16), torch.from_numpy(ohlc_arr)
+
+    except Exception as e:
+
+        return None
+
+
 
 class TensorDiscoveryEngine:
     """
@@ -184,38 +188,20 @@ class TensorDiscoveryEngine:
                 bar_changes.append(torch.zeros(len(master_idx), dtype=torch.float32))
         self.bar_change_cpu = torch.stack(bar_changes) if bar_changes else None
 
-        try:
-            cpu_workers = int(os.environ.get("FOREX_BOT_DISCOVERY_ALIGN_WORKERS", "0") or 0)
-        except Exception:
-            cpu_workers = 0
-        if cpu_workers <= 0:
-            cpu_workers = _discovery_cpu_budget()
-        logger.info(f"Using {cpu_workers} concurrent threads for data alignment.")
+        # --- PARALLEL ALIGNMENT (252-CORE BLITZ) ---
+        cpu_workers = min(252, os.cpu_count() or 1)
+        logger.info(f"Using {cpu_workers} processes for high-speed data alignment.")
         
-        full_fp16_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_FULL_FP16", "auto") or "auto").strip().lower()
-        self.full_fp16 = full_fp16_mode in {"1", "true", "yes", "on"} or (full_fp16_mode == "auto" and torch.cuda.is_available())
-
         results = {}
-        def _process_frame(tf_name):
-            try:
-                raw = frames[tf_name].reindex(master_idx).ffill()
-                feat_df = raw.fillna(0.0)
-                feats = feat_df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
-                f_std = np.maximum(feats.std(axis=0), 1e-6)
-                norm = (feats - feats.mean(axis=0)) / f_std
-                norm_fp16 = norm.astype(np.float16)
-                ohlc_dtype = np.float16 if self.full_fp16 else np.float32
-                ohlc_arr = raw[['open', 'high', 'low', 'close']].ffill().bfill().to_numpy(dtype=ohlc_dtype)
-                return tf_name, torch.from_numpy(norm_fp16), torch.from_numpy(ohlc_arr)
-            except Exception as e:
-                logger.error(f"Error processing {tf_name}: {e}")
-                return None
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_workers) as executor:
-            future_to_tf = {executor.submit(_process_frame, tf): tf for tf in self.timeframes}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=cpu_workers) as executor:
+            future_to_tf = {
+                executor.submit(_align_worker_static, tf, frames[tf], master_idx, self.full_fp16): tf 
+                for tf in self.timeframes if tf in frames
+            }
             for future in concurrent.futures.as_completed(future_to_tf):
                 res = future.result()
-                if res: results[res[0]] = (res[1], res[2])
+                if res:
+                    results[res[0]] = (res[1], res[2])
 
         cube_list, ohlc_list = [], []
         for tf in self.timeframes:
