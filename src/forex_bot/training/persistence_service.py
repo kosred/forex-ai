@@ -115,37 +115,39 @@ class PersistenceService:
             return {}, None
 
         prefer_gpu = self._prefer_gpu()
-        for name in active:
-            candidates: list[type[ExpertModel]] = []
+        
+        import concurrent.futures
+        
+        def _load_single(name):
+            candidates = []
             try:
                 candidates.append(get_model_class(name, prefer_gpu=prefer_gpu))
-            except Exception:
-                candidates = []
+            except Exception: pass
             try:
                 candidates.append(get_model_class(name, prefer_gpu=not prefer_gpu))
-            except Exception:
-                pass
-
-            # De-duplicate while preserving order.
-            unique: list[type[ExpertModel]] = []
+            except Exception: pass
+            
+            unique_classes = []
             for cls in candidates:
-                if cls not in unique:
-                    unique.append(cls)
-
-            last_exc: Exception | None = None
-            loaded = False
-            for cls in unique:
+                if cls not in unique_classes: unique_classes.append(cls)
+                
+            for cls in unique_classes:
                 try:
-                    model = cls()
-                    model.load(str(self.models_dir))
-                    models[name] = model
-                    loaded = True
-                    break
-                except Exception as exc:
-                    last_exc = exc
+                    m = cls()
+                    m.load(str(self.models_dir))
+                    return name, m
+                except Exception: continue
+            return name, None
 
-            if not loaded:
-                logger.warning(f"Failed to load {name}: {last_exc}")
+        # HPC: Load all models in parallel threads
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(active), 32)) as executor:
+            results = list(executor.map(_load_single, active))
+            
+        for name, model in results:
+            if model:
+                models[name] = model
+            else:
+                logger.warning(f"Failed to load {name}")
 
         try:
             blender = MetaBlender.load(self.models_dir / "meta_blender.joblib")

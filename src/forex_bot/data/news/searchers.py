@@ -63,12 +63,13 @@ class PerplexitySearcher:
             },
         ]
         candidates = [self.model]
+        # HPC FIX: Prioritize 2025 high-quality reasoning models
         fallback_models = [
-            "sonar",
+            "sonar-reasoning-pro",
             "sonar-pro",
             "sonar-reasoning",
-            "sonar-reasoning-pro",
-            "sonar-deep-research",
+            "sonar",
+            "pplx-70b-online", # Legacy fallback
         ]
         for m in fallback_models:
             if m not in candidates:

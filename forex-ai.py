@@ -1,225 +1,87 @@
 #!/usr/bin/env python3
 """
-Forex AI Trading Bot - Universal Entry Point
-
-Usage:
-    ./forex-ai.py              # Auto-detect mode (train if no models, else run)
-    ./forex-ai.py --train      # Force training mode
-    ./forex-ai.py --run        # Force live trading mode
-    ./forex-ai.py --verbose    # Enable debug logging
-
-Works on Windows, Linux, Mac with zero configuration.
-Auto-detects HPC environments (CUDA, multiple GPUs) and optimizes accordingly.
+Forex AI Trading Bot - Master Autonomous Launcher
+2025 HPC Edition (Self-Bootstrapping)
 """
 
 import os
 import sys
+import subprocess
+import platform
+import shutil
+from pathlib import Path
 
-# --- 0. HPC Thread Safety (MUST BE FIRST) ---
-# Prevent numexpr from crashing on high-core machines (>64 cores)
+# --- 0. HPC GLOBAL ENVIRONMENT (NO MANUAL EXPORTS NEEDED) ---
 os.environ["NUMEXPR_MAX_THREADS"] = "64"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# NCCL optimizations for 8x A6000 P2P topology
+os.environ["NCCL_P2P_LEVEL"] = "5"
+os.environ["NCCL_IB_DISABLE"] = "1"
 
-import subprocess
-from pathlib import Path
+# --- 1. SELF-HEALING SYSTEM SETUP ---
+def bootstrap():
+    """Ensure the system is optimized and ready."""
+    is_linux = platform.system().lower() == "linux"
+    
+    # 1.1 TA-Lib Core Binary (Linux Only)
+    if is_linux and not shutil.which("ta-lib-config"):
+        print("[INIT] TA-Lib binary missing. Compiling from source (Automated)...")
+        try:
+            # Run the build process directly from Python
+            build_cmds = [
+                "wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz -O /tmp/ta-lib.tar.gz",
+                "tar -C /tmp -xzf /tmp/ta-lib.tar.gz",
+                "cd /tmp/ta-lib && ./configure --prefix=/usr && make -j$(nproc)",
+                "sudo make install"
+            ]
+            subprocess.check_call(" && ".join(build_cmds), shell=True)
+            print("[INIT] TA-Lib installed successfully.")
+        except Exception as e:
+            print(f"[WARN] TA-Lib build failed: {e}. Some features may be disabled.")
 
-def _is_truthy(value: str | None) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-def _get_ddp_rank() -> int | None:
-    value = os.environ.get("LOCAL_RANK")
-    if value is None:
-        return None
+    # 1.2 Python Dependencies
     try:
-        return int(value)
-    except Exception:
-        return None
+        import pandas
+        import torch
+        import pydantic
+        import cupy
+    except ImportError:
+        print("[INIT] Missing Python libraries. Syncing with Master HPC Stack...")
+        req_file = Path(__file__).parent / "requirements-hpc.txt"
+        
+        cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade", "--break-system-packages"]
+        if req_file.exists():
+            cmd += ["-r", str(req_file)]
+        else:
+            # Fallback to binary-safe core
+            cmd += ["--only-binary", ":all:", "pandas", "numpy", "torch", "pydantic", "sqlalchemy", "cupy-cuda12x"]
+            
+        try:
+            subprocess.check_call(cmd)
+            print("[INIT] Stack synchronized. Restarting engine...")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            print(f"[FATAL] Dependency sync failed: {e}")
+            sys.exit(1)
 
-
-def _ensure_global_python() -> None:
-    """Enforce global Python (no venv/conda) to avoid stale env junk."""
-    in_venv = bool(os.environ.get("VIRTUAL_ENV")) or (
-        hasattr(sys, "real_prefix") or sys.base_prefix != sys.prefix
-    )
-    if not in_venv:
-        return
-    if _is_truthy(os.environ.get("FOREX_BOT_ALLOW_VENV")):
-        return
-    if _is_truthy(os.environ.get("FOREX_BOT_VENV_REEXEC")):
-        print("[FATAL] Virtual env detected and re-exec already attempted.")
-        print("        Please run with global/system Python (no .venv).")
-        raise SystemExit(2)
-
-    base_prefix = Path(sys.base_prefix)
-    if os.name == "nt":
-        candidates = [base_prefix / "python.exe"]
-    else:
-        candidates = [base_prefix / "bin" / "python3", base_prefix / "bin" / "python"]
-
-    base_python = next((p for p in candidates if p.exists()), None)
-    if base_python is None:
-        print("[FATAL] Virtual env detected but global Python not found.")
-        print("        Please run with system Python or set FOREX_BOT_ALLOW_VENV=1.")
-        raise SystemExit(2)
-
-    # Prevent infinite recursion and re-exec using the base interpreter.
-    os.environ["FOREX_BOT_VENV_REEXEC"] = "1"
-    print(f"[INIT] Virtual env detected. Re-launching with {base_python}...")
-    os.execv(str(base_python), [str(base_python), *sys.argv])
-
-
-# --- 1. Path & Environment Bootstrap ---
-# 2025 ANTI-VENV POLICY: Purge environment variables that force virtual environments
-for env_var in ["VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH"]:
-    if env_var in os.environ:
-        del os.environ[env_var]
-
-_ensure_global_python()
-
-# Fix Python path for direct execution from source tree
+# --- 2. ENGINE PATHS ---
 SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_DIR = SCRIPT_DIR / "src"
-
-# FORCE DOMINANCE: Ensure local /src is ALWAYS index 0, overriding global installs
 sys.path.insert(0, str(SRC_DIR))
 os.environ["PYTHONPATH"] = str(SRC_DIR)
 
-# Ensure current working directory is project root
-os.chdir(str(SCRIPT_DIR))
-
-# --- 2. HPC / Stability Tuning ---
-# Disable torch.compile to prevent nvvmAddNVVMContainerToProgram/JIT errors on some drivers
-os.environ.setdefault("FOREX_BOT_DISABLE_COMPILE", "1")
-
-# Fix PyTorch Memory Fragmentation (Modern Config)
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-
-# Tuning for 16GB+ VRAM Cards (A4000/A6000)
-os.environ.setdefault("FOREX_BOT_GLOBAL_POOL_MEM_FRAC", "0.20")
-os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", "auto")
-if _is_truthy(os.environ.get("FOREX_BOT_DISCOVERY_STREAM")):
-    os.environ.setdefault("FOREX_BOT_FULL_DATA", "1")
-
-# Linux-specific: Ensure system CUDA libraries take precedence if present
-if sys.platform.startswith("linux"):
-    cuda_lib = "/usr/local/cuda/targets/x86_64-linux/lib"
-    if os.path.exists(cuda_lib):
-        current_ld = os.environ.get("LD_LIBRARY_PATH", "")
-        if cuda_lib not in current_ld:
-            os.environ["LD_LIBRARY_PATH"] = f"{cuda_lib}:{current_ld}"
-
 if __name__ == "__main__":
-    ddp_rank = _get_ddp_rank()
-    is_ddp_worker = os.environ.get("FOREX_BOT_DDP_LAUNCHED") == "1" and ddp_rank is not None
-    is_rank0 = (not is_ddp_worker) or (ddp_rank == 0)
-    if not is_rank0:
-        # Avoid repeated bootstrap work and noisy logs on non-zero ranks.
-        os.environ.setdefault("FOREX_BOT_SKIP_DEPS", "1")
-
+    # Internal workers for parallel evaluation
     if "--_worker" in sys.argv[1:]:
-        import logging
-
-        worker_idx = sys.argv.index("--_worker")
-        worker_argv = sys.argv[worker_idx + 1 :]
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
         from forex_bot.training.parallel_worker import run_worker
+        sys.exit(run_worker(sys.argv[sys.argv.index("--_worker") + 1 :]))
 
-        sys.exit(run_worker(worker_argv))
+    # Autonomous Setup
+    bootstrap()
 
-    if is_rank0:
-        print("=" * 60)
-        try:
-            print("?? FOREX AI TRADING BOT (Universal Launcher)")
-        except UnicodeEncodeError:
-            print("FOREX AI TRADING BOT (Universal Launcher)")
-        print("=" * 60)
-
-    # --- 3. Dependency Check ---
-    if is_rank0:
-        try:
-            if os.environ.get("FOREX_BOT_SKIP_DEPS", "0") != "1":
-                print("[INIT] Checking and auto-installing dependencies (Global Mode)...", flush=True)
-                from forex_bot.core.deps import ensure_dependencies
-
-                ensure_dependencies()
-
-                # 2025 SMART LINKING: Force user-level editable install.
-                # This ensures that even in global mode, the 'forex_bot' name 
-                # points directly to our local /src directory.
-                print("[INIT] Syncing global environment with local source code...", flush=True)
-                try:
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--no-deps", "-e", "."], cwd=SCRIPT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    print("[INIT] Global environment synced (pip install --user -e .).")
-                except Exception as e:
-                    print(f"[WARN] Local link failed (non-critical): {e}")
-            else:
-                print("[INIT] Skipping dependency bootstrap (FOREX_BOT_SKIP_DEPS=1).", flush=True)
-        except Exception as dep_err:
-            print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
-
-    # --- 4. Hardware Detection & DDP Launch ---
-    try:
-        import torch
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            cpu_cores = os.cpu_count() or 1
-            
-            if is_rank0:
-                print(f"[INIT] Detected {gpu_count} GPUs. Tuning for performance...")
-            
-            # Use all visible GPUs unless user overrides.
-            os.environ.setdefault("FOREX_BOT_MAX_GPUS", str(gpu_count))
-            os.environ.setdefault("SYSTEM__NUM_GPUS", str(gpu_count))
-            os.environ.setdefault("SYSTEM__ENABLE_GPU_PREFERENCE", "auto")
-            os.environ.setdefault("FOREX_BOT_TREE_DEVICE", "auto")
-            
-            # Cap threads per worker to avoid CPU thrash (allow higher HPC defaults)
-            try:
-                per_gpu_threads = int(os.environ.get("FOREX_BOT_CPU_THREADS_PER_GPU", "20") or 20)
-            except Exception:
-                per_gpu_threads = 20
-            per_gpu_threads = max(1, per_gpu_threads)
-            threads_per_worker = max(2, min(per_gpu_threads, cpu_cores // max(1, gpu_count)))
-            os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(threads_per_worker))
-            # Total CPU budget for parallel workers (e.g., 20 cores per GPU)
-            cpu_budget = min(cpu_cores, threads_per_worker * max(1, gpu_count))
-            os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
-            
-            # Feature workers are auto-tuned later in core.system.AutoTuner.
-
-            # HPC Stability: Single-process Multi-GPU mode.
-            # We use internal ThreadPools for 8-GPU scaling to avoid NCCL socket timeouts.
-            os.environ["FOREX_BOT_DDP_LAUNCHED"] = "1" 
-            os.environ["OMP_NUM_THREADS"] = str(cpu_cores)
-            
-    except Exception:
-        pass
-
-    # --- 5. Main Execution ---
-    from forex_bot.main import _global_models_exist, main
-
-    has_models = _global_models_exist()
-    mode_desc = "LIVE TRADING (models exist)" if has_models else "TRAINING FIRST (no models)"
-    if "--train" in sys.argv: mode_desc = "TRAINING (Forced)"
-    if "--run" in sys.argv: mode_desc = "LIVE TRADING (Forced)"
-    
-    if is_rank0:
-        print(f"Mode: {mode_desc}")
-        print(f"Working Directory: {os.getcwd()}")
-        print(f"Python: {sys.version.split()[0]}")
-        print("=" * 60)
-
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n[INFO] Bot stopped by user (Ctrl+C)")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n[ERROR] Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    # Launch the bot
+    from forex_bot.main import main
+    main()

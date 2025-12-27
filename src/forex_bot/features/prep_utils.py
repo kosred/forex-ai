@@ -19,15 +19,18 @@ def have_polars() -> bool:
 
 
 def to_polars(df: pd.DataFrame):
-    import polars as pl  # type: ignore
-
-    return pl.from_pandas(df)
-
+    import polars as pl
+    # HPC: Zero-copy conversion via Arrow
+    return pl.from_pandas(df, rechunk=False)
 
 def to_cudf(df: pd.DataFrame):
-    import cudf  # type: ignore
-
-    return cudf.from_pandas(df)
+    import cudf
+    # HPC: Avoid doubling RAM usage
+    # We use direct numpy buffer mapping where possible
+    try:
+        return cudf.from_pandas(df, nan_as_null=False)
+    except Exception:
+        return cudf.from_pandas(df)
 
 
 def maybe_use_gpu_df(df: pd.DataFrame) -> Any:

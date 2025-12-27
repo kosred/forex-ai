@@ -6,95 +6,69 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from numba import njit, prange
 
-from .base import ExpertModel  # Import ExpertModel for compatibility
+from .base import ExpertModel
 
 logger = logging.getLogger(__name__)
 
+@njit(cache=True, fastmath=True, parallel=True)
+def _rolling_std_numba(data, window):
+    n = len(data)
+    out = np.zeros(n, dtype=np.float32)
+    for i in prange(window, n):
+        chunk = data[i-window+1 : i+1]
+        out[i] = np.std(chunk)
+    return out
 
-class MarketRegimeClassifier(ExpertModel):  # Inherit from ExpertModel
+from sklearn.mixture import GaussianMixture
+
+class MarketRegimeClassifier(ExpertModel):
     """
-    Unsupervised learning component that classifies market conditions
-    into discrete regimes (e.g., Low Volatility Bull, High Volatility Bear, Choppy Range).
-    Uses K-Means clustering on Returns, Volatility, and ADX.
+    HPC FIX: Fully Unsupervised Gaussian Regime Discovery.
+    Discovers the latent 'Hidden States' of the market without human labels.
     """
 
-    def __init__(self, n_regimes: int = 4, lookback: int = 1000, **kwargs):
+    def __init__(self, n_regimes: int = 8, **kwargs):
+        # Increased to 8 regimes to capture more subtle market anomalies
         self.n_regimes = n_regimes
-        self.lookback = lookback
-        self.model = KMeans(n_clusters=n_regimes, random_state=42, n_init="auto")
+        self.model = GaussianMixture(n_components=n_regimes, covariance_type='full', random_state=42)
         self.scaler = StandardScaler()
         self.is_fitted = False
-        self.regime_map = {}  # Map cluster ID to human-readable label
 
     def fit(self, df: pd.DataFrame, y=None, **kwargs) -> None:
-        """
-        Fit the clustering model on historical data.
-        Features: Log Returns, Realized Volatility, ADX (Trend Strength).
-        Compatible with ExpertModel interface (ignores y).
-        """
-        if len(df) < self.lookback:
-            logger.warning(f"Insufficient data for regime classification. Need {self.lookback}, got {len(df)}.")
-            return
-
         features = self._extract_features(df)
-        if features.empty:
-            return
+        if features.empty: return
 
-        # Scale features
         X = self.scaler.fit_transform(features)
-
-        # Cluster
         self.model.fit(X)
         self.is_fitted = True
+        logger.info(f"Unsupervised GMM fitted: {self.n_regimes} latent regimes discovered.")
 
-        # Analyze clusters to assign labels
-        labels = self.model.labels_
-        features["cluster"] = labels
-        summary = features.groupby("cluster").mean()
-
-        # Heuristic Labeling
-        for i in range(self.n_regimes):
-            vol = summary.loc[i, "volatility"]
-            adx = summary.loc[i, "adx"]
-            ret = summary.loc[i, "returns"]
-
-            label = "Normal"
-            if vol < -0.5:
-                label = "Quiet"
-            elif vol > 0.5:
-                label = "Volatile"
-
-            if adx > 0.5:
-                label += " Trend"
-            else:
-                label += " Range"
-
-            if ret > 0.2:
-                label += " (Bull)"
-            elif ret < -0.2:
-                label += " (Bear)"
-
-            self.regime_map[i] = label
-
-        logger.info(f"Regime Classifier Fitted. Regimes: {self.regime_map}")
-
-    def predict(self, df: pd.DataFrame) -> str:
+    def predict_regime_distribution(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Predict the current market regime based on the latest data.
-        Returns: String label (e.g. "Volatile Trend (Bear)")
+        HPC FIX: Multi-Regime Posterior Distribution.
+        Returns a vector of probabilities [p0, p1, ..., p7].
         """
         if not self.is_fitted:
-            return "Unknown"
-
+            return np.zeros(self.n_regimes)
         try:
-            feat = self._extract_features(df.tail(20)).iloc[[-1]]  # Just the last row
+            # Process entire window to get a stable distribution
+            feat = self._extract_features(df.tail(50))
+            if feat.empty: return np.zeros(self.n_regimes)
+            
             X = self.scaler.transform(feat)
-            cluster = self.model.predict(X)[0]
-            return self.regime_map.get(cluster, "Unknown")
-        except Exception as e:
-            logger.warning(f"Regime prediction failed: {e}")
-            return "Error"
+            # Use posteriors (soft assignment)
+            probs = self.model.predict_proba(X)
+            # Return the latest posterior
+            return probs[-1]
+        except Exception:
+            return np.zeros(self.n_regimes)
+
+    def predict(self, df: pd.DataFrame) -> str:
+        """Fallback for legacy components: returns the 'primary' regime ID."""
+        dist = self.predict_regime_distribution(df)
+        return str(np.argmax(dist))
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """
@@ -109,19 +83,25 @@ class MarketRegimeClassifier(ExpertModel):  # Inherit from ExpertModel
 
     def _extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Compute minimal feature set for clustering.
+        HPC Optimized: Feature extraction using Numba.
         """
         try:
-            # Safe feature extraction
-            closes = df["close"]
-            returns = np.log(closes / closes.shift(1)).fillna(0.0)
-            volatility = returns.rolling(20).std().fillna(0.0)
+            closes = df["close"].to_numpy(dtype=np.float32)
+            # Log Returns (Vectorized)
+            returns = np.log(closes[1:] / closes[:-1])
+            returns = np.concatenate([[0.0], returns])
+            
+            # HPC Rolling Volatility
+            volatility = _rolling_std_numba(returns, 20)
 
             # Use 'adx' column if pre-computed, else approx with vol
-            adx = df["adx"] if "adx" in df.columns else volatility * 100
+            adx = df["adx"].to_numpy(dtype=np.float32) if "adx" in df.columns else volatility * 100
 
-            data = pd.DataFrame({"returns": returns, "volatility": volatility, "adx": adx})
-            # Drop NaN from rolling windows
+            data = pd.DataFrame({
+                "returns": returns, 
+                "volatility": volatility, 
+                "adx": adx
+            }, index=df.index)
             return data.dropna()
         except Exception:
             return pd.DataFrame()

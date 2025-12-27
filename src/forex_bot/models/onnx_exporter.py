@@ -305,39 +305,36 @@ class ONNXExporter:
     @staticmethod
     def _pad_probs(probs: np.ndarray, classes: list[int] | None = None) -> np.ndarray:
         """
-        Normalize probability outputs to shape (n,3) ordered as [neutral, buy, sell].
-
-        If `classes` is provided, it is interpreted as the class label for each column and used to reorder/map.
-        Supported label conventions:
-          - {-1, 0, 1}: -1=sell, 0=neutral, 1=buy
-          - {0, 1, 2}: 0=neutral, 1=buy, 2=sell
+        HPC UNIFIED PROTOCOL: Force ONNX output to [Neutral, Buy, Sell].
+        Standard indices: 0=Neutral, 1=Buy, 2=Sell.
         """
         if probs is None or len(probs) == 0:
             return np.zeros((0, 3), dtype=float)
+        
         arr = np.asarray(probs, dtype=float)
         if arr.ndim == 1:
             arr = arr.reshape(-1, 1)
         n = arr.shape[0]
-
         out = np.zeros((n, 3), dtype=float)
-        if classes and len(classes) == arr.shape[1]:
-            for col, cls in enumerate(classes):
-                if cls == 0:
-                    out[:, 0] = arr[:, col]
-                elif cls == 1:
-                    out[:, 1] = arr[:, col]
-                elif cls in (-1, 2):
-                    out[:, 2] = arr[:, col]
+
+        # 1. Handle Model-Specific Mapping
+        if classes is not None and len(classes) == arr.shape[1]:
+            for col, cls_val in enumerate(classes):
+                # Standard Project Mapping: -1 (or 2) -> 2, 0 -> 0, 1 -> 1
+                if cls_val == 0: out[:, 0] = arr[:, col] # Neutral -> 0
+                elif cls_val == 1: out[:, 1] = arr[:, col] # Buy -> 1
+                elif cls_val == -1 or cls_val == 2: out[:, 2] = arr[:, col] # Sell -> 2
             return out
 
-        if arr.shape[1] >= 3:
-            return arr[:, :3]
-        if arr.shape[1] == 2:
-            out[:, 0] = arr[:, 0]
-            out[:, 1] = arr[:, 1]
-            return out
-        out[:, 0] = 1.0 - arr[:, 0]
-        out[:, 1] = arr[:, 0]
+        # 2. Heuristics for direct ONNX outputs
+        if arr.shape[1] == 3:
+            return arr # Assume [Neutral, Buy, Sell]
+        elif arr.shape[1] == 2:
+            out[:, 0] = arr[:, 0] # Neutral
+            out[:, 1] = arr[:, 1] # Buy
+        else:
+            out[:, 0] = 1.0 - arr[:, 0]
+            out[:, 1] = arr[:, 0]
         return out
 
     @staticmethod

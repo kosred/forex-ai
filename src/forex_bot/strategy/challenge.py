@@ -35,43 +35,19 @@ class ChallengeOptimizer:
         win_rate: float,
         avg_risk_reward: float,
         daily_loss_pct: float = 0.0,
+        realized_trades_per_day: float = 2.0,
     ) -> float:
         """
         Calculate optimal risk % per trade.
-
-        Args:
-            current_profit: Current profit percentage (e.g. 0.02 for 2%)
-            days_left: Trading days remaining in challenge
-            current_drawdown: Current TOTAL drawdown percentage from peak (positive value, e.g. 0.03)
-            win_rate: Historical win rate (0.0 to 1.0)
-            avg_risk_reward: Average R:R ratio
-            daily_loss_pct: Current DAILY loss percentage (positive value, e.g. 0.01 for -1% PnL today)
         """
-        dd_room = max(0.0, self.target.max_total_dd - current_drawdown)
-        if dd_room <= 0:
-            return 0.0
-
-        safe_total_cap = dd_room * 0.20
-
-        daily_room = max(0.0, self.target.max_daily_dd - daily_loss_pct)
-
-        if daily_room <= 0.005:  # Less than 0.5% room left? Stop trading.
-            return 0.0
-
-        safe_daily_cap = daily_room * 0.25
-
-        safety_limit = min(safe_total_cap, safe_daily_cap)
-
-        if days_left <= 0:
-            base_risk = self._kelly_criterion(win_rate, avg_risk_reward)
-            return min(base_risk, safety_limit)
-
+        # ...
         remaining_target = self.target.total_profit_target - current_profit
 
         if remaining_target <= 0:
             return 0.0025  # Maintenance mode
 
-        est_trades = max(1, days_left * 3)
+        # HPC FIX: Dynamic Expectancy-Based Sizing
+        est_trades = max(1, int(days_left * realized_trades_per_day))
         expectancy = (win_rate * avg_risk_reward) - (1.0 - win_rate)
 
         if expectancy <= 0.1:

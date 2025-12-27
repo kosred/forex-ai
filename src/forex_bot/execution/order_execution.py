@@ -208,7 +208,7 @@ class OrderExecutor:
             if base_df is None or base_df.empty:
                 raise RuntimeError("Missing base timeframe data for ATR SL")
             atr = base_df["atr"].iloc[-1] if "atr" in base_df.columns else None
-            pip_size = self._get_pip_size()
+            pip_size = self._get_pip_size(symbol)
 
             if atr and atr > 0:
                 atr_mult = float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5))
@@ -229,7 +229,7 @@ class OrderExecutor:
                 base_df = frames.get("M1")
             if base_df is None or base_df.empty:
                 raise RuntimeError("Missing base timeframe data for stop engine")
-            res = infer_stop_target_pips(base_df, settings=self.settings, pip_size=self._get_pip_size())
+            res = infer_stop_target_pips(base_df, settings=self.settings, pip_size=self._get_pip_size(symbol))
             if res is not None:
                 sl_pips, _tp_pips, rr = res
                 self._last_rr = rr
@@ -257,7 +257,7 @@ class OrderExecutor:
             else:  # sell uses bid
                 entry_price = bid if bid > 0 else close_price
 
-            pip_size = self._get_pip_size(info)
+            pip_size = self._get_pip_size(symbol, info)
             sl_dist = sl_pips * pip_size
 
             rr = None
@@ -309,11 +309,12 @@ class OrderExecutor:
         if result.get("requires_manual_check") and self.risk_ledger:
             self.risk_ledger.record("ORDER_UNVERIFIED", f"Critical: {result.get('reason')}", severity="critical")
 
-    def _get_pip_size(self, info=None) -> float:
-        sym = (self.settings.system.symbol or "").upper()
+    def _get_pip_size(self, symbol: str, info=None) -> float:
+        sym = (symbol or "").upper()
         if info:
             pt = float(info.get("point", 0.0001) or 0.0001)
             dig = int(info.get("digits", 5) or 5)
+            # Standard FX logic: 4+ digits = 10 points per pip, else 1
             pip_size = pt * (10 if dig >= 4 else 1)
         else:
             if sym.endswith("JPY") or sym.startswith("JPY"):

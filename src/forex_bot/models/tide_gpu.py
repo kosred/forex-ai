@@ -117,11 +117,15 @@ class TiDEExpert(ExpertModel):
         X_train, X_val = X.iloc[:split], X.iloc[split:]
         y_train, y_val = y_vals[:split], y_vals[split:]
 
+        # HPC FIX: Unified Protocol Mapping
+        y_train_mapped = np.where(y_train == -1, 2, y_train).astype(int)
+        y_val_mapped = np.where(y_val == -1, 2, y_val).astype(int)
+
         # Force CPU initialization to avoid VRAM OOM
         X_t = torch.as_tensor(dataframe_to_float32_numpy(X_train), dtype=torch.float32, device="cpu")
-        y_t = torch.as_tensor(y_train + 1, dtype=torch.long, device="cpu")
+        y_t = torch.as_tensor(y_train_mapped, dtype=torch.long, device="cpu")
         X_v = torch.as_tensor(dataframe_to_float32_numpy(X_val), dtype=torch.float32, device="cpu")
-        y_v = torch.as_tensor(y_val + 1, dtype=torch.long, device="cpu")
+        y_v = torch.as_tensor(y_val_mapped, dtype=torch.long, device="cpu")
 
         # Removed eager move to GPU for validation data
         
@@ -268,9 +272,8 @@ class TiDEExpert(ExpertModel):
         if not outs:
             raise RuntimeError("TiDE GPU inference returned no batches")
         probs = np.vstack(outs)
-        # Training encodes labels as y+1 where y ∈ {-1,0,1} -> class indices {0,1,2}.
-        # Reorder to project convention [neutral, buy, sell].
-        return probs[:, [1, 2, 0]]
+        # Unified Protocol: [Neutral, Buy, Sell] already in indices [0, 1, 2]
+        return probs[:, :3]
 
     def save(self, path: str) -> None:
         if self.model and (not self.is_ddp or self.rank == 0):

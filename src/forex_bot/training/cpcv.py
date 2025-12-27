@@ -420,47 +420,56 @@ class CombinatorialPurgedCV:
             logger.error(f"Scoring failed: {e}")
             return 0.0, {}
 
-        trades = int(np.count_nonzero(y_pred))
-        wins = int(np.sum((y_pred == 1) & (y_test == 1)) + np.sum((y_pred == -1) & (y_test == -1)))
-        win_rate = float(wins / trades) if trades > 0 else 0.0
-
+        from ..strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+        
         max_dd = 0.0
+        win_rate = 0.0
+        trades = 0
+        
         if hasattr(x_test, "index") and "close" in x_test.columns:
             try:
-                close = x_test["close"].to_numpy(dtype=float)
-                if len(close) < 2:
-                    raise ValueError("Insufficient close prices for drawdown calc")
-
-                # Use next-bar returns and drop the last bar (no future).
-                base = np.clip(close[:-1], 1e-12, None)
-                ret = (close[1:] - close[:-1]) / base
-                pnl = []
-                equity = 1.0
-                peak = equity
-                y_pred_arr = np.asarray(y_pred)[: len(ret)]
-                for s, r in zip(y_pred_arr, ret, strict=False):
-                    if s == 0:
-                        pnl.append(0.0)
-                    elif s == 1:
-                        pnl.append(1.0 if r > 0 else -1.0)
-                    else:
-                        pnl.append(1.0 if r < 0 else -1.0)
-                    equity *= 1.0 + (pnl[-1] * 0.001)
-                    peak = max(peak, equity)
-                    max_dd = max(max_dd, peak - equity)
-            except Exception:
-                max_dd = 0.0
-
-        trade_limit_violation = trades > max_trades_per_day
-        min_days_ok = trades > 0 or min_trading_days <= 1
+                close = x_test["close"].to_numpy(dtype=np.float64)
+                high = x_test["high"].to_numpy(dtype=np.float64)
+                low = x_test["low"].to_numpy(dtype=np.float64)
+                
+                idx = x_test.index
+                month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
+                day_idx = (idx.year.astype(np.int32) * 10000 + idx.month.astype(np.int32) * 100 + idx.day.astype(np.int32)).to_numpy(dtype=np.int64)
+                
+                symbol = x_test.attrs.get("symbol", "EURUSD")
+                pip_size, pip_val_lot = infer_pip_metrics(symbol)
+                
+                # HPC Unified Backtest
+                arr = fast_evaluate_strategy(
+                    close_prices=close,
+                    high_prices=high,
+                    low_prices=low,
+                    signals=y_pred.astype(np.int8),
+                    month_indices=month_idx,
+                    day_indices=day_idx,
+                    sl_pips=30.0,
+                    tp_pips=60.0,
+                    pip_value=pip_size,
+                    pip_value_per_lot=pip_val_lot,
+                    spread_pips=1.5,
+                    commission_per_trade=7.0
+                )
+                
+                max_dd = float(arr[3])
+                win_rate = float(arr[4])
+                trades = int(arr[8])
+                
+            except Exception as e:
+                logger.error(f"CPCV internal backtest failed: {e}")
+                max_dd = 1.0
 
         metrics = {
-            "max_dd": float(max_dd),
+            "max_dd": max_dd,
             "trades": trades,
             "win_rate": win_rate,
-            "daily_loss_breach": False,  # not tracked here due to missing timestamps
-            "trade_limit_violation": trade_limit_violation,
-            "min_trading_days_ok": min_days_ok,
+            "daily_loss_breach": max_dd > max_daily_loss_pct,
+            "trade_limit_violation": trades > max_trades_per_day,
+            "min_trading_days_ok": trades >= min_trading_days,
         }
 
         return float(score), metrics

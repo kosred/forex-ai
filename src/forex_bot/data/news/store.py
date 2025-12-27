@@ -2,6 +2,8 @@ import hashlib
 import logging
 import sqlite3
 import threading
+import sys
+import contextlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,21 +27,35 @@ class NewsEvent:
 
 
 class NewsDatabase:
-    """Manages persistent storage of news events with sentiment."""
+    """Manages persistent storage of news events with cross-process locking."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Allow access from background threads (we guard with a lock).
-        self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        # HPC FIX: Cross-process lock file
+        self.lock_file = self.path.with_suffix(".lock")
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._init_schema()
 
+    @contextlib.contextmanager
+    def _get_lock(self):
+        """High-performance cross-process file lock."""
+        import fcntl
+        with open(self.lock_file, 'w') as f:
+            if sys.platform != "win32":
+                fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if sys.platform != "win32":
+                    fcntl.flock(f, fcntl.LOCK_UN)
+
     def _init_schema(self) -> None:
-        with self._lock:
+        with self._get_lock():
             cur = self._conn.cursor()
+            # ... (Existing schema logic)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS news_events (
@@ -90,7 +106,7 @@ class NewsDatabase:
         If `update_existing` is True and an event with the same URL already exists,
         update its sentiment/confidence (and currency mapping) instead of ignoring it.
         """
-        with self._lock:
+        with self._get_lock():
             inserted = 0
             cur = self._conn.cursor()
             for event in events:
@@ -151,7 +167,7 @@ class NewsDatabase:
         currencies: Sequence[str] | None = None,
     ) -> list[NewsEvent]:
         """Fetch events between start/end optionally filtered by currency."""
-        with self._lock:
+        with self._get_lock():
             start_ts = int(start.replace(tzinfo=UTC).timestamp())
             end_ts = int(end.replace(tzinfo=UTC).timestamp())
             cur = self._conn.cursor()
@@ -211,7 +227,7 @@ class NewsDatabase:
             return events
 
     def latest_timestamp(self) -> datetime | None:
-        with self._lock:
+        with self._get_lock():
             cur = self._conn.cursor()
             row = cur.execute("SELECT MAX(published_at) FROM news_events").fetchone()
             if not row or row[0] is None:
@@ -223,7 +239,7 @@ class NewsDatabase:
         return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
     def get_cached_score(self, url: str, title: str) -> dict | None:
-        with self._lock:
+        with self._get_lock():
             key = self._make_key(url, title)
             cur = self._conn.cursor()
             row = cur.execute(
@@ -234,7 +250,7 @@ class NewsDatabase:
             return {"sentiment": float(row[0]), "confidence": float(row[1]), "direction": row[2] or "neutral"}
 
     def set_cached_score(self, url: str, title: str, sentiment: float, confidence: float, direction: str) -> None:
-        with self._lock:
+        with self._get_lock():
             key = self._make_key(url, title)
             cur = self._conn.cursor()
             cur.execute(
@@ -248,7 +264,7 @@ class NewsDatabase:
 
     def close(self) -> None:
         try:
-            with self._lock:
+            with self._get_lock():
                 self._conn.close()
         except Exception as e:
             logger.warning(f"News store operation failed: {e}", exc_info=True)

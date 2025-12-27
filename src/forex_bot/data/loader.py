@@ -745,40 +745,46 @@ class DataLoader:
         logger.info(f"Saved {timeframe} data to {file_path}")
 
     async def get_training_data(self, symbol: str) -> dict[str, pd.DataFrame]:
-        """Load all timeframes for a symbol."""
+        """Load all timeframes for a symbol in parallel."""
         if self.cache_training_frames:
             cached = self._training_frames_cache.get(symbol)
             if cached is not None:
                 return cached
 
-        frames: dict[str, pd.DataFrame] = {}
         tfs = (
             [self.settings.system.base_timeframe]
             + self.settings.system.higher_timeframes
             + self.settings.system.required_timeframes
             + ["M1"]
         )
-        tfs = list(dict.fromkeys(tfs))  # dedupe while preserving order
+        tfs = list(dict.fromkeys(tfs))
 
-        for tf in tfs:
+        async def _load_tf(tf):
             path = self.data_dir / f"symbol={symbol}" / f"timeframe={tf}"
             if not path.exists():
-                continue
+                return None
             files = sorted(path.glob("*.parquet"))
             if not files:
-                continue
+                return None
             try:
-                dfs = [
-                    pd.read_parquet(
-                        fp,
-                        engine="pyarrow",
-                        memory_map=bool(getattr(self.settings.system, "parquet_memory_map", True)),
-                    )
-                    for fp in files
-                ]
-                if not dfs:
-                    continue
-                df = pd.concat(dfs, ignore_index=False)
+                # Use to_thread for the heavy pandas read operation
+                def _read_all():
+                    dfs = [
+                        pd.read_parquet(
+                            fp,
+                            engine="pyarrow",
+                            memory_map=bool(getattr(self.settings.system, "parquet_memory_map", True)),
+                        )
+                        for fp in files
+                    ]
+                    if not dfs: return None
+                    df = pd.concat(dfs, ignore_index=False)
+                    df = self._downcast_float_columns(df)
+                    return df
+
+                df = await asyncio.to_thread(_read_all)
+                if df is None: return None
+                
                 if "timestamp" in df.columns:
                     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
                     df.set_index("timestamp", inplace=True)
@@ -786,25 +792,25 @@ class DataLoader:
                     df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
                 df = df.sort_index()
                 df = self._adjust_to_utc(df)
+                
                 full_data = str(os.environ.get("FOREX_BOT_FULL_DATA", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
                 max_rows = 0 if full_data else int(getattr(self.settings.system, "max_training_rows_per_tf", 0))
                 if max_rows and len(df) > max_rows:
                     df = df.tail(max_rows)
-                if getattr(self.settings.system, "downcast_training_float32", True):
-                    df = self._downcast_float_columns(df)
-                frames[tf] = df
+                
+                return tf, df
             except Exception as e:
                 logger.warning(f"Failed to load {tf} data: {e}")
+                return None
+
+        # 252-Core HPC: Load all timeframes at once
+        results = await asyncio.gather(*[_load_tf(tf) for tf in tfs])
+        frames = {r[0]: r[1] for r in results if r is not None}
+
         if self.cache_training_frames:
             total_bytes = self._estimate_frames_bytes(frames)
             if total_bytes <= self.training_cache_max_bytes:
                 self._training_frames_cache[symbol] = frames
-                logger.info(f"Cached training frames for {symbol} ({total_bytes / 1e6:.1f} MB)")
-            else:
-                logger.info(
-                    f"Skipping cache for {symbol}: {total_bytes / 1e6:.1f} MB exceeds "
-                    f"limit {self.training_cache_max_bytes / 1e6:.1f} MB"
-                )
         return frames
 
     @staticmethod

@@ -43,13 +43,16 @@ class StrategyGauntlet:
 
         try:
             signals = self.mixer.compute_signals(self.data, gene)
-
+            
+            # HPC FIX: Use Metadata for High-Precision Validation
+            # Ensure prop_backtest uses the real OHLC prices for cost logic
             metrics = prop_backtest(
                 self.data,
                 signals,
                 max_daily_dd_pct=self.max_daily_dd,
                 daily_dd_warn_pct=self.max_daily_dd * 0.8,
                 max_trades_per_day=10,
+                use_gpu=False
             )
 
             wr = metrics.get("win_rate", 0.0)

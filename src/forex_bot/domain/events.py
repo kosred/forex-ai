@@ -1,8 +1,9 @@
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Union
 
+import numpy as np
 import pandas as pd
 
 
@@ -14,7 +15,8 @@ class SignalResult:
     regime: str
     meta_features: dict[str, Any]
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
-    probs: list[float] | None = None  # [neutral, buy, sell] for the latest bar
+    # HPC FIX: Use NumPy for zero-copy prob storage
+    probs: np.ndarray | None = None  # [neutral, buy, sell] for the latest bar
 
     trade_probability: pd.Series | None = None
     stacking_confidence: pd.Series | None = None
@@ -28,8 +30,9 @@ class SignalResult:
 
 @dataclass(slots=True)
 class PreparedDataset:
-    X: Any  # DataFrame or numpy array
-    y: Any  # Series or numpy array
+    # HPC FIX: Strict typing for sharded data
+    X: Union[pd.DataFrame, np.ndarray]
+    y: Union[pd.Series, np.ndarray]
     index: Any  # DatetimeIndex
     feature_names: list[str]
     metadata: pd.DataFrame | None = None  # OHLCV for backtesting

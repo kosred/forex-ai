@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -105,9 +106,27 @@ class NewsService:
                         tier1_nearby = True
                         break
 
-        max_conf = max((ev.confidence or 0.0) for ev in self.latest_events) if self.latest_events else 0.0
-        max_sent = max((ev.sentiment or 0.0) for ev in self.latest_events) if self.latest_events else 0.0
-        news_cap = self.settings.risk.max_risk_per_trade * max(0.5, 1.0 - max_conf * 0.5)
+        # HPC FIX: Exponential Sentiment/Confidence Decay
+        decay_half_life = float(getattr(self.settings.news, "news_decay_minutes", 120))
+        decay_factor = math.log(2) / decay_half_life
+        
+        impactful_events = []
+        for ev in self.latest_events:
+            if ev.published_at:
+                age_mins = (now_utc - ev.published_at).total_seconds() / 60.0
+                # Weight by time: Weight = exp(-decay * time)
+                time_weight = math.exp(-decay_factor * max(0, age_mins))
+                
+                impactful_events.append({
+                    "conf": (ev.confidence or 0.0) * time_weight,
+                    "sent": (ev.sentiment or 0.0) * time_weight
+                })
+
+        max_conf = max((e["conf"] for e in impactful_events), default=0.0)
+        max_sent = max((e["sent"] for e in impactful_events), default=0.0)
+        
+        # Risk cap reduces as confidence/surprise increases
+        news_cap = self.settings.risk.max_risk_per_trade * max(0.2, 1.0 - max_conf)
 
         policy = {
             "tier1_nearby": tier1_nearby,
@@ -130,10 +149,25 @@ class NewsService:
         return policy
 
     def _check_fetch_needed(self, now: datetime) -> bool:
-        if self._last_news_fetch is None:
-            return True
+        """HPC FIX: Dynamic Event-Aware Polling."""
+        if self._last_news_fetch is None: return True
+        
+        # Default: 15 minutes
+        interval = self._news_fetch_min_seconds
+        
+        # Check for imminent high-impact events
+        for ev in self.latest_events:
+            if hasattr(ev, "published_at") and ev.published_at:
+                delta = (ev.published_at - now).total_seconds()
+                # FLASH WINDOW: 5 mins before/after event
+                if -300 <= delta <= 300:
+                    # Increase frequency to every 10 seconds
+                    interval = 10 
+                    logger.debug(f"SmartNews: Flash Window detected for {ev.title}. Polling every 10s.")
+                    break
+        
         elapsed = (now - self._last_news_fetch).total_seconds()
-        return elapsed >= self._news_fetch_min_seconds
+        return elapsed >= interval
 
     def _fetch_breaking_news(self, symbol: str, tier1: bool):
         try:

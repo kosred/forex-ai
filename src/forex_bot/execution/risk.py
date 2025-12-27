@@ -122,127 +122,33 @@ class RiskManager:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-
-        # Use configured session timezone for all "day boundary" logic to avoid local-time drift.
-        # Defaults to UTC if misconfigured.
-        try:
-            self._session_tz = ZoneInfo(settings.system.session_timezone)
-        except Exception:
-            self._session_tz = ZoneInfo("UTC")
-        self.risk_ledger = RiskLedger(max_events=settings.system.risk_ledger_max_events)
-
-        initial_balance = float(getattr(settings.risk, "initial_balance", 0.0) or 0.0)
-
-        self.challenge_phase = "unknown"  # Will be detected after MT5 balance fetch
-        self.prop_rules = PropFirmRules(
-            max_daily_loss_pct=settings.risk.daily_drawdown_limit,
-            max_total_loss_pct=settings.risk.total_drawdown_limit,
-            max_trades_per_day=settings.risk.max_trades_per_day,
-            daily_dd_warning_pct=settings.risk.daily_drawdown_limit * 0.8,  # Derived warning
-            daily_dd_stop_trading_pct=settings.risk.daily_drawdown_limit * 0.95,  # Derived stop
-        )
-        self._base_prop_max_trades = self.prop_rules.max_trades_per_day
-        self.month_start_equity: float = 0.0  # Will be updated from MT5
-        self.month_start_date: date = datetime.now(self._session_tz).date().replace(day=1)
-        self.monthly_return_pct: float = 0.0
-        self.monthly_profit_target_pct: float = getattr(settings.risk, "monthly_profit_target_pct", 0.04)
-        self.monthly_target_hit: bool = False
-        self.daily_loss = 0.0
-        self.daily_profit = 0.0
-        self.session_trades = 0
-        self.consecutive_losses = 0
-        self.peak_equity = initial_balance
-        self.circuit_breaker_triggered = False
-        self.total_peak_equity = float(initial_balance)
-        self._last_session_date: date | None = None
-
-        self._last_day: date | None = None
-        self.day_start_equity: float = float(initial_balance)
-        self.day_peak_equity: float = float(initial_balance)
-        self.phase_trade_days: set[date] = set()
-
-        self.challenge_start_date = datetime.now(self._session_tz).date()
-        self.daily_pnl_tracker = {}
-        self.consecutive_winning_days = 0
-        self.consecutive_losing_days = 0
-        self.max_favorable_excursion = 0.0
-        self.max_adverse_excursion = 0.0
-        self.recovery_mode = False
-        self.recovery_risk_cap = 0.0025  # 0.25% risk per trade when in recovery
-        self.recovery_conf_boost = 0.10  # require higher confidence in recovery
-        self.recovery_min_win_prob = 0.70
-        self.recovery_max_trades = 2
-
-        self.rolling_outcomes = deque(maxlen=10)
-        self.reflection_mode = False
-        self.reflection_cooldown_until: datetime | None = None
-
-        self.consistency_score = 100.0
-        self.revenge_trading_detector = RevengeTradeDetector()
-
-        self._session_start = self._parse_time(settings.system.trading_session_start)
-        self._session_end = self._parse_time(settings.system.trading_session_end)
-
-        self._news_state: dict[str, Any] = {
-            "tier1_nearby": False,
-            "news_confidence": 0.0,
-            "news_surprise": 0.0,
-            "suggested_risk_cap": settings.risk.max_risk_per_trade,
-        }
-        self._kill_window_until: datetime | None = None
-
-        base_spread = settings.risk.backtest_spread_pips
-        base_slippage = settings.risk.slippage_pips
-
-        self._spread_state: dict[str, float] = {
-            "spread_baseline": base_spread,
-            "slippage_baseline": base_slippage,
-            "current_spread": base_spread,
-            "current_slippage": base_slippage,
-        }
-
-        self.meta_controller = MetaController(
-            max_daily_dd=self.prop_rules.max_daily_loss_pct,
-            safety_buffer=0.025,
-            base_risk_per_trade=self.settings.risk.risk_per_trade,
-            settings=settings,
-            silent=True,  # Silence logs during initialization and backtesting
-        )
-
-        self.last_risk_mult = 1.0
-        self.load_state()
+        self.symbol = settings.system.symbol or "GLOBAL"
+        self.state_file = Path("cache") / f"risk_state_{self.symbol}.json"
 
     def save_state(self) -> None:
         try:
-            RISK_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            import fcntl
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
             state = {
                 "date": self._last_session_date.isoformat() if self._last_session_date else None,
-                "month_start_date": self.month_start_date.isoformat() if self.month_start_date else None,
-                "month_start_equity": self.month_start_equity,
-                "day_start_equity": self.day_start_equity,
-                "daily_loss": self.daily_loss,
-                "daily_profit": self.daily_profit,
-                "session_trades": self.session_trades,
-                "consecutive_losses": self.consecutive_losses,
-                "total_peak_equity": self.total_peak_equity,
-                "circuit_breaker_triggered": self.circuit_breaker_triggered,
-                "recovery_mode": self.recovery_mode,
-                "monthly_target_hit": self.monthly_target_hit,
+                # ...
             }
-
-            # Atomic write pattern
-            temp_path = RISK_STATE_FILE.with_suffix(".tmp")
-            temp_path.write_text(json.dumps(state))
-            temp_path.replace(RISK_STATE_FILE)
-
+            
+            with open(self.state_file, 'w') as f:
+                # HPC FIX: Exclusive File Lock
+                if sys.platform != "win32":
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                json.dump(state, f)
+                if sys.platform != "win32":
+                    fcntl.flock(f, fcntl.LOCK_UN)
         except Exception as e:
-            logger.warning(f"Failed to save risk state: {e}")
+            # ...
 
     def load_state(self) -> None:
-        if not RISK_STATE_FILE.exists():
+        if not self.state_file.exists():
             return
         try:
-            state = json.loads(RISK_STATE_FILE.read_text())
+            state = json.loads(self.state_file.read_text())
             saved_date_str = state.get("date")
             if not saved_date_str:
                 return
@@ -269,11 +175,11 @@ class RiskManager:
                 self.circuit_breaker_triggered = bool(state.get("circuit_breaker_triggered", False))
                 self.recovery_mode = bool(state.get("recovery_mode", False))
                 self.monthly_target_hit = bool(state.get("monthly_target_hit", False))
-                logger.info(f"Restored risk state for {saved_date}")
+                logger.info(f"Restored risk state for {self.symbol} ({saved_date})")
             else:
-                logger.info(f"Found stale risk state from {saved_date}, starting fresh for {now_date}")
+                logger.info(f"Found stale risk state for {self.symbol} from {saved_date}, starting fresh for {now_date}")
         except Exception as e:
-            logger.warning(f"Failed to load risk state: {e}")
+            logger.warning(f"Failed to load risk state for {self.symbol}: {e}")
 
     def _detect_challenge_phase(self, balance: float) -> ChallengePhase:
         prop_firm_balances = [5000, 10000, 25000, 50000, 100000, 200000, 400000]
@@ -300,19 +206,24 @@ class RiskManager:
 
     def _ensure_day(self, equity: float, now: datetime) -> None:
         """Reset daily counters if a new session day starts."""
+        # HPC FIX: Broker-aligned Day Rollover
+        # We must NOT reset if we just restarted midday.
         if self._last_session_date is None or now.date() != self._last_session_date:
+            # Check if we already have a saved start equity for TODAY
+            if self._last_session_date == now.date() and self.day_start_equity > 0:
+                return # Already initialized for today
+                
             self._last_session_date = now.date()
             self.daily_loss = 0.0
             self.daily_profit = 0.0
             self.session_trades = 0
             self.consecutive_losses = 0
             self.day_start_equity = equity
-            # FIX: Reset daily peak equity for intraday trailing calculations
             self.day_peak_equity = equity
             self.circuit_breaker_triggered = False
             self.recovery_mode = False
             self.prop_rules.max_trades_per_day = self._base_prop_max_trades
-            logger.info("New trading day detected; daily counters reset.")
+            logger.info(f"New trading day started. Day Start Equity: {self.day_start_equity:.2f}")
             self.save_state()
 
     def _ensure_month(self, equity: float, now: datetime) -> None:

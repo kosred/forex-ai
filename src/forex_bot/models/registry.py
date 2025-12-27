@@ -1,160 +1,71 @@
-import logging
+"""
+Lazy-Loading Model Registry.
+Thread-safe implementation for HPC environments.
+"""
 
-from .base import ExpertModel
+import logging
+import threading
+import importlib
+from typing import TYPE_CHECKING, Any, Dict, Type
+
+if TYPE_CHECKING:
+    from .base import ExpertModel
 
 logger = logging.getLogger(__name__)
 
-# MODEL_REGISTRY maps model_name -> {"cpu": cls_cpu, "gpu": cls_gpu or cls_cpu}
-MODEL_REGISTRY: dict[str, dict[str, type[ExpertModel]]] = {}
+# HPC FIX: Thread Lock for Registry
+_REGISTRY_LOCK = threading.Lock()
+_CLASS_CACHE: Dict[str, Type['ExpertModel']] = {}
 
+# Registry mapping: name -> (module_path, class_name)
+MODEL_MAPPING = {
+    "lightgbm": ("trees", "LightGBMExpert"),
+    "xgboost": ("trees", "XGBoostExpert"),
+    "xgboost_rf": ("trees", "XGBoostRFExpert"),
+    "xgboost_dart": ("trees", "XGBoostDARTExpert"),
+    "catboost": ("trees", "CatBoostExpert"),
+    "catboost_alt": ("trees", "CatBoostAltExpert"),
+    "random_forest": ("trees", "RandomForestExpert"),
+    "extra_trees": ("trees", "ExtraTreesExpert"),
+    "mlp": ("mlp", "MLPExpert"),
+    "transformer": ("transformers", "TransformerExpertTorch"),
+    "kan": ("kan_gpu", "KANExpert"),
+    "nbeats": ("nbeats_gpu", "NBeatsExpert"),
+    "tabnet": ("tabnet_gpu", "TabNetExpert"),
+    "tide": ("tide_gpu", "TiDEExpert"),
+    "rl_ppo": ("rl", "RLExpertPPO"),
+    "rl_sac": ("rl", "RLExpertSAC"),
+    "evolution": ("evolution", "EvoExpertCMA"),
+    "genetic": ("genetic", "GeneticStrategyExpert"),
+    "unsupervised": ("unsupervised", "ClusterExpert"),
+}
 
-def register_model(name: str, cpu_cls: type[ExpertModel], gpu_cls: type[ExpertModel] | None = None) -> None:
-    MODEL_REGISTRY[name] = {"cpu": cpu_cls, "gpu": gpu_cls or cpu_cls}
+def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
+    """Thread-safe lazy-imports the requested model class."""
+    with _REGISTRY_LOCK:
+        if name in _CLASS_CACHE:
+            return _CLASS_CACHE[name]
+        
+        if name not in MODEL_MAPPING:
+            raise ValueError(f"Model '{name}' not found in registry.")
+        
+        module_name, class_name = MODEL_MAPPING[name]
+        
+        # Handle CPU fallback for GPU models if needed
+        if not prefer_gpu:
+            if name in ["kan", "nbeats", "tabnet", "tide"]:
+                # Many GPU models have same module name as CPU path
+                pass
 
+        try:
+            # Import with package context
+            module = importlib.import_module(f".{module_name}", package="forex_bot.models")
+            cls = getattr(module, class_name)
+            _CLASS_CACHE[name] = cls
+            return cls
+        except Exception as e:
+            logger.error(f"Failed to lazy-import model '{name}': {e}")
+            raise ImportError(f"Could not load model {name}") from e
 
-def get_model_class(name: str, prefer_gpu: bool = False) -> type[ExpertModel]:
-    if name not in MODEL_REGISTRY:
-        raise ValueError(f"Model '{name}' not found in registry. Available: {list(MODEL_REGISTRY.keys())}")
-    entry = MODEL_REGISTRY[name]
-    if prefer_gpu and entry.get("gpu"):
-        return entry["gpu"]
-    return entry["cpu"]
-
-
-# Tree/linear models (CPU+GPU where supported)
-try:
-    from .trees import (
-        CatBoostAltExpert,
-        CatBoostExpert,
-        ExtraTreesExpert,
-        LightGBMExpert,
-        RandomForestExpert,
-        XGBoostDARTExpert,
-        XGBoostExpert,
-        XGBoostRFExpert,
-    )
-
-    register_model("lightgbm", LightGBMExpert)
-    register_model("xgboost", XGBoostExpert)
-    register_model("xgboost_rf", XGBoostRFExpert)
-    register_model("xgboost_dart", XGBoostDARTExpert)
-    register_model("catboost", CatBoostExpert)
-    register_model("catboost_alt", CatBoostAltExpert)
-    register_model("random_forest", RandomForestExpert)
-    register_model("extra_trees", ExtraTreesExpert)
-except ImportError as e:
-    logger.warning(f"Tree models not fully available: {e}")
-
-# Simple tabular MLP (CPU/GPU)
-try:
-    from .mlp import MLPExpert
-
-    register_model("mlp", MLPExpert, MLPExpert)
-except ImportError as e:
-    logger.warning(f"MLP model not available: {e}")
-
-# Deep models: always register both CPU and GPU variants when present
-try:
-    from .nbeats import NBeatsExpert as NBeatsCPU
-except ImportError:
-    NBeatsCPU = None
-try:
-    from .nbeats_gpu import NBeatsExpert as NBeatsGPU
-except ImportError:
-    NBeatsGPU = None
-if NBeatsCPU:
-    register_model("nbeats", NBeatsCPU, NBeatsGPU)
-
-try:
-    from .tabnet import TabNetExpert as TabNetCPU
-except ImportError:
-    TabNetCPU = None
-try:
-    from .tabnet_gpu import TabNetExpert as TabNetGPU
-except ImportError:
-    TabNetGPU = None
-if TabNetCPU:
-    register_model("tabnet", TabNetCPU, TabNetGPU)
-
-try:
-    from .tide import TiDEExpert as TiDECPU
-except ImportError:
-    TiDECPU = None
-try:
-    from .tide_gpu import TiDEExpert as TiDEGPU
-except ImportError:
-    TiDEGPU = None
-if TiDECPU:
-    register_model("tide", TiDECPU, TiDEGPU)
-
-try:
-    from .kan import KANExpert as KANCPU  # noqa: N814
-except ImportError:
-    KANCPU = None
-try:
-    from .kan_gpu import KANExpert as KANGPU  # noqa: N814
-except ImportError:
-    KANGPU = None
-if KANCPU:
-    register_model("kan", KANCPU, KANGPU)
-
-try:
-    from .transformers import TransformerExpertTorch
-
-    register_model("transformer", TransformerExpertTorch, TransformerExpertTorch)  # same class, device handled inside
-except ImportError as e:
-    logger.warning(f"Transformer models not available: {e}")
-
-# NeuralForecast Transformers (PatchTST / TimesNet)
-try:
-    from .transformer_nf import PatchTSTExpert, TimesNetExpert
-
-    register_model("patchtst", PatchTSTExpert)
-    register_model("timesnet", TimesNetExpert)
-except ImportError as e:
-    logger.warning(f"NeuralForecast transformers not available: {e}")
-
-# NeuralForecast TiDE / NBEATSx
-try:
-    from .forecast_nf import TiDENFExpert, NBEATSxNFExpert
-
-    register_model("tide_nf", TiDENFExpert)
-    register_model("nbeatsx_nf", NBEATSxNFExpert)
-except ImportError as e:
-    logger.warning(f"NeuralForecast TiDE/NBEATSx not available: {e}")
-
-try:
-    from .rl import RLExpertPPO, RLExpertSAC
-
-    register_model("rl_ppo", RLExpertPPO)
-    register_model("rl_sac", RLExpertSAC)
-except ImportError as e:
-    logger.warning(f"RL models not available: {e}")
-try:
-    from .rllib_agent import RLlibPPOAgent, RLlibSACAgent
-
-    register_model("rllib_ppo", RLlibPPOAgent)
-    register_model("rllib_sac", RLlibSACAgent)
-except ImportError as e:
-    logger.warning(f"RLlib models not available: {e}")
-
-try:
-    from .evolution import EvoExpertCMA
-
-    register_model("evolution", EvoExpertCMA)
-except ImportError as e:
-    logger.warning(f"Evolution models not available: {e}")
-
-try:
-    from .genetic import GeneticStrategyExpert
-
-    register_model("genetic", GeneticStrategyExpert)
-except ImportError as e:
-    logger.warning(f"Genetic models not available: {e}")
-
-try:
-    from .unsupervised import ClusterExpert
-
-    register_model("unsupervised", ClusterExpert)
-except ImportError as e:
-    logger.warning(f"Unsupervised models not available: {e}")
+# Keep for backward compatibility with existing code
+MODEL_REGISTRY = MODEL_MAPPING

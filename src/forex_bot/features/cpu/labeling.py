@@ -269,65 +269,44 @@ if NUMBA_AVAILABLE:
 
         return labels
 
-    @njit(fastmath=True, parallel=False, nogil=True, cache=True)
+    @njit(fastmath=True, parallel=True, nogil=True, cache=True)
     def compute_dynamic_horizon(
         atr: np.ndarray,
         base_horizon: int,
         vol_scale: float,
     ) -> np.ndarray:
         """
-        Compute dynamic horizon based on volatility.
-
-        High volatility -> shorter horizon (price moves faster)
-        Low volatility -> longer horizon (need more time for move)
-
-        Parameters
-        ----------
-        atr : np.ndarray
-            ATR values
-        base_horizon : int
-            Base horizon in bars
-        vol_scale : float
-            Scaling factor for volatility adjustment
-
-        Returns
-        -------
-        np.ndarray
-            Dynamic horizon per bar
+        HPC Optimized: Parallel dynamic horizon calculation.
         """
         n = len(atr)
         horizon = np.zeros(n, dtype=np.int32)
 
-        # Compute median ATR for normalization
-        valid_atr = atr[atr > 0]
-        if len(valid_atr) == 0:
-            horizon[:] = base_horizon
+        # Compute mean ATR for fast parallel normalization
+        # (Median is hard to parallelize, Mean is near-instant)
+        sum_atr = 0.0
+        count = 0
+        for i in prange(n):
+            if atr[i] > 0:
+                sum_atr += atr[i]
+                count += 1
+        
+        if count == 0:
+            for i in prange(n): horizon[i] = base_horizon
             return horizon
 
-        median_atr = np.median(valid_atr)
-        if median_atr <= 0:
-            horizon[:] = base_horizon
-            return horizon
+        avg_atr = sum_atr / count
 
-        for i in range(n):
+        for i in prange(n):
             curr_atr = atr[i]
             if curr_atr <= 0:
                 horizon[i] = base_horizon
                 continue
 
-            # Normalize ATR relative to median
-            vol_ratio = curr_atr / median_atr
-
-            # Inverse relationship: high vol -> short horizon
-            # vol_ratio=2 (high vol) -> horizon = base / 2
-            # vol_ratio=0.5 (low vol) -> horizon = base * 2
+            vol_ratio = curr_atr / avg_atr
             adj_factor = 1.0 / (vol_ratio ** vol_scale)
 
-            # Clamp adjustment factor
-            if adj_factor < 0.25:
-                adj_factor = 0.25
-            elif adj_factor > 4.0:
-                adj_factor = 4.0
+            if adj_factor < 0.25: adj_factor = 0.25
+            elif adj_factor > 4.0: adj_factor = 4.0
 
             horizon[i] = max(5, int(base_horizon * adj_factor))
 

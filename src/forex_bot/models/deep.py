@@ -191,17 +191,17 @@ class NBeatsExpert(ExpertModel):
             X_train, X_val = X.iloc[:split], X.iloc[split:]
             y_train, y_val = y.iloc[:split], y.iloc[split:]
 
-        # Convert labels: {-1, 0, 1} -> {0, 1, 2} for CrossEntropyLoss
-        y_train_shifted = y_train.values + 1
-        y_val_shifted = y_val.values + 1
+        # HPC FIX: Unified Protocol Mapping
+        y_train_mapped = np.where(y_train.values == -1, 2, y_train.values).astype(int)
+        y_val_mapped = np.where(y_val.values == -1, 2, y_val.values).astype(int)
 
         X_t = torch.as_tensor(X_train.values, dtype=torch.float32, device="cpu")
-        y_t = torch.as_tensor(y_train_shifted, dtype=torch.long, device="cpu")
+        y_t = torch.as_tensor(y_train_mapped, dtype=torch.long, device="cpu")
         X_v = torch.as_tensor(X_val.values, dtype=torch.float32, device=self.device)
-        y_v = torch.as_tensor(y_val_shifted, dtype=torch.long, device=self.device)
+        y_v = torch.as_tensor(y_val_mapped, dtype=torch.long, device=self.device)
 
         # Compute class weights for balanced loss
-        class_weights = _compute_class_weight_tensor(y_train_shifted, self.device, num_classes=3)
+        class_weights = _compute_class_weight_tensor(y_train_mapped, self.device, num_classes=3)
 
         dataset = TensorDataset(X_t, y_t)
         is_cuda = torch.cuda.is_available() and str(self.device).startswith("cuda")
@@ -237,25 +237,17 @@ class NBeatsExpert(ExpertModel):
 
             epoch_loss = 0.0
             steps = 0
-            for bx, by in loader:
-                if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
-                    break
-                if is_cuda:
-                    bx = bx.to(self.device, non_blocking=True)
-                    by = by.to(self.device, non_blocking=True)
+            # HPC: Robust Volatility Weighting
+            # Locating 'returns' feature (assuming it's normalized near 0)
+            # We use a safer approach: compute per-sample importance based on label rarity
+            with torch.no_grad():
+                # Penalize errors on actual trade signals more than noise
+                vol_weight = torch.ones(len(by), device=self.device)
+                vol_weight[by != 1] *= 1.5 # Boost importance of trade signals (0, 2)
                 
-                # Volatility Weighting (Prop Firm Optimization)
-                # Feature 0 is 'returns'. Penalize errors on big moves to reduce drawdown.
-                with torch.no_grad():
-                    # Scale: 1% move => weight +1.0. 
-                    vol_weight = 1.0 + (torch.abs(bx[:, 0]) * 100.0)
-
-                optimizer.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                    out = self.model(bx)
-                    # Use functional CE to apply per-sample weights dynamically
-                    raw_loss = nn.functional.cross_entropy(out, by, weight=class_weights, reduction='none')
-                    loss = (raw_loss * vol_weight).mean()
+                # If feature 0 is indeed returns (high correlation check), use it
+                if torch.std(bx[:, 0]) < 5.0: # Sanity check for normalized returns
+                    vol_weight += torch.abs(bx[:, 0]) * 5.0
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -295,7 +287,9 @@ class NBeatsExpert(ExpertModel):
                 outs.append(torch.softmax(logits, dim=1).cpu().float().numpy())
         if not outs:
             raise RuntimeError("NBeats inference returned no batches")
-        return np.vstack(outs)
+        probs = np.vstack(outs)
+        # Unified Protocol: [Neutral, Buy, Sell] already in indices [0, 1, 2]
+        return probs[:, :3]
 
     def save(self, path: str) -> None:
         if self.model and (not self.is_ddp or self.rank == 0):
@@ -433,15 +427,16 @@ class TiDEExpert(ExpertModel):
             X_train, X_val = x.iloc[:split], x.iloc[split:]
             y_train, y_val = y.iloc[:split], y.iloc[split:]
 
-        y_train_shifted = y_train.values + 1
-        y_val_shifted = y_val.values + 1
+        # HPC FIX: Unified Protocol Mapping
+        y_train_mapped = np.where(y_train.values == -1, 2, y_train.values).astype(int)
+        y_val_mapped = np.where(y_val.values == -1, 2, y_val.values).astype(int)
 
         X_t = torch.as_tensor(X_train.values, dtype=torch.float32, device=self.device)
-        y_t = torch.as_tensor(y_train_shifted, dtype=torch.long, device=self.device)
+        y_t = torch.as_tensor(y_train_mapped, dtype=torch.long, device=self.device)
         X_v = torch.as_tensor(X_val.values, dtype=torch.float32, device=self.device)
-        y_v = torch.as_tensor(y_val_shifted, dtype=torch.long, device=self.device)
+        y_v = torch.as_tensor(y_val_mapped, dtype=torch.long, device=self.device)
 
-        class_weights = _compute_class_weight_tensor(y_train_shifted, self.device, num_classes=3)
+        class_weights = _compute_class_weight_tensor(y_train_mapped, self.device, num_classes=3)
 
         dataset = TensorDataset(X_t, y_t)
         sampler = None
@@ -475,24 +470,22 @@ class TiDEExpert(ExpertModel):
             epoch_loss = 0.0
             steps = 0
             for bx, by in loader:
-                # Volatility Weighting (Prop Firm Optimization)
+                if is_cuda:
+                    bx = bx.to(self.device, non_blocking=True)
+                    by = by.to(self.device, non_blocking=True)
+
+                # HPC: Robust Volatility Weighting
                 with torch.no_grad():
-                    vol_weight = 1.0 + (torch.abs(bx[:, 0]) * 100.0)
+                    vol_weight = torch.ones(len(by), device=self.device)
+                    vol_weight[by != 1] *= 1.5
+                    if torch.std(bx[:, 0]) < 5.0:
+                        vol_weight += torch.abs(bx[:, 0]) * 5.0
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     out = self.model(bx)
                     raw_loss = nn.functional.cross_entropy(out, by, weight=class_weights, reduction='none')
                     loss = (raw_loss * vol_weight).mean()
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                epoch_loss += loss.item()
-                steps += 1
-
-            avg_train_loss = epoch_loss / max(1, steps)
-            if tensorboard_writer:
-                tensorboard_writer.add_scalar("Loss/train_TiDE", avg_train_loss, epoch)
 
             if len(X_val) > 0:
                 self.model.eval()
@@ -525,7 +518,9 @@ class TiDEExpert(ExpertModel):
                 outs.append(torch.softmax(logits, dim=1).cpu().float().numpy())
         if not outs:
             raise RuntimeError("TiDE inference returned no batches")
-        return np.vstack(outs)
+        probs = np.vstack(outs)
+        # Unified Protocol: [Neutral, Buy, Sell] already in indices [0, 1, 2]
+        return probs[:, :3]
 
     def save(self, path: str) -> None:
         if self.model and (not self.is_ddp or self.rank == 0):
@@ -655,15 +650,16 @@ class TabNetExpert(ExpertModel):
             x_train, x_val = x.iloc[:split], x.iloc[split:]
             y_train, y_val = y.iloc[:split], y.iloc[split:]
 
-        y_train_shifted = y_train.values + 1
-        y_val_shifted = y_val.values + 1
+        # HPC FIX: Unified Protocol Mapping
+        y_train_mapped = np.where(y_train.values == -1, 2, y_train.values).astype(int)
+        y_val_mapped = np.where(y_val.values == -1, 2, y_val.values).astype(int)
 
         x_t = torch.as_tensor(x_train.values, dtype=torch.float32, device=self.device)
-        y_t = torch.as_tensor(y_train_shifted, dtype=torch.long, device=self.device)
+        y_t = torch.as_tensor(y_train_mapped, dtype=torch.long, device=self.device)
         x_v = torch.as_tensor(x_val.values, dtype=torch.float32, device=self.device)
-        y_v = torch.as_tensor(y_val_shifted, dtype=torch.long, device=self.device)
+        y_v = torch.as_tensor(y_val_mapped, dtype=torch.long, device=self.device)
 
-        class_weights = _compute_class_weight_tensor(y_train_shifted, self.device, num_classes=3)
+        class_weights = _compute_class_weight_tensor(y_train_mapped, self.device, num_classes=3)
 
         dataset = TensorDataset(x_t, y_t)
         sampler = None
@@ -697,9 +693,16 @@ class TabNetExpert(ExpertModel):
             epoch_loss = 0.0
             steps = 0
             for bx, by in loader:
-                # Volatility Weighting (Prop Firm Optimization)
+                if is_cuda:
+                    bx = bx.to(self.device, non_blocking=True)
+                    by = by.to(self.device, non_blocking=True)
+
+                # HPC: Robust Volatility Weighting
                 with torch.no_grad():
-                    vol_weight = 1.0 + (torch.abs(bx[:, 0]) * 100.0)
+                    vol_weight = torch.ones(len(by), device=self.device)
+                    vol_weight[by != 1] *= 1.5
+                    if torch.std(bx[:, 0]) < 5.0:
+                        vol_weight += torch.abs(bx[:, 0]) * 5.0
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
@@ -747,7 +750,9 @@ class TabNetExpert(ExpertModel):
                 outs.append(torch.softmax(logits, dim=1).cpu().float().numpy())
         if not outs:
             raise RuntimeError("TabNet inference returned no batches")
-        return np.vstack(outs)
+        probs = np.vstack(outs)
+        # Unified Protocol: [Neutral, Buy, Sell] already in indices [0, 1, 2]
+        return probs[:, :3]
 
     def save(self, path: str) -> None:
         if self.model and (not self.is_ddp or self.rank == 0):
@@ -866,15 +871,16 @@ class KANExpert(ExpertModel):
             x_train, x_val = x.iloc[:split], x.iloc[split:]
             y_train, y_val = y.iloc[:split], y.iloc[split:]
 
-        y_train_shifted = y_train.values + 1
-        y_val_shifted = y_val.values + 1
+        # HPC FIX: Unified Protocol Mapping
+        y_train_mapped = np.where(y_train.values == -1, 2, y_train.values).astype(int)
+        y_val_mapped = np.where(y_val.values == -1, 2, y_val.values).astype(int)
 
         x_t = torch.as_tensor(x_train.values, dtype=torch.float32, device=self.device)
-        y_t = torch.as_tensor(y_train_shifted, dtype=torch.long, device=self.device)
+        y_t = torch.as_tensor(y_train_mapped, dtype=torch.long, device=self.device)
         x_v = torch.as_tensor(x_val.values, dtype=torch.float32, device=self.device)
-        y_v = torch.as_tensor(y_val_shifted, dtype=torch.long, device=self.device)
+        y_v = torch.as_tensor(y_val_mapped, dtype=torch.long, device=self.device)
 
-        class_weights = _compute_class_weight_tensor(y_train_shifted, self.device, num_classes=3)
+        class_weights = _compute_class_weight_tensor(y_train_mapped, self.device, num_classes=3)
 
         dataset = TensorDataset(x_t, y_t)
         sampler = None
@@ -908,9 +914,16 @@ class KANExpert(ExpertModel):
             epoch_loss = 0.0
             steps = 0
             for bx, by in loader:
-                # Volatility Weighting (Prop Firm Optimization)
+                if is_cuda:
+                    bx = bx.to(self.device, non_blocking=True)
+                    by = by.to(self.device, non_blocking=True)
+
+                # HPC: Robust Volatility Weighting
                 with torch.no_grad():
-                    vol_weight = 1.0 + (torch.abs(bx[:, 0]) * 100.0)
+                    vol_weight = torch.ones(len(by), device=self.device)
+                    vol_weight[by != 1] *= 1.5
+                    if torch.std(bx[:, 0]) < 5.0:
+                        vol_weight += torch.abs(bx[:, 0]) * 5.0
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
@@ -958,7 +971,9 @@ class KANExpert(ExpertModel):
                 outs.append(torch.softmax(logits, dim=1).cpu().float().numpy())
         if not outs:
             raise RuntimeError("KAN inference returned no batches")
-        return np.vstack(outs)
+        probs = np.vstack(outs)
+        # Unified Protocol: [Neutral, Buy, Sell] already in indices [0, 1, 2]
+        return probs[:, :3]
 
     def save(self, path: str) -> None:
         if self.model and (not self.is_ddp or self.rank == 0):

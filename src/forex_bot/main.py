@@ -9,63 +9,14 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-def _is_truthy(value: str | None) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _ensure_global_python() -> None:
-    """Enforce global Python (no venv/conda) to avoid stale env junk."""
-    in_venv = bool(os.environ.get("VIRTUAL_ENV")) or (
-        hasattr(sys, "real_prefix") or sys.base_prefix != sys.prefix
-    )
-    if not in_venv:
-        return
-    if _is_truthy(os.environ.get("FOREX_BOT_ALLOW_VENV")):
-        return
-    if _is_truthy(os.environ.get("FOREX_BOT_VENV_REEXEC")):
-        print("[FATAL] Virtual env detected and re-exec already attempted.")
-        print("        Please run with global/system Python (no .venv).")
-        raise SystemExit(2)
-
-    base_prefix = Path(sys.base_prefix)
-    if os.name == "nt":
-        candidates = [base_prefix / "python.exe"]
-    else:
-        candidates = [base_prefix / "bin" / "python3", base_prefix / "bin" / "python"]
-
-    base_python = next((p for p in candidates if p.exists()), None)
-    if base_python is None:
-        print("[FATAL] Virtual env detected but global Python not found.")
-        print("        Please run with system Python or set FOREX_BOT_ALLOW_VENV=1.")
-        raise SystemExit(2)
-
-    os.environ["FOREX_BOT_VENV_REEXEC"] = "1"
-    print(f"[INIT] Virtual env detected. Re-launching with {base_python}...")
-    os.execv(str(base_python), [str(base_python), *sys.argv])
-
-
-if __name__ == "__main__" and __package__ is None:
-    sys.path.append(str(Path(__file__).resolve().parent.parent))
-    __package__ = "forex_bot"
-
-if __name__ == "__main__":
-    _ensure_global_python()
-    src_root = Path(__file__).resolve().parent.parent
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
-    try:
-        print("[INIT] Checking and auto-installing dependencies (Hardware-Aware)...", flush=True)
-        from forex_bot.core.deps import ensure_dependencies
-
-        ensure_dependencies()
-    except Exception as dep_err:
-        print(f"[WARN] Dependency bootstrap failed: {dep_err}", file=sys.stderr)
-
 from forex_bot.core.config import Settings
 from forex_bot.core.logging import setup_logging
 from forex_bot.data.loader import DataLoader
 from forex_bot.execution.bot import ForexBot
-from forex_bot.models.device import maybe_init_distributed  # DDP Support
+
+# No DDP support here; we use internal ThreadPools for 8-GPU scaling.
+def maybe_init_distributed():
+    return None
 
 
 def _global_models_exist(models_dir: Path = Path("models")) -> bool:
@@ -672,33 +623,16 @@ async def main_async():
             logger.info("ONNX export requested and no manifest found; exporting ONNX models now...")
             await asyncio.to_thread(_export_onnx_from_saved_models, models_dir)
 
-    default_concurrency = min(len(symbols), max(1, getattr(base_settings.system, "n_jobs", 1)))
-    sem = asyncio.Semaphore(default_concurrency)
-
-    tasks = []
-    for symbol in symbols:
-        instance_settings = deepcopy(base_settings)
-        instance_settings.system.symbol = symbol
-
-        async def _run_one(s=instance_settings):
-            async with sem:
-                await run_bot_instance(s, stop_event)
-
-        tasks.append(asyncio.create_task(_run_one()))
-
-    async def _cancel_on_stop():
-        await stop_event.wait()
-        for t in tasks:
-            t.cancel()
-        listener.cancel()
-
-    stopper = asyncio.create_task(_cancel_on_stop())
-
-    try:
-        await asyncio.gather(*tasks, listener, stopper, return_exceptions=True)
-    finally:
-        listener.cancel()
-        stopper.cancel()
+    # HPC LIVE: Launch all symbols in parallel tasks
+    logger.info(f"HPC: Launching {len(symbols)} parallel trading engines...")
+    
+    async with asyncio.TaskGroup() as tg:
+        for symbol in symbols:
+            instance_settings = deepcopy(base_settings)
+            instance_settings.system.symbol = symbol
+            tg.create_task(run_bot_instance(instance_settings, stop_event))
+            
+    logger.info("All trading engines stopped.")
 
 
 def load_keys(keys_path: str = "keys.txt"):

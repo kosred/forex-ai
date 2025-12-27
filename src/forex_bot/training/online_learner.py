@@ -9,6 +9,9 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
 from sklearn.metrics.pairwise import cosine_similarity
 
 from ..models.base import ExpertModel
@@ -105,24 +108,29 @@ class OnlineLearner:
 
     def is_repeat_mistake(self, current_features: pd.DataFrame, threshold: float = 0.95) -> bool:
         """
-        Check if current market state matches a past disaster.
-        Returns True if this looks like a 'Bad Idea'.
+        HPC Optimized: GPU-accelerated similarity guard.
         """
         if not self.loss_archive:
             return False
 
         try:
-            curr_vec = current_features.iloc[0].to_numpy(dtype=np.float32).reshape(1, -1)
-            archive_matrix = np.stack(self.loss_archive)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            curr_vec = torch.from_numpy(current_features.iloc[0].to_numpy(dtype=np.float32)).to(device)
+            archive_tensor = torch.from_numpy(np.stack(self.loss_archive)).to(device)
 
-            sims = cosine_similarity(curr_vec, archive_matrix)
-            max_sim = np.max(sims)
+            # HPC: Compute cosine similarity using pure torch matrix math
+            # CosSim(A, B) = (A dot B) / (||A|| * ||B||)
+            a_norm = F.normalize(curr_vec.unsqueeze(0), p=2, dim=1)
+            b_norm = F.normalize(archive_tensor, p=2, dim=1)
+            
+            sims = torch.mm(a_norm, b_norm.transpose(0, 1))
+            max_sim = torch.max(sims).item()
 
             if max_sim > threshold:
                 logger.warning(f"Similarity guard: current setup matches a past loss ({max_sim:.2f}). Blocking.")
                 return True
         except Exception as e:
-            logger.warning(f"Similarity check failed: {e}")
+            logger.warning(f"GPU similarity check failed: {e}")
 
         return False
 

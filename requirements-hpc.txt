@@ -1,0 +1,60 @@
+# ============================================================
+# ABSOLUTE HPC MASTER STACK (FORK-VERIFIED 2025)
+# OS: Ubuntu 24.04 | PY: 3.13.x | CUDA: 12.8 | TORCH: 2.9.1
+# ============================================================
+--prefer-binary
+--break-system-packages
+
+# --- 1. CORE DEEP LEARNING (STABLE cu128 RELEASES) ---
+--index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
+
+# --- 2. GPU-NATIVE DATA STACK (RAPIDS + CUPY) ---
+--extra-index-url https://pypi.nvidia.com
+cudf-cu12==25.12.0
+cuml-cu12==25.12.0
+cupy-cuda12x==13.6.0
+
+# --- 3. MODERN FORKS (SPECIFICALLY FOR PY 3.13) ---
+pytorch-tabnet2==4.5.3
+# Using GitHub Master for KAN due to 3.13 stability patches
+git+https://github.com/Blealtan/efficient-kan.git
+# FlashAttention community-optimized binary
+https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.6.8/flash_attn-2.8.3+cu130torch2.9-cp313-cp313-linux_x86_64.whl
+
+# --- 4. MACHINE LEARNING MODELS (3.13 VERIFIED) ---
+catboost==1.2.8
+xgboost==3.1.2
+lightgbm==4.6.0
+scikit-learn==1.6.0
+stable-baselines3[extra]==2.8.0a2
+evotorch==0.6.1
+cma==4.4.1
+
+# --- 5. DATA & MATH (BINARY-SAFE) ---
+numpy==2.2.1
+pandas==2.2.3
+scipy==1.14.1
+numexpr==2.14.0
+pyarrow==18.1.0
+joblib==1.4.2
+sqlalchemy==2.0.36
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# --- 6. DISTRIBUTED & INFRA (FIXED FOR 3.13) ---
+# High version Ray to avoid NeuralForecast conflict
+ray[default,rllib]>=2.53.0
+ax-platform[mysql]==1.2.1
+botorch>=0.16.1
+onnxruntime-gpu==1.20.1
+tqdm==4.67.1
+psutil==6.1.1
+requests==2.32.3
+PyYAML==6.0.2
+colorama==0.4.6
+openai==2.14.0
+# Loose NeuralForecast to avoid Ray pin issues
+neuralforecast>=1.7.0

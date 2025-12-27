@@ -74,6 +74,19 @@ class OmniFormerBackbone(nn.Module):
 
         self.norm = nn.LayerNorm(d_model)
         self.pool_attn = nn.Linear(d_model, 1)
+        
+        # HPC FIX: Strategic Weight Initialization
+        self._init_weights()
+
+    def _init_weights(self):
+        """Standardized Xavier/Kaiming initialization for financial stability."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Parameter):
+                nn.init.normal_(m, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, f = x.shape

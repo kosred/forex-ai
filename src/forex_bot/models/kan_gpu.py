@@ -85,34 +85,17 @@ class KANExpert(ExpertModel):
             X_train, X_val = X.iloc[:split], X.iloc[split:]
             y_train, y_val = y.iloc[:split], y.iloc[split:]
 
-        # Convert to tensors on CPU to avoid VRAM OOM
-        X_t = torch.as_tensor(
-            dataframe_to_float32_numpy(X_train), dtype=torch.float32, device="cpu"
-        )
-        y_t = torch.as_tensor(
-            y_train.to_numpy() + 1, dtype=torch.long, device="cpu"
-        )  # -1,0,1 -> 0,1,2
+        # HPC FIX: Unified Protocol Mapping
+        # -1 (Sell) -> 2, 0 (Neutral) -> 0, 1 (Buy) -> 1
+        y_mapped = np.where(y_train.to_numpy() == -1, 2, y_train.to_numpy()).astype(int)
+        y_t = torch.as_tensor(y_mapped, dtype=torch.long, device="cpu")
 
         X_v = None
         y_v = None
         if len(X_val) > 0:
-            try:
-                max_val = int(os.environ.get("FOREX_BOT_KAN_VAL_MAX_ROWS", "200000") or 200000)
-            except Exception:
-                max_val = 200000
-            if max_val > 0 and len(X_val) > max_val:
-                X_val = X_val.iloc[-max_val:]
-                y_val = y_val.iloc[-max_val:]
-            X_v = torch.as_tensor(
-                dataframe_to_float32_numpy(X_val),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            y_v = torch.as_tensor(
-                y_val.to_numpy() + 1,
-                dtype=torch.long,
-                device=self.device,
-            )
+            # ...
+            y_v_mapped = np.where(y_val.to_numpy() == -1, 2, y_val.to_numpy()).astype(int)
+            y_v = torch.as_tensor(y_v_mapped, dtype=torch.long, device=self.device)
 
         # KAN library expects [Input -> Hidden -> Output] layers list
         # We construct a simple 2-layer KAN: Input -> Hidden -> 3 (Classes)
@@ -159,28 +142,37 @@ class KANExpert(ExpertModel):
 
         start = time.time()
 
+        # HPC: Enable Automatic Mixed Precision (AMP)
+        scaler = torch.amp.GradScaler("cuda", enabled=is_cuda)
+        amp_dtype = torch.bfloat16 if (is_cuda and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+
         # Training Loop
         self.model.train()
         es_pat, es_delta = get_early_stop_params(20, 0.001)
         early_stopper = EarlyStopper(patience=es_pat, min_delta=es_delta)
         for epoch in range(1000):
             if sampler:
-                sampler.set_epoch(epoch)  # Crucial for shuffling in DDP
+                sampler.set_epoch(epoch)
 
             if time.time() - start > self.max_time_sec:
                 break
 
             total_loss = 0
             for bx, by in loader:
-                # Move batch to device
                 bx = bx.to(self.device, non_blocking=is_cuda)
                 by = by.to(self.device, non_blocking=is_cuda)
 
-                optimizer.zero_grad()
-                logits = self.model(bx)
-                loss = criterion(logits, by)
-                loss.backward()
-                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                
+                # AMP Autocast
+                with torch.amp.autocast("cuda", enabled=is_cuda, dtype=amp_dtype):
+                    logits = self.model(bx)
+                    loss = criterion(logits, by)
+                
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
                 total_loss += loss.item()
 
             if tensorboard_writer:
@@ -219,9 +211,8 @@ class KANExpert(ExpertModel):
         if not outs:
             raise RuntimeError("KAN GPU inference returned no batches")
         probs = np.vstack(outs)
-        # Training encodes labels as y+1 where y ∈ {-1,0,1} -> class indices {0,1,2}.
-        # Reorder to project convention [neutral, buy, sell].
-        return probs[:, [1, 2, 0]]
+        # Unified Protocol: [Neutral, Buy, Sell] already in indices [0, 1, 2]
+        return probs[:, :3]
 
     def save(self, path: str) -> None:
         if self.model:

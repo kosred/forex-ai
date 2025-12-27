@@ -106,14 +106,24 @@ class ExitAgent(ExpertModel):
             potential_gain = exit_price - min_future_price
             potential_loss = max_future_price - exit_price
 
+        # HPC FIX: Balanced Reward Logic (No Fear Bias)
         reward = 0.0
-        if action == 1:  # Closed Early
-            if potential_loss > potential_gain:
-                reward = 1.0  # Good call, it dropped
-            elif potential_gain > (potential_loss * 2):
-                reward = -1.0  # Bad call, it went to moon
+        
+        # 1. Regret Analysis (What if we held?)
+        if action == 1: # Closed Early
+            if potential_gain > (potential_loss * 1.5):
+                reward = -1.0 # Missed out on huge rally
+            elif potential_loss > (potential_gain * 1.5):
+                reward = 1.0 # Good protection
             else:
-                reward = 0.1  # Neutral/Choppy, taking profit is fine
+                reward = 0.0 # Neutral
+        else: # Held
+            if potential_gain > (potential_loss * 1.5):
+                reward = 1.0 # Great hold
+            elif potential_loss > (potential_gain * 1.5):
+                reward = -1.0 # Failed to protect
+            else:
+                reward = 0.1 # Patient hold is slightly rewarded
 
         self.memory.append((data["state"], action, reward, None, True))  # Terminal state
 

@@ -63,15 +63,35 @@ def _vol_ewma(close: np.ndarray, *, window: int, lam: float) -> np.ndarray:
     return sigma
 
 
-def _vol_parkinson(high: np.ndarray, low: np.ndarray) -> np.ndarray:
-    hl = _safe_log(high) - _safe_log(low)
-    return (hl * hl) / (4.0 * np.log(2.0))
+from numba import njit, prange
 
+@njit(cache=True, fastmath=True, parallel=True)
+def _vol_parkinson_numba(high, low, window):
+    n = len(high)
+    out = np.zeros(n, dtype=np.float64)
+    hl = np.log(high) - np.log(low)
+    sq_hl = hl * hl
+    
+    for i in prange(window, n):
+        # Rolling mean of squared HL
+        out[i] = np.sqrt(np.mean(sq_hl[i-window+1 : i+1]) / (4.0 * np.log(2.0)))
+    return out
 
-def _vol_garman_klass(open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
-    hl = _safe_log(high) - _safe_log(low)
-    co = _safe_log(close) - _safe_log(open_)
-    return 0.5 * (hl * hl) - (2.0 * np.log(2.0) - 1.0) * (co * co)
+@njit(cache=True, fastmath=True)
+def _estimate_hurst_fast(series):
+    # Fast Hurst approximation without heavy polyfit
+    n = len(series)
+    if n < 20: return 0.5
+    
+    # Simple rescaled range approach
+    m = np.mean(series)
+    z = np.cumsum(series - m)
+    r = np.max(z) - np.min(z)
+    s = np.std(series)
+    if s < 1e-12: return 0.5
+    return math.log(r/s) / math.log(n)
+
+class StopTargetEngine: # Wrapper logic if needed
 
 
 def _vol_rogers_satchell(open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:

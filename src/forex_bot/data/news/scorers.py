@@ -75,16 +75,17 @@ class OpenAIScorer:
             return None
 
         system_prompt = (
-            "You are a senior FX macro strategist. "
-            "Analyze the given news headline for its impact on the specified currencies. "
-            "1. Identify the core economic event (rate decision, CPI, geopolitical, speech). "
-            "2. Determine the likely impact on yield differentials and risk sentiment. "
-            "3. Decide whether this strengthens or weakens the currency. "
-            "4. Output a JSON object with: "
-            "   - 'direction': 'buy' (strengthens currency), 'sell' (weakens), or 'neutral'. "
-            "   - 'sentiment': Float from -1.0 (extremely bearish) to 1.0 (extremely bullish). "
-            "   - 'confidence': Float 0.0-1.0 based on clarity of the event. "
-            "   - 'reasoning': A concise 1-sentence explanation."
+            "You are a Quantitative Macro Strategist at a top-tier FX Hedge Fund. "
+            "Analyze the headline for its impact on Global Liquidity and Yield Differentials. "
+            "1. Catalyst: Identify the specific driver (Central Bank, Inflation, Geopolitics). "
+            "2. Flow: Is this a Risk-On (Bullish high-yielders like AUD) or Risk-Off (Bullish JPY/USD) event? "
+            "3. Yield: How does this affect the 2Y/10Y spread for the target currencies? "
+            "4. OUTPUT FORMAT (JSON): "
+            "   - 'direction': 'buy' | 'sell' | 'neutral' "
+            "   - 'sentiment': Float (-1.0 to 1.0). Be aggressive: use 0.8+ for major surprises. "
+            "   - 'confidence': Float (0.0 to 1.0). Use 0.9+ for NFP/CPI/Interest Rate results. "
+            "   - 'impact_horizon': 'short' | 'medium' | 'long' "
+            "   - 'reasoning': Max 15 words explaining the fundamental shift."
         )
 
         user_content = {"headline": title, "currencies": currencies, "context": "Intraday to Swing trading horizon."}
@@ -121,8 +122,9 @@ class OpenAIScorer:
                 return None
 
             direction = str(data.get("direction", "neutral")).lower()
-            confidence = float(data.get("confidence", 0.0))
-            sentiment = float(data.get("sentiment", 0.0))
+            # HPC FIX: Strict Boundary Enforcement
+            confidence = np.clip(float(data.get("confidence", 0.0)), 0.0, 1.0)
+            sentiment = np.clip(float(data.get("sentiment", 0.0)), -1.0, 1.0)
 
             if sentiment == 0.0:
                 if direction == "buy":
@@ -130,7 +132,7 @@ class OpenAIScorer:
                 elif direction == "sell":
                     sentiment = -0.5
 
-            return ScoreResult(sentiment=sentiment, confidence=confidence, direction=direction)
+            return ScoreResult(sentiment=float(sentiment), confidence=float(confidence), direction=direction)
 
         except AuthenticationError as auth_err:
             logger.warning(f"OpenAI authentication failed; disabling OpenAI scorer: {auth_err}")

@@ -129,14 +129,8 @@ class PropAwareStrategySearch:
 
     def _prop_metric(self, metrics: np.ndarray) -> float:
         """
-        Prop-style fitness optimized for 4% monthly profit target.
-        Uses actual MT5 balance, no hardcoded values.
-        metrics = [
-            NetProfit, Sharpe, Sortino, MaxDD, WinRate, ProfitFactor,
-            Expectancy, SQN, Trades, Consistency, MaxDailyDD
-        ]
+        HPC FIX: Hard-Stop Survival Enforcement.
         """
-        # Handle 11 metrics (added ConsistencyScore + MaxDailyDD)
         (
             net_profit,
             sharpe,
@@ -153,7 +147,10 @@ class PropAwareStrategySearch:
 
         dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.07) or 0.07)
         daily_limit = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
-        # No minimum trades requirement
+
+        # 1. Survival Check (Hard Limit)
+        if max_dd >= dd_limit or daily_dd >= daily_limit:
+            return -100.0 # Disqualified
 
         monthly_ret_pct = (net_profit / self.actual_balance) * 100.0
         target_monthly_pct = 4.0
@@ -165,21 +162,10 @@ class PropAwareStrategySearch:
         fitness += 0.5 * sharpe
         fitness += 0.2 * profit_factor
         fitness += 0.1 * (win_rate * 100.0)
-        fitness -= 50.0 * max(0.0, max_dd - dd_limit)
-
-        # Soft penalties for drawdown violations (no hard-kill)
-        excess_dd = max(0.0, max_dd - dd_limit)
-        excess_daily = max(0.0, daily_dd - daily_limit)
-        denom = 1.0
-        if dd_limit > 0:
-            denom += 10.0 * (excess_dd / dd_limit)
-        else:
-            denom += 10.0 * excess_dd
-        if daily_limit > 0:
-            denom += 10.0 * (excess_daily / daily_limit)
-        else:
-            denom += 10.0 * excess_daily
-        fitness = fitness / denom
+        
+        # Stability: penalize zero trade strategies
+        if trades < 10:
+            fitness -= 50.0
 
         return float(fitness)
 
@@ -269,7 +255,7 @@ class PropAwareStrategySearch:
     def _evaluate_population_parallel(self, genes: list[GeneticGene]) -> None:
         """
         Evaluate a population in parallel.
-        If distributed, shard genes by rank to avoid duplicate work; otherwise thread pool.
+        HPC FIX: Use ProcessPoolExecutor for TRUE GIL bypass.
         """
         # Shard by rank if running under torchrun
         if self.world_size > 1:
@@ -277,8 +263,12 @@ class PropAwareStrategySearch:
         genes_to_eval = [g for g in genes if g.strategy_id not in self.fitness_cache]
         if not genes_to_eval:
             return
+            
         max_workers = self.max_workers or 1
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        spawn_ctx = multiprocessing.get_context("spawn")
+        
+        # HPC: True Multi-Process Evaluation
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as ex:
             future_map = {ex.submit(self._evaluate_gene, g): g for g in genes_to_eval}
             for fut in concurrent.futures.as_completed(future_map):
                 g = future_map[fut]

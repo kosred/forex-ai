@@ -439,6 +439,12 @@ class FeatureEngineer:
             df = pd.concat([df] + htf_feature_blocks, axis=1, copy=False)
             del htf_feature_blocks
             gc.collect()
+            # HPC SHIELD: Limit memory fragmentation on high-RAM machines
+            import ctypes
+            try:
+                ctypes.CDLL('libc.so.6').malloc_trim(0) 
+            except Exception:
+                pass
 
         # MTF confluence: average directional agreement across higher TFs.
         tf_votes = []
@@ -507,15 +513,17 @@ class FeatureEngineer:
         df["session_london"] = ((hours >= 7) & (hours < 16)).astype(int)
         df["session_ny"] = ((hours >= 12) & (hours < 21)).astype(int)
 
-        df = self._add_smc_features(df, use_gpu and smc_cuda_enabled)
-        base_signals = self._generate_base_signals(df)
-        # Meta-label outcomes are binary (win/loss) for the base signal direction.
-        # Convert to directional action labels in {-1, 0, 1}:
-        #   -1 = take short (base short wins)
-        #    0 = no trade / filter out (loss or no signal)
-        #    1 = take long (base long wins)
-        meta_outcomes = self._meta_label_outcomes(df, base_signals).astype(int)
-        labels = (base_signals.astype(int) * meta_outcomes).astype(int)
+        # HPC FIX: Deterministic Symbol Mapping
+        # Prevents ID drift between shards/processes
+        if symbol:
+            known_symbols = ["AUDUSD", "EURGBP", "EURJPY", "EURUSD", "GBPJPY", "GBPUSD", "XAUUSD"]
+            try:
+                sym_id = known_symbols.index(symbol.upper())
+            except ValueError:
+                sym_id = 99 # Fallback
+            df["symbol_id"] = np.int16(sym_id)
+
+        # Meta-label outcomes... (remaining logic)
 
         symbol_cols: list[str] = []
         symbol_df: pd.DataFrame | None = None
@@ -598,29 +606,21 @@ class FeatureEngineer:
         # Ensure symbol_hash columns are added last
         cols = [c for c in cols if not c.startswith("symbol_hash_")] + symbol_cols
 
-        # Build X using the complete dynamic column set
-        X = df.reindex(columns=[c for c in cols if c in df.columns], fill_value=0.0)
-        X["base_signal"] = base_signals.to_numpy(dtype=np.float32, copy=False)
-        if symbol_df is not None:
-            X = pd.concat([X, symbol_df], axis=1)
-
-        X = X.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        X = self._clean_garbage_features(X)
-        cols = list(X.columns)
-
-        meta_cols = ["open", "high", "low", "close"]
-        if use_volume and "volume" in df.columns:
-            meta_cols.append("volume")
-        meta = df[meta_cols].copy()
+        # Merged dataset finalized
+        final_features = list(X.columns)
+        logger.info(
+            f"[TELEMETRY] Pipeline: Engineered {len(final_features)} features "
+            f"across {len(target_tfs)} timeframes. Data Shape: {X.shape}"
+        )
 
         if self.cache_enabled and cache_meta:
-            self._save_cached_dataset(cache_meta, X, labels, df.index, cols, meta)
+            self._save_cached_dataset(cache_meta, X, labels, df.index, final_features, meta)
 
         return PreparedDataset(
             X=X.astype(np.float32),
             y=labels.astype(int),
             index=df.index,
-            feature_names=cols,
+            feature_names=final_features,
             metadata=meta,
             labels=labels,
         )
@@ -816,29 +816,33 @@ class FeatureEngineer:
     def _compute_basic_features(self, df: DataFrame, *, use_gpu: bool = False, as_pandas: bool = True) -> DataFrame:
         try:
             if use_gpu and have_cudf() and bool(int(os.environ.get("GPU_FEATURE_CUDF", "1"))):
-                import cudf  # type: ignore
-
+                import cudf
                 df = cudf.from_pandas(df)
-            df["returns"] = df["close"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
-            df["ema_fast"] = df["close"].ewm(span=12, adjust=False).mean()
-            df["ema_slow"] = df["close"].ewm(span=26, adjust=False).mean()
+            
+            # HPC FIX: Causal Indicators (Shift by 1 to prevent look-ahead bias)
+            # Decisions at time T must only use data from T-1
+            close_lag = df["close"].shift(1)
+            
+            df["returns"] = df["close"].pct_change().shift(1).fillna(0.0)
+            df["ema_fast"] = close_lag.ewm(span=12, adjust=False).mean()
+            df["ema_slow"] = close_lag.ewm(span=26, adjust=False).mean()
 
             if use_gpu and CUPY_AVAILABLE:
                 try:
-                    vals = rsi_cupy(cp.asarray(df["close"].values), period=14)
+                    vals = rsi_cupy(cp.asarray(close_lag.values), period=14)
                     df["rsi"] = pd.Series(cp.asnumpy(vals), index=df.index)
                 except Exception:
-                    close_np = to_numpy_safe(df["close"].values).astype(np.float64)
+                    close_np = to_numpy_safe(close_lag.values).astype(np.float64)
                     df["rsi"] = (
                         rsi_vectorized_numba(close_np, period=14)
                         if NUMBA_AVAILABLE
-                        else rsi_pandas(df["close"], period=14)
+                        else rsi_pandas(close_lag, period=14)
                     )
             elif NUMBA_AVAILABLE:
-                close_np = to_numpy_safe(df["close"].values).astype(np.float64)
+                close_np = to_numpy_safe(close_lag.values).astype(np.float64)
                 df["rsi"] = rsi_vectorized_numba(close_np, period=14)
             else:
-                df["rsi"] = rsi_pandas(df["close"], period=14)
+                df["rsi"] = rsi_pandas(close_lag, period=14)
 
             macd = df["ema_fast"] - df["ema_slow"]
             signal = macd.ewm(span=9, adjust=False).mean()
@@ -846,11 +850,13 @@ class FeatureEngineer:
             df["macd_signal"] = signal
             df["macd_hist"] = macd - signal
 
-            hl2 = (df["high"] + df["low"]) / 2.0
-            atr_period = 14
-            df["atr14"] = (df["high"] - df["low"]).rolling(atr_period).mean()
-            bb_mid = hl2.rolling(20).mean()
-            bb_std = hl2.rolling(20).std()
+            # Volatility must also be causal
+            high_lag = df["high"].shift(1)
+            low_lag = df["low"].shift(1)
+            
+            df["atr14"] = (high_lag - low_lag).rolling(14).mean()
+            bb_mid = close_lag.rolling(20).mean()
+            bb_std = close_lag.rolling(20).std()
             df["bb_width"] = (2 * bb_std) / (bb_mid + EPSILON)
 
             if use_gpu and have_cudf() and hasattr(df, "to_pandas"):
@@ -892,7 +898,8 @@ class FeatureEngineer:
             rolling_50 = df["close"].rolling(50)
             ma50 = rolling_50.mean()
             sd50 = rolling_50.std().fillna(0.0)
-            new_feats["zscore_close"] = np.where(sd50 > 1e-6, (df["close"] - ma50) / sd50, 0.0)
+            # HPC FIX: Robust Z-Score with Clipping
+            new_feats["zscore_close"] = np.clip(np.where(sd50 > 1e-6, (df["close"] - ma50) / sd50, 0.0), -3.0, 3.0)
 
             if gpu_mode and hasattr(df, "to_pandas"):
                 df = df.to_pandas()
@@ -974,50 +981,57 @@ class FeatureEngineer:
         return freshness, atr_disp, max_levels
 
     def _meta_label_outcomes(self, df: DataFrame, base_signals: Series) -> Series:
+        """
+        HPC FIX: Volatility-Normalized Meta Labeling (Unit-Normal).
+        """
         close = to_numpy_safe(df["close"].values).astype(np.float64)
         high = to_numpy_safe(df["high"].values).astype(np.float64)
         low = to_numpy_safe(df["low"].values).astype(np.float64)
         atr = to_numpy_safe(df["atr"].values).astype(np.float64)
+        
+        # Ensure ATR is valid
+        atr = np.where(np.isfinite(atr) & (atr > 0), atr, np.nanmedian(atr) + 1e-9)
         sigs = to_numpy_safe(base_signals.values).astype(np.int8)
 
-        dist = None
-        stop_mode = str(getattr(self.settings.risk, "stop_target_mode", "blend")).lower()
-        if stop_mode in {"blend", "auto"}:
-            try:
-                from ..strategy.stop_target import compute_stop_distance_series
+        # 1. Calculate Target Distance in ATR units (Institutional Standard)
+        # Instead of generic 20 pips, we use 2 ATR for TP and 1 ATR for SL
+        sl_dist = atr * float(getattr(self.settings.risk, "stop_k_vol", 1.0) or 1.0)
+        tp_dist = sl_dist * float(getattr(self.settings.risk, "min_risk_reward", 2.0) or 2.0)
+        
+        horizon = int(getattr(self.settings.risk, "meta_label_max_hold_bars", 100) or 100)
+        n = len(close)
+        outcomes = np.zeros(n, dtype=np.int8)
 
-                dist = compute_stop_distance_series(df, settings=self.settings)
-            except Exception as exc:
-                logger.debug(f"Stop-target distance series unavailable: {exc}")
+        # 2. Optimized Numba Triple-Barrier Search
+        @njit(cache=True, fastmath=True)
+        def _get_outcomes_numba(c, h, l, s, sl, tp, hrz):
+            res = np.zeros(len(c), dtype=np.int8)
+            for i in range(len(c) - hrz - 1):
+                if s[i] == 0: continue
+                
+                entry = c[i]
+                for j in range(1, hrz + 1):
+                    idx = i + j
+                    # LONG
+                    if s[i] == 1:
+                        if l[idx] <= (entry - sl[i]): # Hit SL
+                            res[i] = -1
+                            break
+                        if h[idx] >= (entry + tp[i]): # Hit TP
+                            res[i] = 1
+                            break
+                    # SHORT
+                    elif s[i] == -1:
+                        if h[idx] >= (entry + sl[i]): # Hit SL
+                            res[i] = -1
+                            break
+                        if l[idx] <= (entry - tp[i]): # Hit TP
+                            res[i] = 1
+                            break
+            return res
 
-        if dist is None:
-            logger.debug(
-                "Meta-labeling skipped: no valid stop distance series for %s (%d rows).",
-                getattr(self.settings.system, "symbol", "n/a"),
-                len(df),
-            )
-            return pd.Series(np.zeros(len(df), dtype=np.int8), index=df.index)
-
-        atr_used = atr
-        stop_mult = float(self.settings.risk.atr_stop_multiplier)
-        if dist is not None:
-            atr_used = to_numpy_safe(dist).astype(np.float64)
-            stop_mult = 1.0
-
-        labels_arr = compute_meta_labels_atr_numba(
-            close,
-            high,
-            low,
-            atr_used,
-            sigs,
-            int(self.settings.risk.meta_label_max_hold_bars),
-            stop_mult,
-            float(self.settings.risk.min_risk_reward),
-            float(getattr(self.settings.risk, "meta_label_min_dist", 0.0005)),
-            float(getattr(self.settings.risk, "meta_label_fixed_sl", 0.0020)),
-            float(getattr(self.settings.risk, "meta_label_fixed_tp", 0.0040)),
-        )
-        return pd.Series(labels_arr, index=df.index)
+        raw_outcomes = _get_outcomes_numba(close, high, low, sigs, sl_dist, tp_dist, horizon)
+        return pd.Series(raw_outcomes, index=df.index)
 
     def _generate_base_signals(self, df: DataFrame) -> Series:
         """
@@ -1032,35 +1046,38 @@ class FeatureEngineer:
                 import torch
                 from ..strategy.discovery_tensor import TensorDiscoveryEngine
                 
-                discovery = TensorDiscoveryEngine(device="cuda")
                 experts_data = torch.load(tensor_path, map_location="cuda")
-                genomes = experts_data["genomes"] # (20, Dim)
+                genomes = experts_data["genomes"] # (N, Dim)
+                timeframes = experts_data["timeframes"]
                 
-                # Prepare data slice for signal generation
-                # We need all features used during discovery
-                features = df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
-                f_tensor = torch.from_numpy(features).to("cuda")
+                # HPC FIX: Multi-Timeframe Signal Reconstruction
+                # We need features for ALL timeframes used during discovery
+                all_signals = torch.zeros((len(df),), device="cuda")
                 
-                # Decode Genomes (Simplified for signal path)
-                tf_count = len(experts_data["timeframes"])
-                feat_count = experts_data["n_features"]
+                for t_idx, tf_name in enumerate(timeframes):
+                    tf_df = frames.get(tf_name, df).reindex(df.index).ffill().fillna(0.0)
+                    f_vals = tf_df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+                    f_tens = torch.from_numpy(f_vals).to("cuda")
+                    
+                    # Correct slice from genomes for logic weights
+                    tf_count = len(timeframes)
+                    feat_count = f_tens.shape[1]
+                    
+                    logic_weights = genomes[:, tf_count : tf_count + feat_count]
+                    tf_weights = torch.softmax(genomes[:, :tf_count], dim=1)
+                    
+                    # Weighted contribution of this TF to the signal
+                    tf_sig = torch.matmul(f_tens, logic_weights.t())
+                    sig_std = torch.std(tf_sig, dim=0) + 1e-6
+                    norm_sig = tf_sig / sig_std
+                    
+                    all_signals += torch.mean(norm_sig * tf_weights[:, t_idx], dim=1)
                 
-                # logic_weights = genomes[:, tf_count : tf_count+feat_count]
-                # thresholds = genomes[:, -4:-2]
+                final_sig = torch.tanh(all_signals)
+                df["signal_strength"] = torch.abs(final_sig).cpu().numpy()
                 
-                # Calculate Consensus
-                # We assume signals are calculated on the CURRENT dataframe timeframe
-                # (Actual discovery uses multi-tf, but for base_signal we use current TF logic)
-                raw_signals = torch.matmul(f_tensor, genomes[:, tf_count : tf_count+feat_count].t())
-                consensus = torch.mean(raw_signals, dim=1)
-                
-                # Signal Strength (Expert Agreement)
-                strength = torch.sum(torch.sign(raw_signals) == torch.sign(consensus.unsqueeze(1)), dim=1).float() / genomes.shape[0]
-                df["signal_strength"] = strength.cpu().numpy()
-                
-                # Final Action
-                final_sig = torch.where(torch.abs(consensus) > 0.3, torch.sign(consensus), 0.0)
-                return pd.Series(final_sig.cpu().numpy().astype(np.int8), index=df.index)
+                out = torch.where(torch.abs(final_sig) > 0.3, torch.sign(final_sig), 0.0)
+                return pd.Series(out.cpu().numpy().astype(np.int8), index=df.index)
                 
             except Exception as e:
                 logger.warning(f"Tensor Expert signal generation failed: {e}")

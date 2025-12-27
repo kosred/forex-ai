@@ -45,79 +45,77 @@ if NUMBA_AVAILABLE:
         return out
 
 
+if NUMBA_AVAILABLE:
+    @njit(cache=True, fastmath=True, parallel=True)
+    def _compute_daily_profile_numba(low, high, close, volume, day_ids):
+        n = len(close)
+        poc_out = np.zeros(n, dtype=np.float32)
+        vah_out = np.zeros(n, dtype=np.float32)
+        val_out = np.zeros(n, dtype=np.float32)
+        
+        # 1. Identify Day Start/End Indices
+        day_changes = np.where(day_ids[1:] != day_ids[:-1])[0] + 1
+        day_starts = np.concatenate([[0], day_changes])
+        day_ends = np.concatenate([day_changes, [n]])
+        
+        # 2. Parallel Profile Calculation
+        for d in prange(len(day_starts)):
+            start, end = day_starts[d], day_ends[d]
+            if end - start < 5: continue
+            
+            p_min, p_max = np.min(low[start:end]), np.max(high[start:end])
+            if p_max == p_min: continue
+            
+            bin_size = (p_max - p_min) / 50.0 # Standard 50-bin profile
+            bins = np.zeros(50, dtype=np.float32)
+            
+            for i in range(start, end):
+                b_idx = int((close[i] - p_min) / bin_size)
+                if b_idx >= 50: b_idx = 49
+                bins[b_idx] += volume[i]
+            
+            poc_bin = np.argmax(bins)
+            poc_price = p_min + (poc_bin * bin_size)
+            
+            # Simple 70% Value Area
+            total_v = np.sum(bins)
+            target_v = total_v * 0.70
+            
+            # Sort bins by volume
+            sorted_bins = np.argsort(bins)[::-1]
+            cum_v = 0.0
+            min_b, max_b = poc_bin, poc_bin
+            
+            for b in sorted_bins:
+                cum_v += bins[b]
+                min_b = min(min_b, b)
+                max_b = max(max_b, b)
+                if cum_v >= target_v: break
+                
+            # Propagation: Today's profile features become tomorrow's inputs (prevent leakage)
+            if d + 1 < len(day_starts):
+                next_start, next_end = day_starts[d+1], day_ends[d+1]
+                poc_out[next_start:next_end] = poc_price
+                vah_out[next_start:next_end] = p_min + (max_b * bin_size)
+                val_out[next_start:next_end] = p_min + (min_b * bin_size)
+                
+        return poc_out, vah_out, val_out
+
 def compute_volume_profile_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute Session Volume Profile features: POC, VAH, VAL."""
+    """HPC Optimized: Parallel Volume Profile."""
     if "close" not in df.columns or "volume" not in df.columns:
         return df
-
     try:
-
-        def calc_day_profile(group):
-            price_min = group["low"].min()
-            price_max = group["high"].max()
-            if price_max == price_min:
-                return pd.Series(0, index=["poc", "vah", "val"])
-
-            bin_size = (price_max - price_min) / 100.0
-            if bin_size == 0:
-                bin_size = 0.0001
-
-            bins = ((group["close"] - price_min) / bin_size).astype(int)
-            vol_by_bin = group.groupby(bins)["volume"].sum().sort_index()
-
-            if vol_by_bin.empty:
-                return pd.Series(0, index=["poc", "vah", "val"])
-
-            poc_bin = vol_by_bin.idxmax()
-            poc_price = price_min + (poc_bin * bin_size)
-
-            total_vol = vol_by_bin.sum()
-            target_vol = total_vol * 0.70
-
-            sorted_vol = vol_by_bin.sort_values(ascending=False)
-            cum_vol = 0
-            va_bins = []
-            for b, v in sorted_vol.items():
-                cum_vol += v
-                va_bins.append(b)
-                if cum_vol >= target_vol:
-                    break
-
-            if not va_bins:
-                vah = val = poc_price
-            else:
-                vah = price_min + (max(va_bins) * bin_size)
-                val = price_min + (min(va_bins) * bin_size)
-
-            return pd.Series({"poc": poc_price, "vah": vah, "val": val})
-
-        daily_stats = df.groupby(df.index.date).apply(calc_day_profile)
-        daily_stats = daily_stats.shift(1)
-
-        daily_stats.index = pd.to_datetime(daily_stats.index)
-        if hasattr(df.index, "tz") and df.index.tz is not None:
-            if getattr(daily_stats.index, "tz", None) is None:
-                if str(df.index.tz) == "UTC":
-                    daily_stats.index = daily_stats.index.tz_localize("UTC")
-                else:
-                    daily_stats.index = daily_stats.index.tz_localize(df.index.tz)
-
-        temp_df = df.copy()
-        temp_df["date"] = temp_df.index.normalize()
-        merged = temp_df.merge(daily_stats, left_on="date", right_index=True, how="left")
-
-        df["poc_daily"] = merged["poc"].ffill().fillna(0.0)
-        df["vah_daily"] = merged["vah"].ffill().fillna(0.0)
-        df["val_daily"] = merged["val"].ffill().fillna(0.0)
-
+        l, h, c, v = df["low"].values, df["high"].values, df["close"].values, df["volume"].values
+        day_ids = df.index.dayofyear.values.astype(np.int32)
+        
+        poc, vah, val = _compute_daily_profile_numba(l, h, c, v, day_ids)
+        
+        df["poc_daily"], df["vah_daily"], df["val_daily"] = poc, vah, val
         df["dist_to_poc"] = df["close"] - df["poc_daily"]
-        df["in_value_area"] = ((df["close"] >= df["val_daily"]) & (df["close"] <= df["vah_daily"])).astype(int)
-
+        df["in_value_area"] = ((df["close"] >= df["val_daily"]) & (df["close"] <= df["vah_daily"])).astype(np.int8)
     except Exception as e:
-        logger.warning(f"Volume profile calc failed: {e}")
-        df["dist_to_poc"] = 0.0
-        df["in_value_area"] = 0
-
+        logger.warning(f"Volume profile failed: {e}")
     return df
 
 

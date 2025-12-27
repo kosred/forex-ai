@@ -128,52 +128,31 @@ def _get_model_classes(model: Any) -> list[int] | None:
 
 def _reorder_to_neutral_buy_sell(probs: np.ndarray, classes: list[int] | None) -> np.ndarray:
     """
-    Ensure probabilities are shape (n,3) and ordered as [neutral, buy, sell].
-    If `classes` is provided, it must match `probs.shape[1]`.
+    HPC PROTOCOL: Force output to [Neutral, Buy, Sell].
+    Standard indices: 0=Neutral, 1=Buy, 2=Sell.
     """
     arr = np.asarray(probs, dtype=float)
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
     n = arr.shape[0]
-
-    if arr.shape[1] >= 3:
-        arr = arr[:, :3]
-        # If we know classes, reorder.
-        if classes and len(classes) >= 3:
-            classes = classes[:3]
-            out = np.zeros((n, 3), dtype=float)
-            for col, cls in enumerate(classes):
-                if cls == 0:
-                    out[:, 0] = arr[:, col]
-                elif cls == 1:
-                    out[:, 1] = arr[:, col]
-                elif cls == -1:
-                    out[:, 2] = arr[:, col]
-                elif cls == 2:
-                    out[:, 2] = arr[:, col]
-            return out
-        return arr
-
     out = np.zeros((n, 3), dtype=float)
-    if classes and len(classes) == arr.shape[1]:
-        for col, cls in enumerate(classes):
-            if cls == 0:
-                out[:, 0] = arr[:, col]
-            elif cls == 1:
-                out[:, 1] = arr[:, col]
-            elif cls == -1:
-                out[:, 2] = arr[:, col]
-            elif cls == 2:
-                out[:, 2] = arr[:, col]
-        return out
-
-    # Fallback: assume columns are [neutral, buy] or [p_buy]
+    
+    # If model is binary (Neutral vs Signal)
     if arr.shape[1] == 2:
-        out[:, 0] = arr[:, 0]
-        out[:, 1] = arr[:, 1]
+        out[:, 0] = arr[:, 0] # Neutral
+        out[:, 1] = arr[:, 1] # Buy (Default assumption for 2-class)
+        return out
+        
+    # If model is multiclass
+    if classes is not None:
+        for col, cls_val in enumerate(classes):
+            # Map based on our contiguous mapping: 0=Sell, 1=Neutral, 2=Buy
+            # (Wait, let's match the remap_labels we just made: -1->0, 0->1, 1->2)
+            if cls_val == 0: out[:, 2] = arr[:, col] # Sell
+            elif cls_val == 1: out[:, 0] = arr[:, col] # Neutral
+            elif cls_val == 2: out[:, 1] = arr[:, col] # Buy
     else:
-        out[:, 0] = 1.0 - arr[:, 0]
-        out[:, 1] = arr[:, 0]
+        # Fallback to direct mapping if classes missing
+        return arr # Assume [Neutral, Buy, Sell]
+        
     return out
 
 
@@ -204,23 +183,27 @@ def _augment_time_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def _remap_labels_to_contiguous(y: pd.Series | np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
     """
-    Map {-1,0,1} style labels to contiguous {0,1,2} expected by some tree libs.
-    Returns remapped array and mapping dict.
+    HPC FIX: Hardcoded Deterministic Mapping.
+    Prevents 'Label Drift' where Buy/Sell columns are swapped depending on data.
+    Order: -1 -> 0 (Sell), 0 -> 1 (Neutral), 1 -> 2 (Buy)
     """
     y_arr = np.asarray(y, dtype=int)
-    mapping: dict[int, int] = {}
-    # Unique in stable order
-    uniq = list(dict.fromkeys(int(v) for v in y_arr))
-    for new_idx, old in enumerate(uniq):
-        mapping[old] = new_idx
-    remapped = np.array([mapping[int(v)] for v in y_arr], dtype=int)
+    mapping = {-1: 0, 0: 1, 1: 2}
+    
+    # Fast vectorized mapping
+    remapped = np.zeros_like(y_arr)
+    remapped[y_arr == -1] = 0
+    remapped[y_arr == 0] = 1
+    remapped[y_arr == 1] = 2
+    
     return remapped, mapping
 
 
 class LightGBMExpert(ExpertModel):
-    def __init__(self, params: dict[str, Any] = None) -> None:
+    def __init__(self, params: dict[str, Any] = None, idx: int = 1) -> None:
         self.model = None
         self._gpu_only_disabled = False
+        self.idx = idx # Store index for GPU distribution
         self.params = params or {
             "n_estimators": 800,
             "num_leaves": 64,
@@ -280,9 +263,12 @@ class LightGBMExpert(ExpertModel):
 
             if use_gpu:
                 params["device_type"] = "gpu"
-                params.setdefault("max_bin", 63)  # critical for GPU speed
+                params.setdefault("max_bin", 63)
                 params.setdefault("gpu_use_dp", False)
-                params.setdefault("gpu_device_id", 0)
+                # HPC: Spread models across all 8 GPUs
+                import torch
+                gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                params["gpu_device_id"] = (self.idx - 1) % gpu_count
             else:
                 params["device_type"] = "cpu"
                 params.pop("gpu_use_dp", None)
@@ -410,9 +396,10 @@ class LightGBMExpert(ExpertModel):
 
 
 class RandomForestExpert(ExpertModel):
-    def __init__(self, params: dict[str, Any] = None) -> None:
+    def __init__(self, params: dict[str, Any] = None, idx: int = 1) -> None:
         self.model = None
         self._gpu_only_disabled = False
+        self.idx = idx
         self.params = params or {
             "n_estimators": 400,
             "max_depth": 16,
@@ -441,9 +428,12 @@ class RandomForestExpert(ExpertModel):
             import cupy as cp
             import cudf
             from cuml.ensemble import RandomForestClassifier as CuRF
+            import torch
 
-            # Select specific GPU if specified in params
-            gpu_id = self.params.get("gpu_device_id", 0)
+            # HPC: Spread models across all 8 GPUs
+            gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+            gpu_id = (self.idx - 1) % gpu_count
+            
             with cp.cuda.Device(gpu_id):
                 # Convert to cudf/cupy for best performance
                 x_gpu = cudf.DataFrame.from_pandas(x)
@@ -664,9 +654,10 @@ class ElasticNetExpert(ExpertModel):
 
 
 class XGBoostExpert(ExpertModel):
-    def __init__(self, params: dict[str, Any] = None) -> None:
+    def __init__(self, params: dict[str, Any] = None, idx: int = 1) -> None:
         self.model = None
         self._gpu_only_disabled = False
+        self.idx = idx
 
         self.params = params or {
             "n_estimators": 800,
@@ -703,7 +694,10 @@ class XGBoostExpert(ExpertModel):
 
         if use_gpu:
             # Newer XGBoost prefers `tree_method=hist` + `device=cuda`.
-            self.params.setdefault("device", "cuda")
+            import torch
+            gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+            gpu_id = (self.idx - 1) % gpu_count
+            self.params.setdefault("device", f"cuda:{gpu_id}")
             self.params["tree_method"] = "gpu_hist"
         else:
             self.params.pop("device", None)
@@ -796,9 +790,10 @@ class XGBoostExpert(ExpertModel):
 
 
 class CatBoostExpert(ExpertModel):
-    def __init__(self, params: dict[str, Any] = None) -> None:
+    def __init__(self, params: dict[str, Any] = None, idx: int = 1) -> None:
         self.model = None
         self._gpu_only_disabled = False
+        self.idx = idx
 
         pref = _tree_device_preference()
         has_cuda = _torch_cuda_available()
@@ -830,7 +825,10 @@ class CatBoostExpert(ExpertModel):
 
         if use_gpu:
             self.params.setdefault("task_type", "GPU")
-            self.params.setdefault("devices", "0")
+            import torch
+            gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+            gpu_id = (self.idx - 1) % gpu_count
+            self.params.setdefault("devices", str(gpu_id))
             self.params.setdefault("border_count", 32)
         else:
             # Ensure we don't accidentally try to run CatBoost in GPU mode without devices.

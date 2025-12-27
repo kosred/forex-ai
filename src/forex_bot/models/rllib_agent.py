@@ -48,30 +48,46 @@ def _default_config(device: str, num_workers: int = 1) -> dict[str, Any]:
 
 def _apply_resources(cfg: Any, device: str, num_workers: int) -> Any:
     """
-    Map GPUs to learner/rollout workers.
-    - Single GPU: give it to the learner, keep workers on CPU.
-    - Multi-GPU: reserve 1 for learner, give 1 per worker up to remaining GPUs.
+    HPC Resource Strategy:
+    - 252 Cores: Deploy up to 128 environment runners.
+    - 8 GPUs: Distribute learner across all cards if using PyTorch DDP.
     """
     import multiprocessing
-
-    gpus = get_available_gpus()
-    total_gpus = len(gpus)
+    import torch
+    
     cpu_total = multiprocessing.cpu_count()
-
-    learner_gpus = 1 if total_gpus > 0 else 0
-
-    req_workers = max(0, num_workers)
-    if total_gpus > 1:
-        max_gpu_workers = max(0, total_gpus - 1)
-        worker_count = min(req_workers, max_gpu_workers)
-        worker_gpus = 1 if worker_count > 0 else 0
-    else:
-        worker_count = min(req_workers, max(0, cpu_total - 1))
-        worker_gpus = 0
-
-    cfg = cfg.resources(num_gpus=learner_gpus, num_gpus_per_worker=worker_gpus, num_cpus_per_worker=1)
-    # Optimize for CPU: Vectorize environments (4 per worker) to amortize overhead
-    cfg = cfg.env_runners(num_env_runners=worker_count, num_envs_per_env_runner=4)
+    gpu_total = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    
+    # 1. Scaling Workers (Rollout)
+    # Use 50% of cores for environment simulation
+    target_workers = max(1, cpu_total // 2)
+    # Cap at 128 to avoid Ray scheduling overhead
+    worker_count = min(target_workers, 128)
+    
+    # 2. Scaling Learner (Training)
+    # Use all GPUs for the learner if we have them
+    num_gpus = gpu_total if gpu_total > 0 else 0
+    
+    cfg = cfg.resources(
+        num_gpus=num_gpus,
+        num_cpus_per_worker=1,
+        num_gpus_per_worker=0 # Keep workers on CPU to save VRAM for learner
+    )
+    
+    # 3. Vectorization (Throughput)
+    # Each runner handles 8 environments in parallel
+    cfg = cfg.env_runners(
+        num_env_runners=worker_count,
+        num_envs_per_env_runner=8
+    )
+    
+    # 4. HPC Batching (A6000 Speed)
+    # Increase batch size to utilize A6000 Tensor Cores
+    cfg = cfg.training(
+        train_batch_size=8192,
+        minibatch_size=1024
+    )
+    
     return cfg
 
 

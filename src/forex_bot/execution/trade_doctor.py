@@ -20,6 +20,48 @@ class CloseInstruction:
     score: float
 
 
+from numba import njit
+
+@njit(cache=True, fastmath=True)
+def _diagnose_positions_numba(
+    pos_types, pos_prices_open, pos_sls, pos_durations,
+    current_price, momentum, rsi, volatility,
+    stall_threshold, min_profit_bank, reversal_sens
+):
+    n = len(pos_types)
+    results = np.zeros(n, dtype=np.int8) # 0=Hold, 1=Close
+    
+    for i in range(n):
+        p_type = pos_types[i]
+        p_open = pos_prices_open[i]
+        p_dur = pos_durations[i]
+        
+        # HPC FIX: Volatility-Normalized Distance
+        # We use ATR (volatility) as the yardstick instead of hard SL
+        # Standard SL is usually ~2 ATR
+        effective_risk = max(volatility * 2.0, 1e-9)
+        
+        curr_dist = (current_price - p_open) if p_type == 0 else (p_open - current_price)
+        r_mult = curr_dist / effective_risk
+        
+        # 1. Stall Check (Vol-Aware)
+        if r_mult > min_profit_bank and p_dur > stall_threshold and abs(momentum) < (volatility * 0.3):
+            results[i] = 1
+            continue
+            
+        # 2. Reversal Check (Dynamic Momentum)
+        if r_mult > 0.5: # In decent profit
+            # If momentum flips against us by more than 0.5 ATR
+            if p_type == 0 and momentum < -(volatility * 0.5): results[i] = 1
+            elif p_type == 1 and momentum > (volatility * 0.5): results[i] = 1
+            if results[i] == 1: continue
+            
+        # 3. Zombie Check (Time-Aware)
+        if -0.2 < r_mult < 0 and p_dur > 240: # 4 hours of nothing
+            results[i] = 1
+            
+    return results
+
 class TradeDoctor:
     """
     Active Trade Management (ATM) Agent.
@@ -49,35 +91,50 @@ class TradeDoctor:
 
     def diagnose(self, positions: list[MT5Position], frames: dict[str, pd.DataFrame]) -> list[CloseInstruction]:
         """
-        Evaluate all open positions.
+        HPC Optimized: Evaluate all open positions using Numba.
         """
         instructions = []
         if not positions:
             return instructions
 
-        df = frames.get("M1")
-        if df is None:
-            df = frames.get("M5")
+        symbol = self.settings.system.symbol
+        target_positions = [p for p in positions if p.symbol == symbol]
+        if not target_positions:
+            return instructions
+
+        df = frames.get("M1") or frames.get("M5")
         if df is None or df.empty:
             return instructions
 
-        current_price = df["close"].iloc[-1]
+        current_price = float(df["close"].iloc[-1])
         recent_closes = df["close"].iloc[-5:].values
-        momentum = (recent_closes[-1] - recent_closes[0]) if len(recent_closes) > 1 else 0.0
-
-        rsi = df["rsi"].iloc[-1] if "rsi" in df.columns else 50.0
-
-        vol = df["atr"].iloc[-1] if "atr" in df.columns else 0.001
-
+        momentum = float(recent_closes[-1] - recent_closes[0]) if len(recent_closes) > 1 else 0.0
+        rsi = float(df["rsi"].iloc[-1]) if "rsi" in df.columns else 50.0
+        vol = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0.001
         now = datetime.now(UTC)
 
-        for pos in positions:
-            if pos.symbol != self.settings.system.symbol:
-                continue
+        # Prepare arrays for Numba
+        pos_types = np.array([p.type for p in target_positions], dtype=np.int8)
+        pos_prices_open = np.array([p.price_open for p in target_positions], dtype=np.float64)
+        pos_sls = np.array([p.sl for p in target_positions], dtype=np.float64)
+        pos_durations = np.array([(now - p.time).total_seconds() / 60.0 for p in target_positions], dtype=np.float64)
 
-            instruction = self._check_position(pos, current_price, momentum, rsi, vol, now)
-            if instruction:
-                instructions.append(instruction)
+        # Call Numba Pass
+        results = _diagnose_positions_numba(
+            pos_types, pos_prices_open, pos_sls, pos_durations,
+            current_price, momentum, rsi, vol,
+            float(self.stall_threshold_minutes),
+            float(self.min_profit_to_bank),
+            float(self.reversal_sensitivity)
+        )
+
+        # Convert results back to instructions
+        for i, res in enumerate(results):
+            if res == 1:
+                p = target_positions[i]
+                instructions.append(CloseInstruction(
+                    p.ticket, p.symbol, 0.0, "TradeDoctor: Technical Exit (Numba)", 1.0
+                ))
 
         return instructions
 

@@ -366,6 +366,9 @@ class HyperparameterOptimizer:
 
     @staticmethod
     def _pad_probs(probs: np.ndarray) -> np.ndarray:
+        """
+        HPC UNIFIED PROTOCOL: Force output to [Neutral, Buy, Sell].
+        """
         if probs is None or len(probs) == 0:
             return np.zeros((0, 3), dtype=float)
         arr = np.asarray(probs, dtype=float)
@@ -373,11 +376,10 @@ class HyperparameterOptimizer:
             arr = arr.reshape(-1, 1)
         n = arr.shape[0]
 
-        if arr.shape[1] >= 3:
-            return arr[:, :3]
-
         out = np.zeros((n, 3), dtype=float)
-        if arr.shape[1] == 2:
+        if arr.shape[1] == 3:
+            return arr
+        elif arr.shape[1] == 2:
             out[:, 0] = arr[:, 0]
             out[:, 1] = arr[:, 1]
             return out
@@ -575,7 +577,8 @@ class HyperparameterOptimizer:
                 max_daily = max(max_daily, float(daily_dd))
                 if trades <= 0:
                     continue
-                monthly_ret = (net_profit / 100000.0) / months
+                init_balance = float(getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0)
+                monthly_ret = (net_profit / init_balance) / months
                 calmar = (monthly_ret / dd) if dd > 1e-9 else 0.0
                 prop_score = (
                     monthly_ret * 100.0
@@ -657,7 +660,8 @@ class HyperparameterOptimizer:
         if required > 0 and trades < required:
             return _invalid(dd, daily_dd)
 
-        monthly_ret = (net_profit / 100000.0) / months
+        init_balance = float(getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0)
+        monthly_ret = (net_profit / init_balance) / months
         calmar = (monthly_ret / dd) if dd > 1e-9 else 0.0
         prop_score = (
             monthly_ret * 100.0
@@ -665,7 +669,7 @@ class HyperparameterOptimizer:
             + 0.4 * calmar
             + 0.2 * profit_factor
             + 0.1 * (win_rate * 100.0)
-            - 50.0 * max(0.0, dd - 0.04)
+            - 50.0 * max(0.0, dd - dd_limit)
         )
         prop_score *= _penalty_factor(float(dd), float(daily_dd), float(monthly_ret))
         return {
@@ -892,7 +896,7 @@ class HyperparameterOptimizer:
             best_config["num_class"] = int(y_train.nunique())
         return best_config
 
-    def _optimize_all_ray_tune(
+    async def _optimize_all_ray_tune_async(
         self,
         X_train: pd.DataFrame,
         y_train: pd.Series,
@@ -900,43 +904,39 @@ class HyperparameterOptimizer:
         y_val: pd.Series,
         meta_val: pd.DataFrame | None,
     ) -> dict[str, dict[str, Any]]:
-        logger.info(
-            f"Ray Tune/Ax HPO: trials={self.n_trials} backend={self.hpo_backend}"
-        )
+        logger.info(f"HPC HPO: Launching parallel tuning for all models across {len(self.device_pool)} GPUs...")
         best_params: dict[str, dict[str, Any]] = {}
-
-        model_batches = [
-            ["LightGBM", "RandomForest", "XGBoostRF", "XGBoostDART", "CatBoostAlt", "MLP"],
-            ["TabNet", "N-BEATS", "TiDE", "KAN"],
-            ["Transformer"],
+        
+        all_models = [
+            "LightGBM", "RandomForest", "XGBoostRF", "XGBoostDART", "CatBoostAlt", "MLP",
+            "TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"
         ]
 
-        for batch in model_batches:
-            for name in batch:
-                if self._should_stop():
-                    logger.info("Stop requested; skipping remaining HPO runs.")
-                    self._save_params(best_params)
-                    return best_params
-                try:
-                    import gc
+        async def _tune_single(name):
+            if self._should_stop(): return name, {}
+            try:
+                # Run the heavy ray tune in a thread to keep event loop responsive
+                result = await asyncio.to_thread(
+                    self._ray_tune_model, name, X_train, y_train, X_val, y_val, meta_val
+                )
+                return name, result
+            except Exception as e:
+                logger.error(f"HPO failed for {name}: {e}")
+                return name, {}
 
-                    gc.collect()
-                    try:
-                        import torch
-
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                    logger.info(f"Starting {name} Ray Tune/Ax HPO")
-                    best_params[name] = self._ray_tune_model(
-                        name, X_train, y_train, X_val, y_val, meta_val
-                    )
-                except Exception as exc:
-                    logger.error(f"Ray Tune optimization for {name} failed: {exc}")
+        # HPC BLITZ: Launch every model study at the same time
+        results = await asyncio.gather(*[_tune_single(m) for m in all_models])
+        
+        for name, params in results:
+            if params:
+                best_params[name] = params
 
         self._save_params(best_params)
         return best_params
+
+    def _optimize_all_ray_tune(self, *args, **kwargs):
+        # Compatibility wrapper for sync callers
+        return asyncio.run(self._optimize_all_ray_tune_async(*args, **kwargs))
 
     def optimize_all(
         self,

@@ -18,82 +18,76 @@ class GenesisLibrary:
 
     @staticmethod
     def get_smart_trend_archetype() -> TALibStrategyGene:
-        """
-        Archetype 1: Adaptive Trend Following.
-        Uses KAMA (Kaufman Adaptive MA) instead of EMA to filter chop.
-        """
+        """Archetype 1: Stochastic Adaptive Trend."""
+        # HPC FIX: Randomized seed to prevent Mode Collapse
+        kama_p = random.choice([5, 10, 14, 21])
         indicators = ["KAMA", "MAMA", "ADX"]
         params = {
-            "KAMA": {"timeperiod": 10},  # Fast adaptive
-            "MAMA": {"fastlimit": 0.5, "slowlimit": 0.05},
-            "ADX": {"timeperiod": 14},
+            "KAMA": {"timeperiod": kama_p},
+            "MAMA": {"fastlimit": random.uniform(0.4, 0.6), "slowlimit": 0.05},
+            "ADX": {"timeperiod": random.choice([10, 14, 21])},
         }
         return TALibStrategyGene(
             indicators=indicators,
             params=params,
             combination_method="weighted_vote",
-            long_threshold=0.6,
-            short_threshold=-0.6,
+            long_threshold=random.uniform(0.5, 0.7),
+            short_threshold=-random.uniform(0.5, 0.7),
             weights={"KAMA": 0.5, "MAMA": 0.3, "ADX": 0.2},
             preferred_regime="trend",
-            strategy_id="genesis_smart_trend",
-            use_ob=False,  # Pure trend initially
-            use_fvg=True,  # FVG often aligns with strong trends
-            mtf_confirmation=True,  # Crucial for trend
-            tp_pips=60.0,
-            sl_pips=30.0,
+            strategy_id=f"genesis_smart_trend_{random.randint(0, 999)}",
+            use_ob=False,
+            use_fvg=True,
+            mtf_confirmation=True,
+            tp_pips=random.uniform(40.0, 80.0),
+            sl_pips=random.uniform(20.0, 40.0),
         )
 
     @staticmethod
     def get_mean_reversion_archetype() -> TALibStrategyGene:
-        """
-        Archetype 2: Volatility-Based Mean Reversion.
-        Uses Bollinger Band Width to detect squeeze/expansion and RSI for entry.
-        """
+        """Archetype 2: Stochastic Mean Reversion."""
+        bb_p = random.choice([14, 20, 34])
         indicators = ["BBANDS", "RSI", "MFI"]
         params = {
-            "BBANDS": {"timeperiod": 20, "nbdevup": 2.0, "nbdevdn": 2.0},
-            "RSI": {"timeperiod": 7},  # Faster RSI for mean rev
-            "MFI": {"timeperiod": 14},
+            "BBANDS": {"timeperiod": bb_p, "nbdevup": random.uniform(1.8, 2.5), "nbdevdn": random.uniform(1.8, 2.5)},
+            "RSI": {"timeperiod": random.choice([7, 10, 14])},
+            "MFI": {"timeperiod": random.choice([14, 21])},
         }
         return TALibStrategyGene(
             indicators=indicators,
             params=params,
             combination_method="threshold",
-            long_threshold=0.7,  # Higher threshold for contrarian trades
-            short_threshold=-0.7,
+            long_threshold=random.uniform(0.6, 0.8),
+            short_threshold=-random.uniform(0.6, 0.8),
             weights={"BBANDS": 0.4, "RSI": 0.4, "MFI": 0.2},
             preferred_regime="range",
-            strategy_id="genesis_mean_rev",
-            use_liq_sweep=True,  # Sweep often marks the reversal top/bottom
-            use_premium_discount=True,  # Buy in discount, sell in premium
-            tp_pips=20.0,  # Quick scalp
-            sl_pips=15.0,
+            strategy_id=f"genesis_mean_rev_{random.randint(0, 999)}",
+            use_liq_sweep=True,
+            use_premium_discount=True,
+            tp_pips=random.uniform(15.0, 30.0),
+            sl_pips=random.uniform(10.0, 20.0),
         )
 
     @staticmethod
     def get_institutional_flow_archetype() -> TALibStrategyGene:
-        """
-        Archetype 3: Order Flow & Volume.
-        Uses VWAP (simulated via MFI/OBV context) and SMC structures.
-        Note: True VWAP is calculated in pipeline, here we use proxies available in TA-Lib mixer logic.
-        """
+        """Archetype 3: Stochastic Institutional Flow."""
+        mfi_p = random.choice([7, 14, 21])
         indicators = ["MFI", "OBV", "ADOSC"]
-        params = {"MFI": {"timeperiod": 14}, "ADOSC": {"fastperiod": 3, "slowperiod": 10}}
+        params = {"MFI": {"timeperiod": mfi_p}, "ADOSC": {"fastperiod": 3, "slowperiod": 10}}
         return TALibStrategyGene(
             indicators=indicators,
             params=params,
             combination_method="weighted_vote",
-            long_threshold=0.55,
-            short_threshold=-0.55,
+            long_threshold=random.uniform(0.5, 0.65),
+            short_threshold=-random.uniform(0.5, 0.65),
             weights={"MFI": 0.4, "OBV": 0.3, "ADOSC": 0.3},
             preferred_regime="any",
-            strategy_id="genesis_inst_flow",
-            use_ob=True,  # Order blocks are key
-            use_inducement=True,  # Trap trading
+            strategy_id=f"genesis_inst_flow_{random.randint(0, 999)}",
+            use_ob=True,
+            use_inducement=True,
             mtf_confirmation=True,
-            tp_pips=40.0,
-            sl_pips=20.0,
+            tp_pips=random.uniform(30.0, 60.0),
+            sl_pips=random.uniform(15.0, 30.0),
         )
 
     @staticmethod

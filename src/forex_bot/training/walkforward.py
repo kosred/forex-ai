@@ -38,7 +38,10 @@ def embargoed_walkforward_backtest(
         return {"walk_forward_splits": 0}
 
     window = max(1, n // n_splits)
-    embargo_bars = max(0, embargo_minutes // max(1, timeframe_minutes))
+    # HPC FIX: Robust Embargo (Clear indicators and labels)
+    # Most TA-Lib indicators use up to 200 bars. Labels look forward 100.
+    auto_embargo = int(os.environ.get("FOREX_BOT_WALKFORWARD_EMBARGO", "300") or 300)
+    embargo_bars = max(embargo_minutes // max(1, timeframe_minutes), auto_embargo)
     results = []
 
     for i in range(n_splits):
@@ -204,10 +207,21 @@ def embargoed_walkforward_backtest(
                 stats = {"equity_start": equity, "equity_end": equity, "trades": 0}
                 daily_stats[day_key] = stats
 
+            # HPC FIX: Unified HPC Backtest Math (CPU/GPU Parity)
             sig_val = int(sig.iloc[idx])
-            pnl_i = float(sig_val) * float(ret[idx])
+            bar_ret = float(ret[idx])
+            
+            pnl_i = 0.0
+            if sig_val != 0:
+                # 1. Base Profit
+                trade_ret = sig_val * bar_ret
+                # 2. Risk Sizing (Match GPU Path)
+                base_risk = 0.01
+                pnl_i = base_risk * (1.0 if trade_ret > 0 else -1.0)
+                # 3. Cost (Spread/Comm)
+                pnl_i -= 0.0005 
+                
             pnl.append(pnl_i)
-
             equity *= 1.0 + pnl_i
             stats["equity_end"] = equity
             if sig_val != 0:

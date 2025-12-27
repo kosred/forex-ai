@@ -14,45 +14,37 @@ except Exception:
 
 def pad_probs(probs: np.ndarray, classes: list[int] | None = None) -> np.ndarray:
     """
-    Normalize probability outputs to shape (n,3) ordered as [neutral, buy, sell].
-
-    If `classes` is provided, it is interpreted as the class label for each column and used to reorder/map.
-    Supported label conventions:
-      - {-1, 0, 1}: -1=sell, 0=neutral, 1=buy
-      - {0, 1, 2}: 0=neutral, 1=buy, 2=sell
+    HPC UNIFIED PROTOCOL: Force output to [Neutral, Buy, Sell].
+    Standard indices: 0=Neutral, 1=Buy, 2=Sell.
     """
     if probs is None or len(probs) == 0:
         return np.zeros((0, 3), dtype=float)
+    
     arr = np.asarray(probs, dtype=float)
     if arr.ndim == 1:
         arr = arr.reshape(-1, 1)
     n = arr.shape[0]
-
-    if arr.shape[1] >= 3 and not classes:
-        return arr[:, :3]
-
     out = np.zeros((n, 3), dtype=float)
-    if classes and len(classes) == arr.shape[1]:
-        for col, cls in enumerate(classes):
-            if cls == 0:
-                out[:, 0] = arr[:, col]
-            elif cls == 1:
-                out[:, 1] = arr[:, col]
-            elif cls == -1:
-                out[:, 2] = arr[:, col]
-            elif cls == 2:
-                out[:, 2] = arr[:, col]
+
+    # 1. Handle Model-Specific Mapping (If classes provided)
+    if classes is not None and len(classes) == arr.shape[1]:
+        for col, cls_val in enumerate(classes):
+            # Map from Project Labels {-1, 0, 1} to Unified Indices {0, 1, 2}
+            if cls_val == 0: out[:, 0] = arr[:, col] # Neutral -> 0
+            elif cls_val == 1: out[:, 1] = arr[:, col] # Buy -> 1
+            elif cls_val == -1 or cls_val == 2: out[:, 2] = arr[:, col] # Sell -> 2
         return out
 
-    if arr.shape[1] >= 3:
-        return arr[:, :3]
-    if arr.shape[1] == 2:
-        # Default: treat as [neutral, buy]
-        out[:, 0] = arr[:, 0]
-        out[:, 1] = arr[:, 1]
-        return out
-    out[:, 0] = 1.0 - arr[:, 0]
-    out[:, 1] = arr[:, 0]
+    # 2. Automated Heuristics (If no class map)
+    if arr.shape[1] == 3:
+        return arr # Assume [Neutral, Buy, Sell]
+    elif arr.shape[1] == 2:
+        out[:, 0] = arr[:, 0] # Neutral
+        out[:, 1] = arr[:, 1] # Buy
+    else:
+        out[:, 0] = 1.0 - arr[:, 0] # Neutral
+        out[:, 1] = arr[:, 0] # Buy
+        
     return out
 
 
@@ -95,146 +87,7 @@ def quick_backtest(df: pd.DataFrame, signals: pd.Series) -> dict[str, Any]:
     }
 
 
-# Forward declaration of Numba function to avoid import errors if Numba missing
-_fast_prop_backtest_numba = None
-
-try:
-    import numba
-
-    @numba.njit(fastmath=True, cache=True, nogil=True)
-    def _fast_prop_backtest_numba(
-        close: np.ndarray, signals: np.ndarray, timestamps: np.ndarray, max_daily_dd_pct: float, max_trades_per_day: int
-    ):
-        n = len(close)
-        if n < 2:
-            return 0.0, 0.0, 0.0, 0, False, False
-
-        equity = 1.0
-        peak = 1.0
-        max_dd = 0.0
-
-        # State tracking
-        violations_dd = False
-        violations_trades = False
-
-        # Trade stats
-        wins = 0
-        trades = 0
-
-        # Daily reset logic
-        # timestamps are int64 nanoseconds.
-        # 1 day = 24 * 3600 * 1e9 ns
-        NS_PER_DAY = 86400 * 1_000_000_000
-
-        current_day_idx = timestamps[0] // NS_PER_DAY
-        day_start_equity = 1.0
-        daily_trades = 0
-
-        # Meta-Controller Logic Proxies (Simplified for JIT)
-        consec_losses = 0
-        # Rolling win rate (last 20 trades)
-        outcome_history = np.zeros(20, dtype=np.int8)
-        outcome_ptr = 0
-        outcome_len = 0
-
-        for i in range(n - 1):
-            # 1. Day Check
-            ts = timestamps[i]
-            day_idx = ts // NS_PER_DAY
-
-            if day_idx != current_day_idx:
-                current_day_idx = day_idx
-                day_start_equity = equity
-                daily_trades = 0
-
-            # 2. Risk Checks
-            current_daily_dd = 0.0
-            if day_start_equity > 0:
-                current_daily_dd = (day_start_equity - equity) / day_start_equity
-
-            allow_trade = True
-            if current_daily_dd >= max_daily_dd_pct:
-                violations_dd = True
-                allow_trade = False
-
-            if daily_trades >= max_trades_per_day:
-                violations_trades = True
-                allow_trade = False
-
-            # 3. Trade Logic
-            sig = signals[i]
-            if sig != 0 and allow_trade:
-                # Calculate simple rolling win rate
-                wr_sum = 0
-                for k in range(outcome_len):
-                    wr_sum += outcome_history[k]
-
-                recent_wr = 0.5
-                if outcome_len > 0:
-                    recent_wr = wr_sum / outcome_len
-
-                # Dynamic Risk Scaling (Meta-Controller Logic)
-                risk_mult = 1.0
-                if consec_losses > 2:
-                    risk_mult = 0.5
-                elif recent_wr > 0.6:
-                    risk_mult = 1.5
-
-                # Execute Trade
-                curr_price = close[i]
-                next_price = close[i + 1]
-                if curr_price < 1e-9:
-                    bar_ret = 0.0
-                else:
-                    bar_ret = (next_price - curr_price) / curr_price
-
-                trade_ret = sig * bar_ret
-
-                base_risk = 0.01
-                realized_pnl = base_risk * risk_mult * (1.0 if trade_ret > 0 else -1.0)
-
-                # Commission/Spread Penalty
-                realized_pnl -= 0.0005 * risk_mult
-
-                equity *= 1.0 + realized_pnl
-
-                trades += 1
-                daily_trades += 1
-
-                if trade_ret > 0:
-                    wins += 1
-                    consec_losses = 0
-                    outcome_history[outcome_ptr] = 1
-                else:
-                    consec_losses += 1
-                    outcome_history[outcome_ptr] = 0
-
-                outcome_ptr = (outcome_ptr + 1) % 20
-                if outcome_len < 20:
-                    outcome_len += 1
-
-            # 4. Global Drawdown Tracking
-            if equity > peak:
-                peak = equity
-
-            dd = peak - equity
-            if peak > 0:
-                dd_pct = dd / peak
-                if dd_pct > max_dd:
-                    max_dd = dd_pct
-
-        total_pnl = equity - 1.0
-        final_wr = 0.0
-        if trades > 0:
-            final_wr = wins / trades
-
-        return total_pnl, final_wr, max_dd, trades, violations_dd, violations_trades
-
-except ImportError:
-    # Fallback if Numba not installed
-    def _fast_prop_backtest_numba(c, s, t, mdd, mt):
-        return 0.0, 0.0, 0.0, 0, False, False
-
+from ..strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
 
 def prop_backtest(
     df: pd.DataFrame,
@@ -245,31 +98,42 @@ def prop_backtest(
     use_gpu: bool | None = None,
 ) -> dict[str, Any]:
     """
-    Backtest with MetaController integration for realistic Prop Firm simulation.
-    Uses Numba for high-performance CPU execution (approx 100x speedup vs pure Python).
+    HPC Unified Backtest: Uses the master Numba engine for identical results.
     """
     if df is None or signals is None or len(df) == 0 or len(signals) != len(df):
         return {}
 
-    # Extract numpy arrays for Numba
-    # Ensure contiguous float64/int64 arrays for maximum JIT speed
+    # 1. Prepare Inputs
     close = df["close"].to_numpy(dtype=np.float64)
-    signals_arr = signals.to_numpy(dtype=np.int8)
-
-    # We need timestamps to detect day changes.
-    # Convert DateTimeIndex to int64 (nanoseconds)
-    timestamps = df.index.view(np.int64)
-
-    # Call the JIT-compiled kernel
-    pnl, win_rate, max_dd, trades, vio_dd, vio_trades = _fast_prop_backtest_numba(
-        close, signals_arr, timestamps, max_daily_dd_pct, max_trades_per_day
+    high = df["high"].to_numpy(dtype=np.float64)
+    low = df["low"].to_numpy(dtype=np.float64)
+    sig_arr = signals.to_numpy(dtype=np.int8)
+    
+    # 2. Extract Time Indices
+    idx = df.index
+    month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
+    day_idx = (idx.year.astype(np.int32) * 10000 + idx.month.astype(np.int32) * 100 + idx.day.astype(np.int32)).to_numpy(dtype=np.int64)
+    
+    # 3. Dynamic Pip Metrics
+    symbol = df.attrs.get("symbol", "EURUSD")
+    pip_size, pip_val_lot = infer_pip_metrics(symbol)
+    
+    # 4. Run Master Engine
+    # Note: We use 30 pip SL and 60 pip TP as defaults for scoring consistency
+    arr = fast_evaluate_strategy(
+        close_prices=close,
+        high_prices=high,
+        low_prices=low,
+        signals=sig_arr,
+        month_indices=month_idx,
+        day_indices=day_idx,
+        sl_pips=30.0,
+        tp_pips=60.0,
+        pip_value=pip_size,
+        pip_value_per_lot=pip_val_lot,
+        spread_pips=1.5,
+        commission_per_trade=7.0
     )
-
-    return {
-        "pnl_score": float(pnl),
-        "win_rate": float(win_rate),
-        "max_dd_pct": float(max_dd),
-        "trades": int(trades),
-        "daily_dd_violation": bool(vio_dd),
-        "trade_limit_violation": bool(vio_trades),
-    }
+    
+    keys = ["net_profit", "sharpe", "sortino", "max_dd_pct", "win_rate", "profit_factor", "expectancy", "sqn", "trades", "consistency", "daily_dd"]
+    return {k: float(v) for k, v in zip(keys, arr.tolist())}

@@ -211,8 +211,18 @@ def maybe_data_parallel(model: torch.nn.Module, device: str | list[str]) -> tupl
         gpus = get_available_gpus()
         if len(gpus) <= 1:
             return model, device
-        device_ids = list(range(len(gpus)))
-        primary = "cuda:0"
+            
+        # HPC FIX: Load-Balanced Master Selection
+        # Use the assigned device as the master instead of hardcoded cuda:0
+        if isinstance(device, str) and device.startswith("cuda:"):
+            primary = device
+            device_idx = int(device.split(":")[1])
+            # Shift device list to put the primary first for DataParallel
+            device_ids = [(device_idx + i) % len(gpus) for i in range(len(gpus))]
+        else:
+            primary = "cuda:0"
+            device_ids = list(range(len(gpus)))
+            
         model = torch.nn.DataParallel(model, device_ids=device_ids)
         model = model.to(primary)
         return model, primary

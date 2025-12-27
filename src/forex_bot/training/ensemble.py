@@ -100,11 +100,21 @@ class MetaBlender:
         if "symbol" in dataset:
             symbols = dataset.pop("symbol")
             symbol_one_hot = pd.get_dummies(symbols, prefix="sym", dtype=float)
-            features = pd.concat([dataset.reset_index(drop=True), symbol_one_hot.reset_index(drop=True)], axis=1)
-        else:
-            features = dataset.reset_index(drop=True)
+            dataset = pd.concat([dataset.reset_index(drop=True), symbol_one_hot.reset_index(drop=True)], axis=1)
+            
+        # HPC FIX: Unsupervised Multi-Regime Distribution
+        # Ingest the [p0...p7] probability vector from the GMM
+        regime_cols = [c for c in dataset.columns if c.startswith("regime_p")]
+        if regime_cols:
+            for col in regime_cols:
+                dataset[col] = dataset[col].astype(np.float32)
+        elif "regime" in dataset:
+            # Fallback for legacy categorical
+            dataset["regime"] = dataset["regime"].astype("category")
+            if XGB_AVAILABLE and hasattr(self.model, "enable_categorical"):
+                self.model.set_params(enable_categorical=True)
 
-        features = features.fillna(0.0)
+        features = dataset.reset_index(drop=True).fillna(0.0)
         self.feature_columns = features.columns
 
         # Time-series train/val split (no random shuffle!)
@@ -150,27 +160,27 @@ class MetaBlender:
     def predict_proba(self, frame: pd.DataFrame) -> np.ndarray:
         if self.feature_columns is None:
             raise RuntimeError("MetaBlender has not been fitted")
-        dataset = frame.copy()
-
-        if "symbol" in dataset:
-            symbols = dataset.pop("symbol")
-            symbol_one_hot = pd.get_dummies(symbols, prefix="sym", dtype=float)
-            features = pd.concat([dataset.reset_index(drop=True), symbol_one_hot.reset_index(drop=True)], axis=1)
-        else:
-            features = dataset.reset_index(drop=True)
-
-        for column in self.feature_columns:
-            if column not in features:
-                features[column] = 0.0
-        features = features[self.feature_columns].fillna(0.0)
-        raw = self.model.predict_proba(features.to_numpy())
-        classes = self.proba_classes
-        if classes is None:
-            try:
-                classes = [int(c) for c in list(self.model.classes_)]
-            except Exception:
-                classes = None
-        return pad_probs(raw, classes=classes)
+        
+        # HPC Optimization: Direct NumPy Mapping
+        # Instead of copying the whole dataframe, we map only the columns we need.
+        input_cols = list(frame.columns)
+        n_samples = len(frame)
+        X_np = np.zeros((n_samples, len(self.feature_columns)), dtype=np.float32)
+        
+        for i, col in enumerate(self.feature_columns):
+            if col in input_cols:
+                # Handle categorical regime properly
+                if col == "regime":
+                    X_np[:, i] = frame[col].astype(np.float32).to_numpy()
+                else:
+                    X_np[:, i] = frame[col].to_numpy(dtype=np.float32)
+            # symbol handling (one-hot)
+            elif col.startswith("sym_") and "symbol" in input_cols:
+                sym_name = col[4:]
+                X_np[:, i] = (frame["symbol"] == sym_name).astype(np.float32)
+        
+        raw = self.model.predict_proba(X_np)
+        return pad_probs(raw, classes=self.proba_classes)
 
     def save(self, path: Path) -> None:
         payload = {

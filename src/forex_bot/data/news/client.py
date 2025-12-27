@@ -48,8 +48,10 @@ class SentimentAnalyzer:
             "CHF": ["EUR"],
             "EUR": ["CHF"],
             "GBP": ["EUR"],
-            "USD": ["CAD", "JPY"],
+            "USD": ["CAD", "JPY", "XAU", "OIL", "BTC"], # USD moves everything
             "JPY": ["USD"],
+            "XAU": ["USD", "CNY", "FED", "RATE"], # Gold is moved by USD and Rates
+            "OIL": ["CAD", "USD", "ME"] # Oil moves CAD and is moved by Middle East
         }
 
         self.currency_synonyms = {
@@ -121,11 +123,15 @@ class SentimentAnalyzer:
 
         if use_live_llm and self.settings.news.perplexity_enabled:
             try:
-                if (end - start).days < 2:
-                    query = f"Breaking forex news for {symbol} today and potential market impact"
-                else:
-                    query = f"Major economic events and news for {symbol} from {start.date()} to {end.date()}"
-                pplx_events = self._fetch_perplexity_headlines(query, target_currencies)
+                # HPC FIX: Institutional-Grade Macro Search Queries
+                macro_query = (
+                    f"High-impact fundamental catalysts for {symbol} and {target_currencies}: "
+                    "Focus on Central Bank policy shifts (Fed, ECB, BoJ), "
+                    "Interest Rate differentials, Liquidity shocks, and Geopolitical risk. "
+                    f"Timeframe: {start.date()} to {end.date()}. "
+                    "Prioritize Bloomberg, Reuters, and Financial Times sources."
+                )
+                pplx_events = self._fetch_perplexity_headlines(macro_query, target_currencies)
                 new_pplx_events = [
                     ev
                     for ev in pplx_events
@@ -455,7 +461,7 @@ class SentimentAnalyzer:
             logger.warning(f"OpenAI headline parsing failed: {exc}")
         return events
 
-    def score_events(
+    async def score_events_async(
         self,
         events: list[NewsEvent],
         max_openai: int | None = None,
@@ -463,69 +469,59 @@ class SentimentAnalyzer:
         force_openai: bool = False,
     ) -> list[NewsEvent]:
         """
-        Score events with OpenAI (LLM-first).
+        Score events with OpenAI in parallel (HPC Optimized).
         """
         if max_openai is None:
-            try:
-                max_openai = int(getattr(self.settings.news, "openai_max_events_per_fetch", 50) or 50)
-            except Exception:
-                max_openai = 50
-        max_openai = int(max(0, max_openai))
-
-        scored = []
+            max_openai = int(getattr(self.settings.news, "openai_max_events_per_fetch", 50) or 50)
+        
+        # Parallel Scoring Logic
+        sem = asyncio.Semaphore(10) # Max 10 concurrent API calls
         openai_available = self.openai_scorer.available
-        used_openai = 0
-
-        sorted_events = sorted(events, key=lambda e: e.confidence or 0.0, reverse=True)
-
-        for ev in sorted_events:
-            cached = None
+        
+        async def _score_single(ev):
+            if not openai_available: return ev
             try:
-                cached = self.db.get_cached_score(ev.url, ev.title)
-            except Exception:
-                cached = None
+                async with sem:
+                    # Run the synchronous scorer in a thread to keep loop responsive
+                    result = await asyncio.to_thread(self.openai_scorer.score, ev.title, ev.currencies or [])
+                    if result:
+                        ev.sentiment = result.sentiment
+                        ev.confidence = result.confidence
+                        self.db.set_cached_score(ev.url, ev.title, result.sentiment, result.confidence, result.direction)
+            except Exception as e:
+                logger.warning(f"Async scoring failed for {ev.title}: {e}")
+            return ev
+
+        # Skip cached ones first
+        to_score = []
+        final_scored = []
+        for ev in events:
+            cached = self.db.get_cached_score(ev.url, ev.title)
             if cached:
                 ev.sentiment = cached["sentiment"]
                 ev.confidence = cached["confidence"]
-                scored.append(ev)
-                continue
-
-            result: ScoreResult | None = None
-
-            use_openai = False
-            if openai_available:
-                if force_openai:
-                    use_openai = used_openai < max_openai
-                else:
-                    is_high_impact = (ev.confidence or 0.0) >= 0.8
-                    if is_high_impact and used_openai < max_openai:
-                        use_openai = True
-                    elif used_openai < (max_openai * 0.5):
-                        use_openai = True
-
-            if use_openai:
-                try:
-                    result = self.openai_scorer.score(ev.title, ev.currencies or [])
-                    used_openai += 1
-                except Exception as exc:
-                    logger.warning(f"OpenAI scoring failed: {exc}")
-                    use_openai = False
-                    openai_available = False  # Disable further OpenAI attempts in this batch
-
-            if result:
-                ev.sentiment = result.sentiment
-                ev.confidence = result.confidence
-
-                try:
-                    self.db.set_cached_score(ev.url, ev.title, result.sentiment, result.confidence, result.direction)
-                except Exception as e:
-                    logger.warning(f"News client request failed: {e}", exc_info=True)
+                final_scored.append(ev)
             else:
-                ev.sentiment = ev.sentiment or 0.0
-                ev.confidence = ev.confidence or 0.0
-            scored.append(ev)
+                to_score.append(ev)
+        
+        if to_score:
+            logger.info(f"HPC: Scoring {len(to_score)} new events in parallel...")
+            parallel_results = await asyncio.gather(*[_score_single(ev) for ev in to_score[:max_openai]])
+            final_scored.extend(parallel_results)
+            # Add remaining unscored if cap hit
+            if len(to_score) > max_openai:
+                final_scored.extend(to_score[max_openai:])
+        
+        logger.info(
+            f"[TELEMETRY] News: Processed {len(events)} events. "
+            f"LLM Scores: {len(to_score[:max_openai])} | Cached: {len(events) - len(to_score)}"
+        )
+                
+        return final_scored
 
-        return scored
+    def score_events(self, *args, **kwargs):
+        # Compatibility wrapper for sync callers
+        return asyncio.run(self.score_events_async(*args, **kwargs))
 
     def rescore_existing_events(
         self,

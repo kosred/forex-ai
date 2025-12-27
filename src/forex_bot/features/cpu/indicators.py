@@ -22,7 +22,7 @@ EPSILON = 1e-10
 
 if NUMBA_AVAILABLE:
 
-    @njit(cache=True, fastmath=True)
+    @njit(cache=True, fastmath=True, parallel=True)
     def rsi_vectorized_numba(series_arr: np.ndarray, period: int = 14) -> np.ndarray:
         n = len(series_arr)
         if n < period + 1:
@@ -60,7 +60,7 @@ if NUMBA_AVAILABLE:
 
         return rsi
 
-    @njit(cache=True, fastmath=True)
+    @njit(cache=True, fastmath=True, parallel=True)
     def compute_adx_numba(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
         n = len(close)
         adx_out = np.full(n, 0.0)
@@ -136,7 +136,7 @@ if NUMBA_AVAILABLE:
 
         return adx_out
 
-    @njit(cache=True, fastmath=True)
+    @njit(cache=True, fastmath=True, parallel=True)
     def compute_stochastic_numba(
         high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -168,7 +168,7 @@ if NUMBA_AVAILABLE:
 
         return np.nan_to_num(stoch_k, nan=50.0), np.nan_to_num(stoch_d, nan=50.0)
 
-    @njit(cache=True, fastmath=True)
+    @njit(cache=True, fastmath=True, parallel=True)
     def compute_cci_numba(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 20) -> np.ndarray:
         n = len(close)
         cci_out = np.full(n, 0.0)
@@ -193,7 +193,7 @@ if NUMBA_AVAILABLE:
 
         return cci_out
 
-    @njit(cache=True, fastmath=True)
+    @njit(cache=True, fastmath=True, parallel=True)
     def compute_vwap_numba(
         high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, dates_epoch_days: np.ndarray
     ) -> np.ndarray:

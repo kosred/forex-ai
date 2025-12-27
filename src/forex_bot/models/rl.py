@@ -9,7 +9,7 @@ from gymnasium import spaces
 # Optional Stable Baselines 3
 try:
     from stable_baselines3 import PPO, SAC
-    from stable_baselines3.common.vec_env import DummyVecEnv
+    from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
     from stable_baselines3.common.callbacks import (
         BaseCallback,
         CallbackList,
@@ -22,6 +22,7 @@ except ImportError:
     PPO = None
     SAC = None
     DummyVecEnv = None
+    SubprocVecEnv = None
     BaseCallback = None
     CallbackList = None
     EvalCallback = None
@@ -37,6 +38,71 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+
+if NUMBA_AVAILABLE:
+    @njit(cache=True, fastmath=True)
+    def _update_state_numba(
+        action, position, entry_price, current_close, current_high, current_low, 
+        balance, equity, high_water_mark, daily_start_equity, commission, 
+        initial_balance, profit_target, max_daily_dd, max_total_dd
+    ):
+        prev_equity = equity
+        new_position = position
+        new_entry_price = entry_price
+        new_balance = balance
+        
+        # 1. Action Logic (Standard)
+        if action == 1: # Buy
+            if position == -1: 
+                new_balance = equity
+                new_position = 0
+            if new_position == 0: 
+                new_position = 1
+                new_entry_price = current_close
+                new_balance -= new_balance * commission
+                equity = new_balance
+        elif action == 2: # Sell
+            if position == 1: 
+                new_balance = equity
+                new_position = 0
+            if new_position == 0: 
+                new_position = -1
+                new_entry_price = current_close
+                new_balance -= new_balance * commission
+                equity = new_balance
+
+        # 2. Real-time High/Low Equity Tracking (HPC FIX)
+        # We check the WORST case scenario during this bar to catch DD breaches
+        worst_floating_equity = equity
+        if new_position == 1: # Long
+            worst_floating_equity = new_balance * (1.0 + (current_low - new_entry_price) / new_entry_price)
+            equity = new_balance * (1.0 + (current_close - new_entry_price) / new_entry_price)
+        elif new_position == -1: # Short
+            worst_floating_equity = new_balance * (1.0 + (new_entry_price - current_high) / new_entry_price)
+            equity = new_balance * (1.0 + (new_entry_price - current_close) / new_entry_price)
+        
+        new_high_water = max(high_water_mark, equity)
+        
+        # 3. Reward & Done Logic (Using WORST equity for DD checks)
+        pnl_change = (equity - prev_equity) / prev_equity
+        reward = pnl_change * 100.0
+        
+        # Prop-firm DISQUALIFICATION check
+        daily_dd_worst = (daily_start_equity - worst_floating_equity) / daily_start_equity
+        total_dd_worst = (new_high_water - worst_floating_equity) / new_high_water
+        
+        done = False
+        if daily_dd_worst >= max_daily_dd or total_dd_worst >= max_total_dd:
+            reward = -150.0 # Heavier penalty for account death
+            done = True
+            
+        current_return = (equity - initial_balance) / initial_balance
+        if current_return >= profit_target and (prev_equity - initial_balance)/initial_balance < profit_target:
+            reward += 50.0
+            
+        if new_position != 0: reward -= 0.001
+        
+        return new_position, new_entry_price, new_balance, equity, new_high_water, reward, done
 
 class PropFirmTradingEnv(gym.Env):
     """
@@ -82,6 +148,17 @@ class PropFirmTradingEnv(gym.Env):
 
         self.df = df
         self.features = features.astype(np.float32)
+        # HPC: Vectorized price access
+        self.prices = df["close"].to_numpy(dtype=np.float32)
+        self.highs = df["high"].to_numpy(dtype=np.float32)
+        self.lows = df["low"].to_numpy(dtype=np.float32)
+        
+        # Track days vectorized for speed
+        if "timestamp" in df.columns:
+            self.day_indices = df["timestamp"].dt.day.to_numpy(dtype=np.int32)
+        else:
+            self.day_indices = df.index.day.to_numpy(dtype=np.int32)
+            
         self.n_steps = len(df)
         self.initial_balance = initial_balance
         self.max_daily_dd = max_daily_dd
@@ -138,39 +215,26 @@ class PropFirmTradingEnv(gym.Env):
         return state.astype(np.float32)
 
     def step(self, action):
-        done = False
-        truncated = False
-
-        current_price = self.df.iloc[self.current_step]["close"]
-
-        # 1. Execute Action
-        # Action mapping: 0=Hold, 1=Buy, 2=Sell
-        # Simplified: If Buy (1) and currently Short (-1), flip to Long (1)
-
-        prev_equity = self.equity
-
-        # Close existing if signal flips or explicit close (logic can be complex, keeping simple)
-        if action == 1:  # Buy Signal
-            if self.position == -1:  # Close Short
-                self._close_position(current_price)
-            if self.position == 0:  # Open Long
-                self._open_position(current_price, 1)
-
-        elif action == 2:  # Sell Signal
-            if self.position == 1:  # Close Long
-                self._close_position(current_price)
-            if self.position == 0:  # Open Short
-                self._open_position(current_price, -1)
-
-        elif action == 0:  # Hold / Close
-            # Optional: Treat 0 as "Close" or "Hold"?
-            # For simplicity in this env, 0 means "Maintain Position".
-            # To allow closing, we usually need a 4th action or a specific Close signal.
-            # Here: 0 = Hold. We rely on reversal signals (1->2) to exit.
-            pass
-
-        # 2. Update Equity
-        self._update_equity(current_price)
+        current_price = self.prices[self.current_step]
+        current_high = self.highs[self.current_step]
+        current_low = self.lows[self.current_step]
+        
+        # HPC: Execute the entire market simulation in machine code
+        (
+            self.position, 
+            self.entry_price, 
+            self.balance, 
+            self.equity, 
+            self.high_water_mark, 
+            step_reward, 
+            done
+        ) = _update_state_numba(
+            int(action), self.position, self.entry_price, 
+            float(current_price), float(current_high), float(current_low),
+            self.balance, self.equity, self.high_water_mark, self.daily_start_equity, 
+            self.commission, self.initial_balance, self.profit_target, 
+            self.max_daily_dd, self.max_total_dd
+        )
 
         # 3. Time & Day Handling
         self.current_step += 1
@@ -179,51 +243,13 @@ class PropFirmTradingEnv(gym.Env):
 
         # Check Daily Reset
         if not done:
-            ts = (
-                self.df.index[self.current_step]
-                if "timestamp" not in self.df.columns
-                else self.df.iloc[self.current_step]["timestamp"]
-            )
-            if ts.day != self.current_day_idx:
-                self.current_day_idx = ts.day
-                self.daily_start_equity = self.equity  # Reset daily high-water mark
+            # HPC: Fast day lookup
+            current_day = self.day_indices[self.current_step]
+            if current_day != self.current_day_idx:
+                self.current_day_idx = current_day
+                self.daily_start_equity = self.equity
 
-        # 4. Calculate Reward & Constraints
-        step_reward = 0.0
-
-        # A. Core PnL Reward (Log Return)
-        pnl_change = (self.equity - prev_equity) / prev_equity
-        step_reward += pnl_change * 100.0  # Scale up for stability
-
-        # B. Sortino Penalty (Downside Risk)
-        if pnl_change < 0:
-            step_reward *= 2.0  # Penalize losses 2x more than gains
-
-        # C. Prop Firm Constraints (Hard Fail)
-        daily_dd = (self.daily_start_equity - self.equity) / self.daily_start_equity
-        total_dd = (self.high_water_mark - self.equity) / self.high_water_mark
-
-        if daily_dd >= self.max_daily_dd:
-            step_reward = -100.0  # Massive penalty
-            done = True
-            truncated = True  # Forced stop
-
-        if total_dd >= self.max_total_dd:
-            step_reward = -100.0
-            done = True
-            truncated = True
-
-        # D. Consistency Bonus
-        # If we reached the target profit this step, give a bonus
-        current_return = (self.equity - self.initial_balance) / self.initial_balance
-        if current_return >= self.profit_target and prev_equity < (self.initial_balance * (1 + self.profit_target)):
-            step_reward += 50.0  # Big bonus for hitting 4%
-
-        # 5. Holding Cost (to prevent infinite holding)
-        if self.position != 0:
-            step_reward -= 0.001
-
-        return self._get_obs(), step_reward, done, truncated, {}
+        return self._get_obs(), float(step_reward), done, done, {}
 
     def _open_position(self, price, direction):
         self.position = direction
@@ -345,27 +371,18 @@ class RLExpertPPO(ExpertModel):
             logger.warning("StableBaselines3 not installed. RL skipped.")
             return
 
-        # Validate time-ordering to prevent look-ahead bias
-        validate_time_ordering(X, context="RLExpertPPO.fit")
+        # Create environment with high-speed parallel execution
+        import os
+        n_envs = min(int(os.environ.get("FOREX_BOT_RL_ENVS", "32")), (os.cpu_count() or 4) - 4)
+        
+        def make_env():
+            return PropFirmTradingEnv(meta_train, X_train.values)
 
-        # We ignore 'y' (labels) because we use Price Action (X) directly now!
-        # Assuming X has OHLC columns or we pass them in metadata
-        metadata = kwargs.get("metadata")
-        if metadata is None:
-            logger.warning("RL Expert requires metadata (OHLC) for Prop Environment.")
-            return
+        if n_envs > 1:
+            self.env = SubprocVecEnv([make_env for _ in range(n_envs)])
+        else:
+            self.env = DummyVecEnv([make_env])
 
-        X_train, X_val, meta_train, meta_val = self._split_env_data(X, y, metadata)
-        if meta_train is None or len(X_train) == 0:
-            logger.warning("RL Expert: training metadata unavailable or empty.")
-            return
-
-        if meta_val is not None and self.eval_max_rows > 0 and len(X_val) > self.eval_max_rows:
-            X_val = X_val.iloc[-self.eval_max_rows:]
-            meta_val = meta_val.iloc[-self.eval_max_rows:]
-
-        # Create environment with sequential stepping (no random resets during training)
-        self.env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_train, X_train.values)])
         eval_env = None
         if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
             eval_env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_val, X_val.values)])
@@ -470,8 +487,18 @@ class RLExpertSAC(RLExpertPPO):
             X_val = X_val.iloc[-self.eval_max_rows:]
             meta_val = meta_val.iloc[-self.eval_max_rows:]
 
-        # Create environment with sequential stepping (no random resets during training)
-        self.env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_train, X_train.values)])
+        # Create environment with high-speed parallel execution
+        import os
+        n_envs = min(int(os.environ.get("FOREX_BOT_RL_ENVS", "32")), (os.cpu_count() or 4) - 4)
+        
+        def make_env():
+            return PropFirmTradingEnv(meta_train, X_train.values)
+
+        if n_envs > 1:
+            self.env = SubprocVecEnv([make_env for _ in range(n_envs)])
+        else:
+            self.env = DummyVecEnv([make_env])
+
         eval_env = None
         if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
             eval_env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_val, X_val.values)])

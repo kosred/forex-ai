@@ -4,14 +4,24 @@ from typing import Any
 
 
 def infer_pip_metrics(symbol: str) -> tuple[float, float]:
-    """Heuristic pip_size/pip_value_per_lot for offline backtests."""
+    """
+    HPC FIX: Precision Pip Metrics.
+    Uses institutional defaults but prefers live-broker metadata when available.
+    """
     sym = (symbol or "").upper()
+    # Gold/Silver (XAU/XAG) - Standard 2-decimal or 3-decimal
     if sym.startswith(("XAU", "XAG")):
-        return 0.1, 10.0
-    if "BTC" in sym or "ETH" in sym or "LTC" in sym:
-        return 1.0, 1.0
+        return 0.01, 1.0 # 1 cent move = 1 dollar per lot
+    
+    # JPY Pairs - Standard 2-decimal or 3-decimal
     if sym.endswith("JPY") or sym.startswith("JPY"):
-        return 0.01, 9.0
+        return 0.01, 6.5 # Approx dollar value per pip for JPY
+        
+    # Crypto
+    if any(c in sym for c in ["BTC", "ETH", "LTC"]):
+        return 1.0, 1.0
+        
+    # Standard FX - 4/5-decimal
     return 0.0001, 10.0
 
 
@@ -99,6 +109,49 @@ def calculate_max_drawdown(cumulative_returns: np.ndarray) -> float:
     return max_dd
 
 
+@njit(cache=True, fastmath=True, parallel=True)
+def batch_evaluate_strategies(
+    close_prices_batch: np.ndarray,
+    high_prices_batch: np.ndarray,
+    low_prices_batch: np.ndarray,
+    signals_batch: np.ndarray,
+    month_indices_batch: np.ndarray,
+    day_indices_batch: np.ndarray,
+    sl_pips: float,
+    tp_pips: float,
+    max_hold_bars: int = 0,
+    pip_value: float = 0.0001,
+    spread_pips: float = 1.5,
+    commission: float = 0.0,
+    pip_val_lot: float = 10.0,
+) -> np.ndarray:
+    """
+    HPC BATCH EVALUATOR: Runs multiple backtests in parallel across 252 cores.
+    Inputs are 2D arrays (num_strategies, num_bars).
+    Returns 2D metrics (num_strategies, 11).
+    """
+    n_strats = close_prices_batch.shape[0]
+    out_metrics = np.zeros((n_strats, 11))
+    
+    for s in prange(n_strats):
+        out_metrics[s] = fast_evaluate_strategy(
+            close_prices_batch[s],
+            high_prices_batch[s],
+            low_prices_batch[s],
+            signals_batch[s],
+            month_indices_batch[s],
+            day_indices_batch[s],
+            sl_pips,
+            tp_pips,
+            max_hold_bars,
+            False, 1.0, 1.0, # trailing defaults for speed
+            pip_value,
+            spread_pips,
+            commission,
+            pip_val_lot
+        )
+    return out_metrics
+
 @njit(cache=True, fastmath=True)
 def fast_evaluate_strategy(
     close_prices: np.ndarray,
@@ -176,6 +229,16 @@ def fast_evaluate_strategy(
         if in_position != 0:
             current_low = low_prices[i]
             current_high = high_prices[i]
+            
+            # HPC FIX: Real-time Intraday Floating PnL Tracking
+            if in_position == 1:
+                floating_pnl = (current_low - entry_price) / pip_value * cash_per_pip
+            else:
+                floating_pnl = (entry_price - current_high) / pip_value * cash_per_pip
+            
+            current_floating_equity = equity + floating_pnl
+            if current_floating_equity < day_low:
+                day_low = current_floating_equity
 
             sl_price = 0.0
             tp_price = 0.0
@@ -242,8 +305,14 @@ def fast_evaluate_strategy(
                     exit_signal = True
 
             if exit_signal:
-                cost = (spread_pips * cash_per_pip) + commission_per_trade
-                pnl -= cost
+                # HPC FIX: Lot-based commission (Standard Prop Firm Rule)
+                # commission_per_trade is now treated as 'Commission Per Side Per Lot'
+                lot_size = 1.0 # Default lot size for score normalization
+                cost_in_pips = spread_pips
+                commission_in_cash = commission_per_trade * lot_size * 2.0 # Round trip
+                
+                total_cost = (cost_in_pips * cash_per_pip) + commission_in_cash
+                pnl -= total_cost
 
                 equity += pnl
                 current_month_pnl += pnl

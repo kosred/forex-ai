@@ -344,7 +344,14 @@ def _run_island(
     start = time.time()
     x_norm_np = (x_np - mean) / scale
     row_idx_np = np.arange(y_np.shape[0])
-    class_idx_np = y_np.astype(np.int64) + 1
+    
+    # HPC FIX: Unified Protocol Mapping
+    # -1 (Sell) -> 0, 0 (Neutral) -> 1, 1 (Buy) -> 2
+    class_idx_np = np.zeros_like(y_np, dtype=np.int64)
+    class_idx_np[y_np == -1] = 0
+    class_idx_np[y_np == 0] = 1
+    class_idx_np[y_np == 1] = 2
+    
     x_norm_cp = None
     y_cp = None
     row_idx_cp = None
@@ -360,7 +367,13 @@ def _run_island(
             x_norm_cp = cp.asarray(x_norm_np)
             y_cp = cp.asarray(y_np)
             row_idx_cp = cp.arange(y_cp.shape[0])
-            class_idx_cp = y_cp.astype(cp.int64) + 1
+            
+            # HPC FIX: Unified Protocol Mapping
+            class_idx_cp = cp.zeros_like(y_cp, dtype=cp.int64)
+            class_idx_cp[y_cp == -1] = 0
+            class_idx_cp[y_cp == 0] = 1
+            class_idx_cp[y_cp == 1] = 2
+            
             use_gpu = True
         except Exception:
             use_gpu = False
@@ -901,7 +914,10 @@ class EvoExpertCMA(ExpertModel):
                 hidden_act = np.tanh(xn @ w1 + b1)
                 logits = hidden_act @ w2 + b2
                 p_batch = _softmax(logits)
-                probs_list.append(p_batch)
+                # Reorder to [Neutral, Buy, Sell]
+                # Indices after remapping: 0=Sell, 1=Neutral, 2=Buy
+                # Target: index 0=Neutral, 1=Buy, 2=Sell
+                probs_list.append(p_batch[:, [1, 2, 0]])
 
             return np.vstack(probs_list)
         except Exception as exc:

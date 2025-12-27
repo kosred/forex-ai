@@ -212,6 +212,7 @@ class MLPExpert(ExpertModel):
         if not probs:
             return np.zeros((len(x), 3))
         out = np.vstack(probs)
+        # Unified Protocol: [Neutral, Buy, Sell] already in indices [0, 1, 2]
         return out[:, :3]
 
     def save(self, path: str) -> None:

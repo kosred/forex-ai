@@ -46,8 +46,19 @@ class PortfolioOptimizer:
                 rets.append(np.array(arr, dtype=float))
                 names.append(s)
         weights = {}
+        # HPC FIX: Robust Sample Size for Correlation
+        MIN_CORR_SAMPLES = 30
+        
         if len(rets) >= 2:
             min_len = min(len(r) for r in rets)
+            
+            if min_len < MIN_CORR_SAMPLES:
+                logger.warning(f"Insufficient overlapping history ({min_len} < {MIN_CORR_SAMPLES}) for correlation. Equal weighting.")
+                weight = 1.0 / len(names)
+                for s in names:
+                    weights[s] = AllocationResult(s, weight, 0.0, weight, 0.0, 0.0)
+                return weights
+
             rets = [r[-min_len:] for r in rets]
             mat = np.vstack(rets)
 

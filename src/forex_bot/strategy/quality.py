@@ -60,7 +60,7 @@ class StrategyQualityAnalyzer:
         self.min_monthly_return_pct = float(
             getattr(settings.risk, "monthly_profit_target_pct", 0.04) or 0.04
         )
-        self.edge_significance_pvalue = 0.05
+        self.edge_significance_pvalue = 0.01 # HPC: Strict 1% significance required
         logger.info("StrategyQualityAnalyzer initialized (iron guard)")
 
     def analyze_strategy(
@@ -85,15 +85,22 @@ class StrategyQualityAnalyzer:
 
         win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
         avg_win_pct = np.mean(wins) if len(wins) > 0 else 0.0
-        avg_loss_pct = np.mean(losses) if len(losses) > 0 else 0.0  # avg_loss is usually negative in data, keep sign?
+        
+        # HPC FIX: Robust Loss Magnitude
+        # Handle both negative (-0.01) and positive (0.01) loss representations
+        losses_cleaned = returns[returns < 0] if np.any(returns < 0) else -returns
+        avg_loss_pct = np.mean(losses_cleaned) if len(losses_cleaned) > 0 else 0.0
+        avg_loss_mag = abs(avg_loss_pct)
 
-        gross_profit = trades.loc[trades["pnl"] > 0, "pnl"].sum()
-        gross_loss = abs(trades.loc[trades["pnl"] <= 0, "pnl"].sum())
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 1e-9 else float("inf")
+        # HPC FIX: Laplace Smoothing for Robust Scoring
+        # Prevents 'Infinite' scores from lucky single trades
+        EPS = 1e-7
+        profit_factor = (gross_profit + EPS) / (gross_loss + EPS)
+        if profit_factor > 100.0: profit_factor = 100.0 # Realistic cap
 
         equity_curve = initial_balance + trades["pnl"].cumsum()
         running_max = equity_curve.cummax()
-        drawdowns = (running_max - equity_curve) / running_max
+        drawdowns = (running_max - equity_curve) / np.maximum(running_max, EPS)
         max_dd = drawdowns.max()
         avg_dd = drawdowns.mean()
 
@@ -107,11 +114,9 @@ class StrategyQualityAnalyzer:
         longest_win_streak = self._longest_streak(trades, win=True)
         longest_loss_streak = self._longest_streak(trades, win=False)
 
-        avg_win_mag = avg_win_pct
-        avg_loss_mag = abs(avg_loss_pct)
-        expectancy = (win_rate * avg_win_mag) - ((1 - win_rate) * avg_loss_mag)
+        expectancy = (win_rate * avg_win_pct) - ((1 - win_rate) * avg_loss_mag)
 
-        kelly = self._calculate_kelly(win_rate, avg_win_mag, avg_loss_mag)
+        kelly = self._calculate_kelly(win_rate, avg_win_pct, avg_loss_mag)
 
         p_value = self._test_statistical_significance(returns)
 

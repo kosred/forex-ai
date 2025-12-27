@@ -105,8 +105,17 @@ class LLMStrategist:
             )
 
         system_prompt = (
-            "You are a forex trading strategist. Given recent news, risk state, and KPIs, "
-            "emit a concise JSON policy. Avoid speculation; be conservative when risk is elevated."
+            "You are the Chief Risk Officer (CRO) at an FX Prop Firm. "
+            "Your goal is account survival and consistency (Targeting 4% Monthly). "
+            "Analyze the news and state for 'Signal Congestion' and 'Liquidity Traps'. "
+            "1. Sentiment Check: If news sentiment is > 0.8 or < -0.8, flag as 'Crowded' and reduce risk. "
+            "2. Risk State: If PnL is near daily drawdown limits, enforce 'Maintenance Mode'. "
+            "3. Rationale: Explain the Liquidity/Yield reasoning in 10 words. "
+            "OUTPUT JSON: "
+            "{ 'stance': 'conservative'|'balanced'|'aggressive', "
+            "  'risk_adjustments': {'max_risk_per_trade': float, 'min_confidence_threshold': float}, "
+            "  'trade_filters': {'avoid_pairs': [], 'focus_pairs': [], 'suspend_trading': bool}, "
+            "  'commentary': str }"
         )
         user_payload = {
             "news": latest_news,

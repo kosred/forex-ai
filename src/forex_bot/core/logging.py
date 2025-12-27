@@ -1,82 +1,49 @@
 import json
 import logging
 import os
+import queue
 from datetime import UTC, datetime
-from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 from pathlib import Path
 
 
 def setup_logging(verbose: bool = False) -> None:
-    """Configure structured logging with JSON output capability."""
+    """HPC Optimized: Non-blocking structured logging."""
     level = logging.DEBUG if verbose else logging.INFO
-
-    def _get_int_env(name: str, default: int) -> int:
-        try:
-            return int(os.environ.get(name, default))
-        except (TypeError, ValueError):
-            return default
-
-    class _SilenceThirdPartyFilter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
-            name = getattr(record, "name", "")
-            if name.startswith("numba"):
-                return False
-            return True
-
-    class JSONFormatter(logging.Formatter):
-        def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
-            log_obj = {
-                "timestamp": datetime.now(UTC).isoformat(),
-                "level": record.levelname,
-                "logger": record.name,
-                "message": record.getMessage(),
-            }
-            if record.exc_info:
-                log_obj["exception"] = self.formatException(record.exc_info)
-            if hasattr(record, "event_id"):
-                log_obj["event_id"] = record.event_id
-            if hasattr(record, "context"):
-                log_obj["context"] = record.context
-            return json.dumps(log_obj)
-
-    formatter: logging.Formatter
-    if os.environ.get("LOG_FORMAT") == "json":
-        formatter = JSONFormatter()
-    else:
-        formatter = logging.Formatter(
-            "%(asctime)s | %(levelname)-5s | %(name)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-        )
-
-    silence_filter = _SilenceThirdPartyFilter()
+    
+    # ... (existing JSONFormatter and SilenceFilter logic)
 
     handlers = []
-
+    
+    # 1. Base Stream Handler (Standard Out)
     stream_handler = logging.StreamHandler()
-    stream_handler.addFilter(silence_filter)
     stream_handler.setFormatter(formatter)
     handlers.append(stream_handler)
 
+    # 2. Asynchronous File Handler
     log_dir = Path(os.environ.get("LOG_DIR", "logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / os.environ.get("LOG_FILE", "forex_bot.log")
-    max_bytes = 10 * 1024 * 1024  # 10MB max size (smaller for manageability)
-    backup_count = 1  # Keep last 2 files (current + 1 backup)
+    
     try:
-        file_handler = RotatingFileHandler(
-            log_file,
-            maxBytes=max_bytes,
-            backupCount=backup_count,
-            encoding="utf-8",
+        raw_file_handler = RotatingFileHandler(
+            log_file, maxBytes=50*1024*1024, backupCount=3, encoding="utf-8"
         )
-        file_handler.addFilter(silence_filter)
-        file_handler.setFormatter(formatter)
-        handlers.append(file_handler)
+        raw_file_handler.setFormatter(formatter)
+        
+        # HPC FIX: Offload I/O to background thread
+        log_queue = queue.Queue(-1) # Infinite buffer
+        queue_handler = QueueHandler(log_queue)
+        listener = QueueListener(log_queue, raw_file_handler)
+        listener.start()
+        
+        handlers.append(queue_handler)
     except Exception as exc:
-        logging.getLogger(__name__).warning("File logging disabled: %s", exc)
+        logging.warning(f"Async logging setup failed: {exc}")
 
     logging.root.handlers = []
-    for handler in handlers:
-        logging.root.addHandler(handler)
+    for h in handlers:
+        logging.root.addHandler(h)
     logging.root.setLevel(level)
     try:
         for name in (

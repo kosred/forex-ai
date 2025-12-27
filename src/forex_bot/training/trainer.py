@@ -1388,14 +1388,25 @@ class ModelTrainer:
 
     @staticmethod
     def _pad_probs(p):
+        """
+        HPC UNIFIED PROTOCOL: Force output to [Neutral, Buy, Sell].
+        Standard indices: 0=Neutral, 1=Buy, 2=Sell.
+        """
         if p is None:
             return np.zeros((0, 3))
         p = np.asarray(p)
         if p.ndim == 1:
-            return np.zeros((0, 3))
-        if p.shape[1] == 2:
-            z = np.zeros((len(p), 3))
-            z[:, 0] = p[:, 0]
-            z[:, 1] = p[:, 1]  # Simplification
-            return z
-        return p[:, :3]
+            p = p.reshape(-1, 1)
+        n = p.shape[0]
+        
+        out = np.zeros((n, 3))
+        if p.shape[1] == 3:
+            return p # Assume standard protocol
+        elif p.shape[1] == 2:
+            # Model only knows Neutral vs Buy or similar
+            out[:, 0] = p[:, 0]
+            out[:, 1] = p[:, 1]
+        else:
+            out[:, 0] = 1.0 - p[:, 0]
+            out[:, 1] = p[:, 0]
+        return out

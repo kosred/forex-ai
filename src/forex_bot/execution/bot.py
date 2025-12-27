@@ -90,6 +90,13 @@ class ForexBot:
             if not self.signal_engine.models:
                 logger.warning("Models missing. Training first...")
                 await self.train(optimize=True, stop_event=stop_event)
+                # HPC FIX: Post-training memory purge
+                import gc
+                import torch
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 self.signal_engine.load_models("models")
 
             # Init Online Learner

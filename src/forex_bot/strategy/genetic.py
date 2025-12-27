@@ -372,43 +372,42 @@ class GeneticStrategyEvolution:
 
     def evolve(self, validation_data: pd.DataFrame | None = None) -> list[GeneticGene]:
         if not self.population:
-            raise RuntimeError("Population not initialized. Call initialize_population() first.")
+            raise RuntimeError("Population not initialized.")
 
         if validation_data is not None and self.mixer is not None:
-            if isinstance(validation_data.index, pd.DatetimeIndex) and not validation_data.index.is_monotonic_increasing:
-                validation_data = validation_data.sort_index(kind="mergesort")
             self._evaluate_population(validation_data, self.population)
 
         self.population.sort(key=lambda x: x.fitness, reverse=True)
         self.best_gene = self.population[0]
 
-        elite_count = max(1, int(self.population_size * 0.2))
+        # HPC FIX: Tournament Selection (Preserves Diversity)
+        def _tournament_select(k=3):
+            # Select k random individuals and return the best one
+            participants = random.sample(self.population, k)
+            return max(participants, key=lambda x: x.fitness)
+
+        elite_count = max(1, int(self.population_size * 0.1)) # Top 10% Elitism
         next_gen: list[GeneticGene] = self.population[:elite_count]
 
+        # HPC: Dynamic Mutation Rate
+        # If population is too similar, boost mutation
+        pop_diversity = len(set([g.indicators[0] for g in self.population if g.indicators]))
+        current_mutation = self.mutation_rate
+        if pop_diversity < 5: current_mutation *= 2.0
+
         while len(next_gen) < self.population_size:
-            p1 = random.choice(self.population[:elite_count])
-            p2 = random.choice(self.population[:elite_count])
+            p1 = _tournament_select()
+            p2 = _tournament_select()
             child_gene = self._crossover(p1, p2)
-            if random.random() < self.mutation_rate:
+            
+            if random.random() < current_mutation:
                 child_gene = self._mutate(child_gene)
+                
             child_gene.generation = self.generation + 1
             next_gen.append(child_gene)
 
-        if validation_data is not None and self.mixer is not None:
-            self._evaluate_population(validation_data, next_gen)
-
         self.population = next_gen
-        # Re-sort to put best new children at top
-        self.population.sort(key=lambda x: x.fitness, reverse=True)
-        if self.population:
-            self.best_gene = self.population[0]
-
         self.generation += 1
-        logger.info(
-            "Genetic evolution generation %s completed; best fitness %.4f",
-            self.generation,
-            self.best_gene.fitness,
-        )
         return self.population
 
     def _crossover(self, p1: GeneticGene, p2: GeneticGene) -> GeneticGene:

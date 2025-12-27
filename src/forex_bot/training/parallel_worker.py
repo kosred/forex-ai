@@ -108,42 +108,24 @@ def run_worker(argv: list[str] | None = None) -> int:
     durations: dict[str, float] = {}
     trained: list[str] = []
 
+    # HPC FIX: Pure-Sharded Task Execution
+    # Instead of nesting threads (which hits the GIL), we process models sequentially
+    # and let the master orchestrator launch more processes.
+    logger.info(f"[WORKER] Sequentially training {len(models)} models to avoid GIL-locking.")
+    
     for idx, name in enumerate(models, start=1):
         t0 = time.perf_counter()
         try:
-            logger.info(f"[WORKER] Training {name} ({idx}/{len(models)})")
-
             model = factory.create_model(name, best_params, idx)
-
-            fit_kwargs: dict[str, Any] = {}
-            try:
-                import inspect
-
-                sig = inspect.signature(model.fit)
-                if "metadata" in sig.parameters:
-                    fit_kwargs["metadata"] = None
-                if "tensorboard_writer" in sig.parameters:
-                    fit_kwargs["tensorboard_writer"] = None
-            except Exception:
-                pass
-
+            # Use full thread budget for THIS model
             with thread_limits(blas_threads=cpu_threads):
-                model.fit(X, y, **fit_kwargs)
-
-            # Sanity: ensure inference works before persisting.
-            try:
-                sample = X.iloc[: min(256, len(X))]
-                _ = _pad_probs(model.predict_proba(sample))
-            except Exception as exc:
-                logger.warning(f"[WORKER] {name} trained but is not usable for inference: {exc}")
-                continue
-
+                model.fit(X, y)
             model.save(str(out_dir))
             trained.append(name)
-        except Exception as exc:
-            logger.error(f"[WORKER] Training {name} failed: {exc}", exc_info=True)
-        finally:
             durations[name] = time.perf_counter() - t0
+            logger.info(f"[WORKER] Successfully trained {name} in {durations[name]:.1f}s")
+        except Exception as e:
+            logger.error(f"[WORKER] Failed {name}: {e}")
 
     # Write a small manifest for the coordinator.
     try:

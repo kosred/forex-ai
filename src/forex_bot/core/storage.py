@@ -18,10 +18,14 @@ logger = logging.getLogger(__name__)
 
 
 class StrategyLedger:
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, symbol: str | None = None) -> None:
         path = Path(db_path)
+        # HPC FIX: Symbol-Isolated Databases
+        if symbol:
+            path = path.with_stem(f"{path.stem}_{symbol}")
+            
         if not path.is_absolute():
-            # Anchor relative paths to repo root (avoid CWD-dependent I/O errors).
+            # Anchor relative paths to repo root
             repo_root = Path(__file__).resolve().parents[3]
             path = repo_root / path
         self.db_path = str(path)

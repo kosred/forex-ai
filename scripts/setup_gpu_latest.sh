@@ -1,58 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-shot GPU setup for Ubuntu 24.04 (NVIDIA, CUDA runtime present).
-# Installs the latest available versions of GPU-capable ML/RL deps on Python 3.12/3.13.
-#
-# Usage:
-#   bash scripts/setup_gpu_latest.sh [--python python3.12] [--cuda-index https://download.pytorch.org/whl/cu121] [--venv .venv]
+# HPC MASTER GPU SETUP (2025 Standard)
+# Target: 8x RTX-A6000 | CUDA 12.8 | Python 3.13
+# Optimized for high-throughput discovery and training.
 
 PYTHON_BIN="python3"
-CUDA_INDEX="https://download.pytorch.org/whl/cu121"  # adjust if using a different CUDA runtime
-VENV_DIR=".venv"
+CUDA_INDEX="https://download.pytorch.org/whl/cu128"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --python) PYTHON_BIN="$2"; shift 2 ;;
-    --cuda-index) CUDA_INDEX="$2"; shift 2 ;;
-    --venv) VENV_DIR="$2"; shift 2 ;;
-    *) echo "Unknown arg: $1"; exit 1 ;;
-  esac
-done
-
-echo "[*] Using python: $PYTHON_BIN"
-echo "[*] CUDA index: $CUDA_INDEX"
-echo "[*] Venv: $VENV_DIR"
+echo "[*] Initializing GPU stack for high-performance Forex bot..."
 
 sudo apt-get update -y
-sudo apt-get install -y build-essential python3-venv python3-dev libopenblas-dev libomp-dev git
+sudo apt-get install -y nvidia-cuda-toolkit libcudnn9-dev libcudnn9-cuda-12
 
-"$PYTHON_BIN" -m venv "$VENV_DIR"
-source "$VENV_DIR/bin/activate"
+echo "[*] Upgrading base environment..."
+"$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel --user --break-system-packages
 
-pip install --upgrade pip setuptools wheel
+echo "[*] Installing verified HPC requirements (CUDA 12.8)..."
+"$PYTHON_BIN" -m pip install -r requirements-hpc.txt --user --break-system-packages
 
-echo "[*] Installing latest CUDA PyTorch from $CUDA_INDEX ..."
-pip install --index-url "$CUDA_INDEX" torch torchvision torchaudio
+# --- GPU VERIFICATION (HPC MODE) ---
+echo "[*] Running multi-GPU integrity check..."
+python3 -c "
+import torch
+print(f'Detected {torch.cuda.device_count()} GPUs')
+for i in range(torch.cuda.device_count()):
+    props = torch.cuda.get_device_properties(i)
+    print(f'  GPU {i}: {props.name} | VRAM: {props.total_memory/1024**3:.1f}GB | P2P: {torch.cuda.can_device_access_peer(0, i) if i > 0 else \"Primary\"}')
+"
 
-echo "[*] Installing core deps..."
-pip install --upgrade numpy pandas scipy scikit-learn numba psutil pyarrow matplotlib tabulate tensorboard
+echo "[*] Optimizing NCCL for multi-GPU performance..."
+# NCCL settings for A6000 P2P topology
+export NCCL_P2P_LEVEL=5
+export NCCL_IB_DISABLE=1 # Disable InfiniBand if not present to avoid socket timeouts
 
-echo "[*] Installing gradient boosting libs..."
-pip install --upgrade lightgbm xgboost catboost
-
-echo "[*] Installing Ray + RLlib (latest)..."
-pip install --upgrade "ray[default,rllib]"
-
-echo "[*] Installing Gymnasium and SB3..."
-pip install --upgrade "gymnasium[box2d,atari]"
-# Try stable SB3 first; if it fails on py3.13, fall back to git main
-if ! pip install --upgrade stable-baselines3; then
-  echo "[*] stable-baselines3 wheel not available; installing from git main..."
-  pip install --upgrade "stable-baselines3 @ git+https://github.com/DLR-RM/stable-baselines3.git"
-fi
-
-echo "[*] Installing optional CuPy (CUDA 12.x build) for GPU TA calcs..."
-pip install --upgrade cupy-cuda12x || echo "[!] CuPy install failed; continue without it."
-
-echo "[*] Done. Activate with: source $VENV_DIR/bin/activate"
+echo "[*] Done. Your 8-GPU cluster is ready for the blitz."
