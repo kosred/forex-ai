@@ -223,6 +223,88 @@ if NUMBA_AVAILABLE:
 
         return vwap_out
 
+else:
+    def rsi_vectorized_numba(series_arr: np.ndarray, period: int = 14) -> np.ndarray:
+        return rsi_pandas(pd.Series(series_arr), period).values
+
+    def compute_adx_numba(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+        if len(close) < period:
+            return np.zeros(len(close))
+            
+        df = pd.DataFrame({'high': high, 'low': low, 'close': close})
+        df['up'] = df['high'] - df['high'].shift(1)
+        df['down'] = df['low'].shift(1) - df['low']
+        
+        plus_dm = np.where((df['up'] > df['down']) & (df['up'] > 0), df['up'], 0.0)
+        minus_dm = np.where((df['down'] > df['up']) & (df['down'] > 0), df['down'], 0.0)
+        
+        tr1 = df['high'] - df['low']
+        tr2 = abs(df['high'] - df['close'].shift(1))
+        tr3 = abs(df['low'] - df['close'].shift(1))
+        tr = np.maximum(tr1, np.maximum(tr2, tr3))
+        
+        alpha = 1.0 / period
+        
+        def smooth(series, alpha):
+            return series.ewm(alpha=alpha, adjust=False).mean()
+
+        smooth_plus_dm = smooth(pd.Series(plus_dm), alpha)
+        smooth_minus_dm = smooth(pd.Series(minus_dm), alpha)
+        smooth_tr = smooth(pd.Series(tr), alpha)
+        
+        plus_di = 100 * (smooth_plus_dm / smooth_tr.replace(0, np.nan))
+        minus_di = 100 * (smooth_minus_dm / smooth_tr.replace(0, np.nan))
+        
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
+        adx = smooth(dx.fillna(0.0), alpha)
+        
+        return adx.fillna(0.0).values
+
+    def compute_stochastic_numba(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> tuple[np.ndarray, np.ndarray]:
+        high_s = pd.Series(high)
+        low_s = pd.Series(low)
+        close_s = pd.Series(close)
+        
+        lowest_low = low_s.rolling(window=period).min()
+        highest_high = high_s.rolling(window=period).max()
+        
+        denom = highest_high - lowest_low
+        stoch_k = 100 * (close_s - lowest_low) / denom.replace(0, np.nan)
+        stoch_k = stoch_k.fillna(50.0)
+        
+        stoch_d = stoch_k.rolling(window=3).mean().fillna(50.0)
+        
+        return stoch_k.values, stoch_d.values
+
+    def compute_cci_numba(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 20) -> np.ndarray:
+        tp = (high + low + close) / 3.0
+        tp_s = pd.Series(tp)
+        sma_tp = tp_s.rolling(window=period).mean()
+        
+        # Mean Absolute Deviation
+        def rolling_mad(x):
+            return np.mean(np.abs(x - x.mean()))
+            
+        mad = tp_s.rolling(window=period).apply(rolling_mad, raw=True)
+        
+        cci = (tp_s - sma_tp) / (0.015 * mad.replace(0, np.nan))
+        return cci.fillna(0.0).values
+
+    def compute_vwap_numba(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, dates_epoch_days: np.ndarray) -> np.ndarray:
+        df = pd.DataFrame({'high': high, 'low': low, 'close': close, 'volume': volume, 'date': dates_epoch_days})
+        df['tp_v'] = ((df['high'] + df['low'] + df['close']) / 3.0) * df['volume']
+        
+        # Group by day and calc cumsum
+        # Note: We must ensure preservation of original order or re-align
+        # Assuming input is time-sorted
+        
+        g = df.groupby('date', sort=False)
+        cum_tp_v = g['tp_v'].cumsum()
+        cum_vol = g['volume'].cumsum().replace(0, 1.0)
+        
+        vwap = cum_tp_v / cum_vol
+        return vwap.fillna(0.0).values
+
 # --- Pandas Fallbacks ---
 
 
