@@ -11,7 +11,11 @@ def setup_logging(verbose: bool = False) -> None:
     """HPC Optimized: Non-blocking structured logging."""
     level = logging.DEBUG if verbose else logging.INFO
     
-    # ... (existing JSONFormatter and SilenceFilter logic)
+    # Define a robust formatter
+    formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
     handlers = []
     
