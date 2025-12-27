@@ -37,6 +37,7 @@ class TensorDiscoveryEngine:
         self.best_experts = []
         self.month_ids_cpu = None
         self.month_count = 0
+        self.month_ids_valid = False
 
     def _prepare_tensor_cube(self, frames: Dict[str, pd.DataFrame], news_map: Optional[Dict[str, pd.DataFrame]] = None):
         logger.info("Aligning Multi-Timeframe Data for Cooperative Discovery...")
@@ -123,14 +124,15 @@ class TensorDiscoveryEngine:
         # The calling code passes 'news_map' as a single DataFrame aligned to master index?
         # Let's adjust the signature to accept 'news_features: pd.DataFrame'
         
-        # We keep the master copy on CPU; each GPU worker will pull its own copy
+        # We keep the master copy on CPU; each GPU worker will pull its own copy.
         self.data_cube_cpu = torch.stack(cube_list)
         self.ohlc_cube_cpu = torch.stack(ohlc_list)
         self.n_features = self.data_cube_cpu.shape[2]
         self.month_ids_cpu = None
         self.month_count = 0
+        month_metrics = str(os.environ.get("FOREX_BOT_DISCOVERY_MONTHLY_METRICS", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
         try:
-            if isinstance(master_idx, pd.DatetimeIndex):
+            if month_metrics and isinstance(master_idx, pd.DatetimeIndex):
                 idx = master_idx
                 if idx.tz is not None:
                     idx = idx.tz_convert("UTC")
@@ -138,9 +140,22 @@ class TensorDiscoveryEngine:
                 month_ids, uniques = pd.factorize(month_keys)
                 self.month_ids_cpu = torch.as_tensor(month_ids, dtype=torch.long)
                 self.month_count = int(len(uniques))
+                if self.month_count > 0:
+                    mi_min = int(self.month_ids_cpu.min().item())
+                    mi_max = int(self.month_ids_cpu.max().item())
+                    self.month_ids_valid = (mi_min >= 0) and (mi_max < self.month_count)
+                else:
+                    self.month_ids_valid = False
         except Exception:
             self.month_ids_cpu = None
             self.month_count = 0
+            self.month_ids_valid = False
+
+        if self.month_ids_cpu is not None and not self.month_ids_valid:
+            logger.warning("Discovery: month_ids invalid; disabling monthly metrics for this run.")
+            self.month_ids_cpu = None
+            self.month_count = 0
+            self.month_ids_valid = False
         
         # News Tensor (Sentiment, Impact)
         self.news_tensor_cpu = None
@@ -155,6 +170,23 @@ class TensorDiscoveryEngine:
              
              news_data = np.stack([sent, impact], axis=1).astype(np.float32)
              self.news_tensor_cpu = torch.from_numpy(news_data)
+
+        # Pin CPU memory for faster H2D transfers when streaming.
+        try:
+            if torch.cuda.is_available():
+                pin_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_PIN_MEMORY", "auto") or "auto").strip().lower()
+                should_pin = pin_mode in {"1", "true", "yes", "on"}
+                if pin_mode == "auto":
+                    should_pin = True
+                if should_pin:
+                    self.data_cube_cpu = self.data_cube_cpu.pin_memory()
+                    self.ohlc_cube_cpu = self.ohlc_cube_cpu.pin_memory()
+                    if self.news_tensor_cpu is not None:
+                        self.news_tensor_cpu = self.news_tensor_cpu.pin_memory()
+                    if self.month_ids_cpu is not None:
+                        self.month_ids_cpu = self.month_ids_cpu.pin_memory()
+        except Exception:
+            pass
 
         logger.info(f"Master Data Cube Ready: {self.data_cube_cpu.shape}")
 
@@ -235,13 +267,18 @@ class TensorDiscoveryEngine:
             gpu_data_cubes = [self.data_cube_cpu.to(gpu) for gpu in cuda_gpus]
             gpu_ohlc_cubes = [self.ohlc_cube_cpu.to(gpu) for gpu in cuda_gpus]
             gpu_news = [self.news_tensor_cpu.to(gpu) for gpu in cuda_gpus] if self.news_tensor_cpu is not None else []
-            gpu_month_ids = [self.month_ids_cpu.to(gpu) for gpu in cuda_gpus] if self.month_ids_cpu is not None else []
         else:
             logger.info("Discovery: streaming data per-batch to avoid VRAM exhaustion.")
             gpu_data_cubes = []
             gpu_ohlc_cubes = []
             gpu_news = []
-            gpu_month_ids = []
+        # Month ids are tiny; keep a per-GPU copy to avoid repeated H2D transfers.
+        gpu_month_ids = []
+        if self.month_ids_cpu is not None and cuda_gpus:
+            try:
+                gpu_month_ids = [self.month_ids_cpu.to(gpu, non_blocking=True) for gpu in cuda_gpus]
+            except Exception:
+                gpu_month_ids = []
 
         num_gpus = max(1, len(self.gpu_list))
 
@@ -283,11 +320,14 @@ class TensorDiscoveryEngine:
                         has_news = self.news_tensor_cpu is not None
                         month_ids = None
                         if self.month_ids_cpu is not None:
-                            month_ids = (
-                                gpu_month_ids[gpu_idx]
-                                if preload and gpu_month_ids
-                                else self.month_ids_cpu.to(dev, non_blocking=True)
-                            )
+                            try:
+                                if gpu_month_ids:
+                                    month_ids = gpu_month_ids[gpu_idx]
+                                else:
+                                    month_ids = self.month_ids_cpu.to(dev)
+                            except Exception as exc:
+                                logger.warning(f"Discovery: month_ids transfer failed; disabling monthly metrics. {exc}")
+                                month_ids = None
 
                         # Auto-scale batch size based on VRAM, data footprint, and signal tensor cost.
                         usable_mem = None
@@ -333,7 +373,7 @@ class TensorDiscoveryEngine:
                         fitness_all = []
                         for g_start in range(0, chunk.shape[0], max_genomes):
                             g_end = min(g_start + max_genomes, chunk.shape[0])
-                            genomes = chunk[g_start:g_end].clone().detach().to(dev)
+                            genomes = chunk[g_start:g_end].detach().to(dev, non_blocking=True)
                             local_pop = genomes.shape[0]
                             batch_size = base_batch
                             if usable_mem is not None and local_pop > 0:
@@ -482,7 +522,7 @@ class TensorDiscoveryEngine:
                                 if has_news and news_slice is not None:
                                     del news_slice
 
-                            if is_cuda:
+                            if is_cuda and str(os.environ.get("FOREX_BOT_DISCOVERY_EMPTY_CACHE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}:
                                 torch.cuda.empty_cache()
 
                             if effective_samples <= 0:
