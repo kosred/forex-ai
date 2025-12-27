@@ -606,6 +606,20 @@ class FeatureEngineer:
         # Ensure symbol_hash columns are added last
         cols = [c for c in cols if not c.startswith("symbol_hash_")] + symbol_cols
 
+        # Final Feature Matrix Construction
+        valid_cols = [c for c in cols if c in df.columns]
+        X = df[valid_cols].fillna(0.0)
+        
+        # Labels & Metadata (HPC: Vectorized Generation)
+        base_sigs = self._generate_base_signals(df)
+        labels = self._meta_label_outcomes(df, base_sigs)
+        
+        meta = df[["close", "high", "low", "open"]].copy()
+        if "volume" in df.columns:
+            meta["volume"] = df["volume"]
+        if "atr" in df.columns:
+            meta["atr"] = df["atr"]
+
         # Merged dataset finalized
         final_features = list(X.columns)
         logger.info(

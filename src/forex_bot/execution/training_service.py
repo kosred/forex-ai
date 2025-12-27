@@ -1234,8 +1234,15 @@ class TrainingService:
                     logger.error(f"HPC ERROR: Failed to merge shards for {sym}: {merge_err}")
 
             # Save cache for next time
-            if reuse_cache:
-                joblib.dump(datasets, cache_path)
+            if reuse_cache and datasets:
+                try:
+                    joblib.dump(datasets, cache_path)
+                except Exception as e:
+                    logger.warning(f"HPC: Failed to save dataset cache: {e}")
+
+        if not datasets:
+            logger.error("HPC FATAL: No datasets were successfully prepared. Cannot proceed with training.")
+            return
 
         # --- Launch Discovery (Uses internal 8-GPU ThreadPool) ---
         logger.info("Launching GPU-Native Expert Discovery (Multi-GPU Pool)...")
