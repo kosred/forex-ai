@@ -35,6 +35,8 @@ MODEL_MAPPING = {
     "tide": ("tide_gpu", "TiDEExpert"),
     "rl_ppo": ("rl", "RLExpertPPO"),
     "rl_sac": ("rl", "RLExpertSAC"),
+    "rllib_ppo": ("rllib_agent", "RLlibPPOAgent"),
+    "rllib_sac": ("rllib_agent", "RLlibSACAgent"),
     "evolution": ("evolution", "EvoExpertCMA"),
     "genetic": ("genetic", "GeneticStrategyExpert"),
     "unsupervised": ("unsupervised", "ClusterExpert"),
