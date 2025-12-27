@@ -1253,6 +1253,12 @@ def _hpc_feature_worker(settings, frames, sym, news_features=None, assigned_gpu=
         import os
         from pathlib import Path
 
+        # Limit internal math threads to 1 per worker to prevent thrashing
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["NUMEXPR_NUM_THREADS"] = "1"
+        os.environ["NUMEXPR_MAX_THREADS"] = "64"
+
         # Optionally force CPU-only feature engineering to avoid GPU OOM in workers.
         force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {
             "1", "true", "yes", "on"
