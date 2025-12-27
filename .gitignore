@@ -9,13 +9,7 @@
 /.ruff_cache/
 /catboost_info/
 
-# Local secrets / keys (keep out of git)
-keys.txt
-keys*.txt
-!keys.example.txt
-*.pem
-*.pub
-*.key
+
 
 # Local databases / artifacts
 *.sqlite
