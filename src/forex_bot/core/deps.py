@@ -240,7 +240,7 @@ def ensure_dependencies() -> None:
             importlib_metadata.version(base_pkg)
         except importlib_metadata.PackageNotFoundError:
             missing.append(pkg)
-            
+
     if not missing:
         logger.info("All dependencies appear to be satisfied.")
         return
@@ -250,6 +250,13 @@ def ensure_dependencies() -> None:
     # 5. Install Logic
     gpu_libs = []
     standard_libs = []
+
+    # Prefer a pinned torch bundle to avoid pip solving/downloading multiple versions.
+    torch_bundle = None
+    if torch_missing:
+        torch_bundle = _torch_bundle_for_env(py_ver)
+        # Remove bare torch entries from missing; we'll install the pinned bundle.
+        missing = [p for p in missing if p not in {"torch", "torchvision", "torchaudio"}]
 
     for pkg in missing:
         # Only core torch libs are on the special index; evotorch is on standard PyPI
@@ -286,6 +293,9 @@ def ensure_dependencies() -> None:
             else:
                 index_url = "https://download.pytorch.org/whl/cu121"
 
+        # Inject pinned torch bundle first (if any) to avoid resolver churn.
+        if torch_bundle:
+            gpu_libs = torch_bundle + gpu_libs
         _install(gpu_libs, index_url=index_url, pre=is_py313)
 
     if post_torch_libs:
@@ -403,3 +413,29 @@ def _flash_attn_wheel_url() -> str | None:
         )
     except Exception:
         return None
+
+
+def _torch_bundle_for_env(py_ver: tuple[int, int] | None = None) -> list[str]:
+    """
+    Return a pinned torch/torchvision/torchaudio bundle to avoid pip resolving
+    multiple torch versions. Override via FOREX_BOT_TORCH_VERSION if desired.
+    """
+    if py_ver is None:
+        py_ver = sys.version_info[:2]
+    override = os.environ.get("FOREX_BOT_TORCH_VERSION")
+    torch_ver = (override or "2.8.0").strip()
+    # Best-known matching versions.
+    vision_map = {
+        "2.6.0": "0.21.0",
+        "2.7.0": "0.22.0",
+        "2.7.1": "0.22.1",
+        "2.8.0": "0.23.0",
+        "2.9.0": "0.24.0",
+    }
+    vision_ver = vision_map.get(torch_ver, "0.21.0")
+    audio_ver = torch_ver
+    return [
+        f"torch=={torch_ver}",
+        f"torchvision=={vision_ver}",
+        f"torchaudio=={audio_ver}",
+    ]
