@@ -497,10 +497,9 @@ class TensorDiscoveryEngine:
                         curr_actions = exec_actions[:, :, 1:]
                         entries = (prev_actions == 0) & (curr_actions != 0)
                         flips = (prev_actions != 0) & (curr_actions != 0) & (prev_actions != curr_actions)
-                        trade_events = (entries | flips).float()
-                        trade_steps.add_(
-                            (trade_events * tf_weights.unsqueeze(2) * alive_mask.unsqueeze(1).float()).sum(dim=(1, 2))
-                        )
+                        trade_events = (entries | flips)
+                        trade_any = trade_events.sum(dim=1) > 0
+                        trade_steps.add_(trade_any.float().sum(dim=1))
                     else:
                         actions = torch.where(signals > buy_th.unsqueeze(1), 1.0, 0.0)
                         actions = torch.where(signals < sell_th.unsqueeze(1), -1.0, actions)
@@ -594,14 +593,8 @@ class TensorDiscoveryEngine:
                 dd_ratio = max_dd / torch.clamp(torch.tensor(dynamic_dd_limit, device=dev), min=1e-6)
                 dd_penalty = torch.clamp(dd_ratio - 1.0, min=0.0) * dd_penalty_weight
                 
-                total_steps = float(max(n_samples, 1))
-                trade_density = trade_steps / total_steps
-                try:
-                    min_trade_density = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADE_DENSITY", str(1.0 / 1440.0)) or (1.0 / 1440.0))
-                except Exception:
-                    min_trade_density = 1.0 / 1440.0
-                min_trade_density = max(min_trade_density, 1e-6)
-
+                days = max(float(n_samples) / 1440.0, 1e-6)
+                trade_density = trade_steps / days
                 try:
                     target_min_per_day = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_MIN_PER_DAY", "1") or 1.0)
                     target_max_per_day = float(os.environ.get("FOREX_BOT_DISCOVERY_TRADE_MAX_PER_DAY", "2") or 2.0)
@@ -609,14 +602,12 @@ class TensorDiscoveryEngine:
                     target_min_per_day, target_max_per_day = 1.0, 2.0
                 target_min_per_day = max(target_min_per_day, 0.1)
                 target_max_per_day = max(target_max_per_day, target_min_per_day)
-                min_density = target_min_per_day / 1440.0
-                max_density = target_max_per_day / 1440.0
-                min_trade_density = max(min_trade_density, min_density)
-                trade_gate = trade_density >= min_trade_density
+                min_trades_required = max(target_min_per_day * days, 1.0)
+                trade_gate = trade_steps >= min_trades_required
 
-                # Trade activity score peaks within [min_density, max_density]
-                mid_density = (min_density + max_density) / 2.0
-                half_span = max((max_density - min_density) / 2.0, 1e-9)
+                # Trade activity score: penalize under/over-trading, reward within range.
+                mid_density = (target_min_per_day + target_max_per_day) / 2.0
+                half_span = max((target_max_per_day - target_min_per_day) / 2.0, 1e-9)
                 trade_score = 1.0 - torch.abs(trade_density - mid_density) / half_span
                 trade_score = torch.clamp(trade_score, min=-1.0, max=1.0)
                 try:
@@ -636,7 +627,8 @@ class TensorDiscoveryEngine:
                 try:
                     no_trade_penalty = float(os.environ.get("FOREX_BOT_DISCOVERY_NO_TRADE_PENALTY", "-20.0") or -20.0)
                 except Exception:
-                    no_trade_penalty = -5.0
+                    no_trade_penalty = -20.0
+                no_trade_penalty = min(no_trade_penalty, -1e-3)
                 total_fitness = torch.where(trade_gate, total_fitness, torch.full_like(total_fitness, no_trade_penalty))
                 
                 max_dd_safe = torch.nan_to_num(max_dd, nan=1.0)
@@ -644,7 +636,7 @@ class TensorDiscoveryEngine:
                 metadata = {
                     "fit": float(total_fitness[bi].item()), "surv": float(survival_ratio[bi].item()),
                     "shrp": float(sharpe[bi].item()), "dd": float(max_dd_safe[bi].item()), 
-                    "segs": int(segment_profitability[bi].item()), "trade": float(trade_density[bi].item() * 1440.0),
+                    "segs": int(segment_profitability[bi].item()), "trade": float(trade_density[bi].item()),
                     "limit": dynamic_dd_limit
                 }
                 return torch.nan_to_num(total_fitness, nan=0.0).detach().cpu(), metadata
@@ -668,6 +660,49 @@ class TensorDiscoveryEngine:
         searcher = CMAES(problem, popsize=pop_size, stdev_init=stdev_init)
 
         logger.info(f"Starting COOPERATIVE 8-GPU Discovery (Pop: {pop_size})...")
+        checkpoint_path = Path(
+            os.environ.get("FOREX_BOT_DISCOVERY_CHECKPOINT_PATH", "cache/discovery_checkpoint.pt")
+        )
+        try:
+            checkpoint_every = int(os.environ.get("FOREX_BOT_DISCOVERY_CHECKPOINT_EVERY", "10") or 10)
+        except Exception:
+            checkpoint_every = 10
+        checkpoint_every = max(checkpoint_every, 1)
+        resume_enabled = str(os.environ.get("FOREX_BOT_DISCOVERY_RESUME", "1") or "1").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        start_gen = 0
+        resume_best = None
+        if resume_enabled and checkpoint_path.exists():
+            try:
+                ckpt = torch.load(checkpoint_path, map_location="cpu")
+                pop_vals = ckpt.get("population")
+                if pop_vals is not None:
+                    try:
+                        cur_vals = searcher.population.values
+                        if cur_vals.shape == pop_vals.shape:
+                            cur_vals.copy_(pop_vals.to(cur_vals.device, dtype=cur_vals.dtype))
+                            logger.info(f"Discovery resume: restored population from {checkpoint_path}.")
+                        else:
+                            logger.warning(
+                                f"Discovery resume skipped: population shape mismatch "
+                                f"{tuple(cur_vals.shape)} vs {tuple(pop_vals.shape)}."
+                            )
+                    except Exception as e:
+                        logger.warning(f"Discovery resume population load failed: {e}")
+                pop_evals = ckpt.get("evaluations")
+                if pop_evals is not None and hasattr(searcher.population, "evaluations"):
+                    try:
+                        cur_evals = searcher.population.evaluations
+                        if cur_evals is not None and cur_evals.shape == pop_evals.shape:
+                            cur_evals.copy_(pop_evals.to(cur_evals.device, dtype=cur_evals.dtype))
+                    except Exception as e:
+                        logger.warning(f"Discovery resume evaluations load failed: {e}")
+                ckpt_gen = int(ckpt.get("gen", 0) or 0)
+                start_gen = max(0, ckpt_gen + 1)
+                resume_best = ckpt.get("best_eval", None)
+            except Exception as e:
+                logger.warning(f"Discovery resume failed: {e}")
         try:
             stagnation_gens = int(os.environ.get("FOREX_BOT_DISCOVERY_STAGNATION_GENS", "20") or 20)
         except Exception:
@@ -682,9 +717,9 @@ class TensorDiscoveryEngine:
             mutation_boost = 0.3
         stagnation_gens = max(stagnation_gens, 5)
         mutation_boost = max(mutation_boost, 0.0)
-        best_seen = None
+        best_seen = resume_best if resume_best is not None else None
         stagnant = 0
-        for i in range(iterations):
+        for i in range(start_gen, iterations):
             gen_context["val"] = i
             searcher.step()
             current_best = float(searcher.status.get("best_eval", 0.0) or 0.0)
@@ -708,6 +743,29 @@ class TensorDiscoveryEngine:
                 m = metrics_registry.get(i)
                 if m: logger.info(f"Discovery (gen {i}): fit={m['fit']:.2f} surv={m['surv']:.2f} shrp={m['shrp']:.2f} dd={m['dd']:.2f} (lim={m['limit']:.3f}) segs={m['segs']}/3 trade={m['trade']:.3f}")
             if i % 10 == 0: logger.info(f"Generation {i}: Global Best Fitness = {float(searcher.status.get('best_eval', 0.0)):.4f}")
+            if checkpoint_every > 0 and (i % checkpoint_every == 0):
+                try:
+                    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                    pop_vals = searcher.population.values.detach().cpu()
+                    pop_evals = None
+                    if hasattr(searcher.population, "evaluations"):
+                        try:
+                            pop_evals = searcher.population.evaluations.detach().cpu()
+                        except Exception:
+                            pop_evals = None
+                    torch.save(
+                        {
+                            "gen": i,
+                            "population": pop_vals,
+                            "evaluations": pop_evals,
+                            "best_eval": float(searcher.status.get("best_eval", 0.0) or 0.0),
+                            "timeframes": self.timeframes,
+                            "n_features": self.n_features,
+                        },
+                        checkpoint_path,
+                    )
+                except Exception as e:
+                    logger.warning(f"Discovery checkpoint failed: {e}")
         
         final_pop = searcher.population.values.detach().cpu()
         final_scores = searcher.population.evaluations.detach().cpu()
