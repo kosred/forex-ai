@@ -38,6 +38,16 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    from numba import njit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 if NUMBA_AVAILABLE:
     @njit(cache=True, fastmath=True)
@@ -94,6 +104,68 @@ if NUMBA_AVAILABLE:
         done = False
         if daily_dd_worst >= max_daily_dd or total_dd_worst >= max_total_dd:
             reward = -150.0 # Heavier penalty for account death
+            done = True
+            
+        current_return = (equity - initial_balance) / initial_balance
+        if current_return >= profit_target and (prev_equity - initial_balance)/initial_balance < profit_target:
+            reward += 50.0
+            
+        if new_position != 0: reward -= 0.001
+        
+        return new_position, new_entry_price, new_balance, equity, new_high_water, reward, done
+else:
+    def _update_state_numba(
+        action, position, entry_price, current_close, current_high, current_low, 
+        balance, equity, high_water_mark, daily_start_equity, commission, 
+        initial_balance, profit_target, max_daily_dd, max_total_dd
+    ):
+        prev_equity = equity
+        new_position = position
+        new_entry_price = entry_price
+        new_balance = balance
+        
+        # 1. Action Logic (Standard)
+        if action == 1: # Buy
+            if position == -1: 
+                new_balance = equity
+                new_position = 0
+            if new_position == 0: 
+                new_position = 1
+                new_entry_price = current_close
+                new_balance -= new_balance * commission
+                equity = new_balance
+        elif action == 2: # Sell
+            if position == 1: 
+                new_balance = equity
+                new_position = 0
+            if new_position == 0: 
+                new_position = -1
+                new_entry_price = current_close
+                new_balance -= new_balance * commission
+                equity = new_balance
+
+        # 2. Real-time High/Low Equity Tracking
+        worst_floating_equity = equity
+        if new_position == 1: # Long
+            worst_floating_equity = new_balance * (1.0 + (current_low - new_entry_price) / new_entry_price)
+            equity = new_balance * (1.0 + (current_close - new_entry_price) / new_entry_price)
+        elif new_position == -1: # Short
+            worst_floating_equity = new_balance * (1.0 + (new_entry_price - current_high) / new_entry_price)
+            equity = new_balance * (1.0 + (new_entry_price - current_close) / new_entry_price)
+        
+        new_high_water = max(high_water_mark, equity)
+        
+        # 3. Reward & Done Logic
+        pnl_change = (equity - prev_equity) / prev_equity
+        reward = pnl_change * 100.0
+        
+        # Prop-firm DISQUALIFICATION check
+        daily_dd_worst = (daily_start_equity - worst_floating_equity) / daily_start_equity
+        total_dd_worst = (new_high_water - worst_floating_equity) / new_high_water
+        
+        done = False
+        if daily_dd_worst >= max_daily_dd or total_dd_worst >= max_total_dd:
+            reward = -150.0 
             done = True
             
         current_return = (equity - initial_balance) / initial_balance
