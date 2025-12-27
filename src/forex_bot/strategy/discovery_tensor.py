@@ -43,6 +43,7 @@ class TensorDiscoveryEngine:
         self.best_experts = []
         self.month_ids_cpu = None
         self.month_count = 0
+        self.full_fp16 = False
 
     def _prepare_tensor_cube(self, frames: Dict[str, pd.DataFrame], news_map: Optional[Dict[str, pd.DataFrame]] = None):
         """
@@ -102,6 +103,15 @@ class TensorDiscoveryEngine:
         cpu_workers = min(64, os.cpu_count() or 1)
         logger.info(f"Using {cpu_workers} concurrent threads for data alignment.")
         
+        # Full FP16 mode (default auto -> enabled on CUDA)
+        full_fp16_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_FULL_FP16", "auto") or "auto").strip().lower()
+        if full_fp16_mode in {"1", "true", "yes", "on"}:
+            self.full_fp16 = True
+        elif full_fp16_mode in {"0", "false", "no", "off"}:
+            self.full_fp16 = False
+        else:
+            self.full_fp16 = torch.cuda.is_available()
+
         results = {}
         
         def _process_frame(tf_name):
@@ -116,9 +126,10 @@ class TensorDiscoveryEngine:
                 
                 # OPTIMIZATION: Convert to Float16 immediately to save RAM
                 norm_fp16 = norm.astype(np.float16)
-                ohlc_fp32 = df[['open', 'high', 'low', 'close']].to_numpy(dtype=np.float32) # Keep OHLC FP32 for precision
-                
-                return tf_name, torch.from_numpy(norm_fp16), torch.from_numpy(ohlc_fp32)
+                ohlc_dtype = np.float16 if self.full_fp16 else np.float32
+                ohlc_arr = df[['open', 'high', 'low', 'close']].to_numpy(dtype=ohlc_dtype)
+
+                return tf_name, torch.from_numpy(norm_fp16), torch.from_numpy(ohlc_arr)
             except Exception as e:
                 logger.error(f"Error processing {tf_name}: {e}")
                 return None
@@ -166,7 +177,8 @@ class TensorDiscoveryEngine:
              nf = news_map.reindex(master_idx).ffill().fillna(0.0)
              sent = nf['news_sentiment'].values if 'news_sentiment' in nf.columns else np.zeros(len(nf))
              impact = nf['news_confidence'].values if 'news_confidence' in nf.columns else np.zeros(len(nf))
-             news_data = np.stack([sent, impact], axis=1).astype(np.float32)
+             news_dtype = np.float16 if self.full_fp16 else np.float32
+             news_data = np.stack([sent, impact], axis=1).astype(news_dtype)
              self.news_tensor_cpu = torch.from_numpy(news_data)
 
         logger.info(f"Master Data Cube Ready: {self.data_cube_cpu.shape} [{self.data_cube_cpu.dtype}]")
@@ -298,24 +310,26 @@ class TensorDiscoveryEngine:
                                  gpu_data_cubes, gpu_ohlc_cubes, gpu_news, month_ids):
                 # Core evaluation logic separated for retryability
                 local_pop = genomes.shape[0]
-                sum_ret = torch.zeros(local_pop, device=dev)
-                sum_sq_ret = torch.zeros(local_pop, device=dev)
+                accum_dtype = torch.float16 if (dev.type == "cuda" and self.full_fp16) else torch.float32
+                sum_ret = torch.zeros(local_pop, device=dev, dtype=accum_dtype)
+                sum_sq_ret = torch.zeros(local_pop, device=dev, dtype=accum_dtype)
                 effective_samples = 0
-                running_equity = torch.ones(local_pop, device=dev)
-                running_peak = torch.ones(local_pop, device=dev)
-                max_dd = torch.zeros(local_pop, device=dev)
-                profitable_chunks = torch.zeros(local_pop, device=dev)
-                current_chunk_ret = torch.zeros(local_pop, device=dev)
-                month_returns = torch.zeros((local_pop, self.month_count), device=dev) if self.month_count > 0 else None
+                running_equity = torch.ones(local_pop, device=dev, dtype=accum_dtype)
+                running_peak = torch.ones(local_pop, device=dev, dtype=accum_dtype)
+                max_dd = torch.zeros(local_pop, device=dev, dtype=accum_dtype)
+                profitable_chunks = torch.zeros(local_pop, device=dev, dtype=accum_dtype)
+                current_chunk_ret = torch.zeros(local_pop, device=dev, dtype=accum_dtype)
+                month_returns = torch.zeros((local_pop, self.month_count), device=dev, dtype=accum_dtype) if self.month_count > 0 else None
                 
                 chunk_size = max(1, (n_samples - 1) // 10)
                 
                 tf_count = self.data_cube_cpu.shape[0]
-                tf_weights = F.softmax(genomes[:, :tf_count], dim=1)
-                logic_weights = genomes[:, tf_count : tf_count + self.n_features]
+                matmul_dtype = torch.float16 if dev.type == "cuda" else torch.float32
+                tf_weights = F.softmax(genomes[:, :tf_count], dim=1).to(dtype=matmul_dtype)
+                logic_weights = genomes[:, tf_count : tf_count + self.n_features].to(dtype=matmul_dtype)
                 thresholds = genomes[:, -2:]
-                buy_th = torch.maximum(thresholds[:, 0], thresholds[:, 1])
-                sell_th = torch.minimum(thresholds[:, 0], thresholds[:, 1])
+                buy_th = torch.maximum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype)
+                sell_th = torch.minimum(thresholds[:, 0], thresholds[:, 1]).to(dtype=matmul_dtype)
 
                 for start_idx in range(0, n_samples, batch_size):
                     end_idx = min(start_idx + batch_size, n_samples)
@@ -330,7 +344,7 @@ class TensorDiscoveryEngine:
                         news_slice = self.news_tensor_cpu[start_idx:end_idx].to(dev, non_blocking=True) if has_news else None
 
                     # FP16 Computation
-                    signals = torch.zeros((local_pop, end_idx - start_idx), device=dev, dtype=torch.float16)
+                    signals = torch.zeros((local_pop, end_idx - start_idx), device=dev, dtype=matmul_dtype)
                     
                     # Logic: Linear Combination of Features
                     for i in range(tf_count):
@@ -340,12 +354,13 @@ class TensorDiscoveryEngine:
                         # data_slice[i] is [Batch, Feat].
                         # logic_weights is [Pop, Feat].
                         # result: [Batch, Pop]. Transpose to [Pop, Batch].
-                        tf_sig = torch.matmul(data_slice[i], logic_weights.t()).t()
+                        tf_sig = torch.matmul(data_slice[i].to(dtype=matmul_dtype), logic_weights.t()).t()
                         signals.add_(tf_weights[:, i].unsqueeze(1) * tf_sig)
 
                     if news_slice is not None:
-                        # Add Sentiment Bias
-                        signals.add_(news_slice[:, 0].unsqueeze(0) * 0.5)
+                        # Add Sentiment Bias (match dtype for in-place add)
+                        news_sent = news_slice[:, 0].to(dtype=matmul_dtype)
+                        signals.add_(news_sent.unsqueeze(0) * 0.5)
 
                     # Actions
                     actions = torch.zeros_like(signals)
@@ -361,6 +376,7 @@ class TensorDiscoveryEngine:
                     
                     rets = (close_next - open_next) / (open_next + 1e-9)
                     batch_rets = actions_aligned * rets.unsqueeze(0)
+                    batch_rets_acc = batch_rets.to(dtype=accum_dtype)
                     
                     # Cost Model (Spread + Commission + Slippage)
                     spread_cost = 0.0001
@@ -371,24 +387,24 @@ class TensorDiscoveryEngine:
                         batch_rets = batch_rets - (torch.abs(actions_aligned) * impact.unsqueeze(0))
 
                     # Aggregation
-                    sum_ret.add_(batch_rets.sum(dim=1))
-                    sum_sq_ret.add_((batch_rets**2).sum(dim=1))
+                    sum_ret.add_(batch_rets_acc.sum(dim=1))
+                    sum_sq_ret.add_((batch_rets_acc**2).sum(dim=1))
                     effective_samples += batch_rets.shape[1]
                     
                     # Monthly & Chunk stats
                     if month_ids is not None:
                         batch_m_ids = month_ids[start_idx + 1 : end_idx]
                         if batch_m_ids.numel() > 0:
-                            month_returns.scatter_add_(1, batch_m_ids.unsqueeze(0).expand(local_pop, -1), batch_rets.float())
+                            month_returns.scatter_add_(1, batch_m_ids.unsqueeze(0).expand(local_pop, -1), batch_rets_acc)
 
-                    current_chunk_ret.add_(batch_rets.sum(dim=1))
+                    current_chunk_ret.add_(batch_rets_acc.sum(dim=1))
                     if (end_idx // chunk_size) > (start_idx // chunk_size):
                         profitable_chunks.add_((current_chunk_ret > 0).float())
                         current_chunk_ret.zero_()
 
                     # Max DD (Approximate per batch to avoid massive equity tensor)
                     # We maintain running_equity state
-                    equity_step = torch.clamp(1.0 + batch_rets, min=1e-6)
+                    equity_step = torch.clamp(1.0 + batch_rets_acc, min=1e-6)
                     batch_equity = torch.cumprod(equity_step, dim=1)
                     abs_equity = batch_equity * running_equity.unsqueeze(1)
                     batch_peaks = torch.maximum(torch.cummax(abs_equity, dim=1)[0], running_peak.unsqueeze(1))
