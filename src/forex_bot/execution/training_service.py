@@ -372,6 +372,9 @@ class TrainingService:
             device="cuda",
             n_experts=100,
             timeframes=timeframes,
+            max_rows=int(getattr(self.settings.system, "discovery_max_rows", 0) or 0),
+            stream_mode=bool(getattr(self.settings.system, "discovery_stream", False)),
+            auto_cap=bool(getattr(self.settings.system, "discovery_auto_cap", True)),
         )
         
         # We need to pass the enriched multi-timeframe frames to the engine
@@ -991,9 +994,24 @@ class TrainingService:
         cache_path = Path(self.settings.system.cache_dir) / "hpc_datasets.pkl"
 
         datasets: list[tuple[str, PreparedDataset]] = []
+        datasets_loaded = False
 
         if rank == 0:
             # --- RANK 0: Heavy Lifting ---
+            # Optional dataset reuse to avoid re-running feature engineering
+            reuse_cache = str(os.environ.get("FOREX_BOT_HPC_DATASET_CACHE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+            if reuse_cache and cache_path.exists():
+                try:
+                    cached = joblib.load(cache_path)
+                    if isinstance(cached, list) and cached:
+                        cached_symbols = [str(s) for s, _ in cached if s is not None]
+                        if set(cached_symbols) == set(symbols):
+                            datasets = cached
+                            datasets_loaded = True
+                            logger.info(f"HPC: Loaded cached datasets from {cache_path}; skipping feature engineering.")
+                except Exception as e:
+                    logger.warning(f"HPC: Failed to load cached datasets: {e}")
+
             # Allow overriding feature-engineering worker count via env to avoid pool crashes/OOM.
             env_workers = os.getenv("FOREX_BOT_FEATURE_WORKERS") or os.getenv("FEATURE_WORKERS")
             if env_workers:
@@ -1061,45 +1079,46 @@ class TrainingService:
             except Exception:
                 pass
 
-            # Parallel Feature Engineering (use spawn to avoid CUDA fork issues)
-            logger.info(f"HPC (Rank 0): Launching feature engineering on {max_workers} workers...")
-            spawn_ctx = multiprocessing.get_context("spawn")
-            # Avoid oversubscribing GPUs during feature engineering (cupy/cudf in workers can OOM).
-            gpu_count = len(self.discovery_engine.gpu_pool) if hasattr(self.discovery_engine, "gpu_pool") else 1
-            if gpu_count <= 1:
-                import torch
-                gpu_count = torch.cuda.device_count()
-            # If feature engineering is forced to CPU, allow using more CPU workers.
-            force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {
-                "1", "true", "yes", "on"
-            }
-            if not env_workers and gpu_count > 0 and not force_cpu:
-                max_workers = min(max_workers, max(1, gpu_count))
+            if not datasets_loaded:
+                # Parallel Feature Engineering (use spawn to avoid CUDA fork issues)
+                logger.info(f"HPC (Rank 0): Launching feature engineering on {max_workers} workers...")
+                spawn_ctx = multiprocessing.get_context("spawn")
+                # Avoid oversubscribing GPUs during feature engineering (cupy/cudf in workers can OOM).
+                gpu_count = len(self.discovery_engine.gpu_pool) if hasattr(self.discovery_engine, "gpu_pool") else 1
+                if gpu_count <= 1:
+                    import torch
+                    gpu_count = torch.cuda.device_count()
+                # If feature engineering is forced to CPU, allow using more CPU workers.
+                force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {
+                    "1", "true", "yes", "on"
+                }
+                if not env_workers and gpu_count > 0 and not force_cpu:
+                    max_workers = min(max_workers, max(1, gpu_count))
 
-            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
-                futures: dict[concurrent.futures.Future, str] = {}
-                for i, (sym, frames) in enumerate(raw_frames_map.items()):
-                    assigned_gpu = i % max(1, gpu_count)
-                    fut = executor.submit(
-                        _hpc_feature_worker,
-                        self.settings.model_copy(),
-                        frames,
-                        sym,
-                        news_map.get(sym),
-                        assigned_gpu,
-                    )
-                    futures[fut] = sym
+                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
+                    futures: dict[concurrent.futures.Future, str] = {}
+                    for i, (sym, frames) in enumerate(raw_frames_map.items()):
+                        assigned_gpu = i % max(1, gpu_count)
+                        fut = executor.submit(
+                            _hpc_feature_worker,
+                            self.settings.model_copy(),
+                            frames,
+                            sym,
+                            news_map.get(sym),
+                            assigned_gpu,
+                        )
+                        futures[fut] = sym
 
-                for fut in concurrent.futures.as_completed(list(futures.keys())):
-                    try:
-                        sym = futures.get(fut, "UNKNOWN")
-                        ds = fut.result()
-                        if ds is None:
-                            logger.error(f"HPC Feature Gen failed (empty dataset) for {sym}")
-                            continue
-                        datasets.append((sym, ds))
-                    except Exception as e:
-                        logger.error(f"HPC Feature Gen failed: {e}")
+                    for fut in concurrent.futures.as_completed(list(futures.keys())):
+                        try:
+                            sym = futures.get(fut, "UNKNOWN")
+                            ds = fut.result()
+                            if ds is None:
+                                logger.error(f"HPC Feature Gen failed (empty dataset) for {sym}")
+                                continue
+                            datasets.append((sym, ds))
+                        except Exception as e:
+                            logger.error(f"HPC Feature Gen failed: {e}")
 
             # If any symbols failed in the pool, fall back to sequential for the missing ones.
             got_syms = {s for s, _ in datasets}
@@ -1153,6 +1172,9 @@ class TrainingService:
                 device="cuda",
                 n_experts=100,
                 timeframes=timeframes,
+                max_rows=int(getattr(self.settings.system, "discovery_max_rows", 0) or 0),
+                stream_mode=bool(getattr(self.settings.system, "discovery_stream", False)),
+                auto_cap=bool(getattr(self.settings.system, "discovery_auto_cap", True)),
             )
 
             discovery_tensor.run_unsupervised_search(

@@ -29,8 +29,12 @@ system:
   deep_purge_mode: "all"  # Enable full purge for institutional training
   deep_purge_on_train: true
   # Hardware is detected automatically (CPU/GPU/RAM)
-  # Set preference to "auto", "true" (force GPU), or "false" (force CPU)
+  # Set preference to "auto", "true" (force GPU), or "false" (force CPU)        
   enable_gpu_preference: auto
+  # Discovery data handling (full data + avoid auto row caps)
+  discovery_auto_cap: false
+  discovery_max_rows: 0
+  discovery_stream: true
 
 risk:
   initial_balance: 10000  # Fallback used when MT5 balance unavailable
@@ -148,11 +152,16 @@ models:
   num_transformers: 2
   hpo_backend: ax
   hpo_trials: 0  # 0 = use default trial count
-  hpo_max_rows: 500000
+  hpo_max_rows: 0
   ray_tune_max_concurrency: 1
   export_onnx: true  # Export ONNX for fast CPU inference (one-time at startup if missing)
   phase5_filter_meta_blender: true
   phase5_core_models: [transformer, nbeats, tide, tabnet, kan]
+  # Train using base-signal filter for meta-labeling (set false to use all rows)
+  filter_to_base_signal: true
+  # Global pooling caps (0 = no cap)
+  global_max_rows: 0
+  global_max_rows_per_symbol: 0
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
   prop_min_trades: 0
@@ -166,6 +175,7 @@ models:
   cpcv_embargo_pct: 0.01
   cpcv_purge_pct: 0.02
   cpcv_min_phi: 0.80
+  cpcv_max_rows: 0
 
 news:
   news_model: tfidf_linear

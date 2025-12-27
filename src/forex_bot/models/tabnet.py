@@ -12,7 +12,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from ..core.system import thread_limits
-from .base import EarlyStopper, ExpertModel, dataframe_to_float32_numpy
+from .base import EarlyStopper, ExpertModel, dataframe_to_float32_numpy, get_early_stop_params
 from .device import select_device
 
 TabNetClassifier = None  # type: ignore
@@ -188,7 +188,8 @@ class TabNetExpert(ExpertModel):
 
         optimizer = optim.Adam(train_model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss()
-        early_stopper = EarlyStopper(patience=20, min_delta=0.001)
+        es_pat, es_delta = get_early_stop_params(20, 0.001)
+        early_stopper = EarlyStopper(patience=es_pat, min_delta=es_delta)
 
         import time
 

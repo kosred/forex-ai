@@ -32,6 +32,9 @@ class TensorDiscoveryEngine:
         device: str = "cuda",
         n_experts: int = 20,
         timeframes: Optional[List[str]] = None,
+        max_rows: int | None = None,
+        stream_mode: bool | None = None,
+        auto_cap: bool | None = None,
     ):
         from ..models.device import get_available_gpus
         gpu_list = get_available_gpus() or ["cpu"]
@@ -52,6 +55,10 @@ class TensorDiscoveryEngine:
         self.month_ids_cpu = None
         self.month_count = 0
         self.full_fp16 = False
+        # Optional overrides (prefer config-driven settings vs env)
+        self._max_rows_override = max_rows
+        self._stream_mode_override = stream_mode
+        self._auto_cap_override = auto_cap
 
     def _prepare_tensor_cube(self, frames: Dict[str, pd.DataFrame], news_map: Optional[Dict[str, pd.DataFrame]] = None):
         """
@@ -64,14 +71,27 @@ class TensorDiscoveryEngine:
         master_idx = frames[master_tf].index
 
         # Dynamic Row Limiter based on RAM
-        stream_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_STREAM", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
-        try:
-            max_rows_env = int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_ROWS", "0") or 0)
-        except Exception:
-            max_rows_env = 0
-        max_rows = max_rows_env
-        
-        if max_rows <= 0 and not stream_mode:
+        if self._stream_mode_override is None:
+            stream_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_STREAM", "0") or "0").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        else:
+            stream_mode = bool(self._stream_mode_override)
+        if self._max_rows_override is None:
+            try:
+                max_rows_env = int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_ROWS", "0") or 0)
+            except Exception:
+                max_rows_env = 0
+            max_rows = max_rows_env
+        else:
+            max_rows = int(self._max_rows_override)
+
+        if self._auto_cap_override is None:
+            auto_cap = True
+        else:
+            auto_cap = bool(self._auto_cap_override)
+
+        if max_rows <= 0 and not stream_mode and auto_cap:
             try:
                 from ..core.system import HardwareProbe
                 profile = HardwareProbe().detect()
@@ -199,9 +219,43 @@ class TensorDiscoveryEngine:
 
     def run_unsupervised_search(self, frames: Dict[str, pd.DataFrame], news_features: Optional[pd.DataFrame] = None, iterations: int = 1000):
         self._prepare_tensor_cube(frames, news_features)
-        
+
         # Initialize Metrics
         debug_metrics = os.environ.get("FOREX_BOT_DISCOVERY_DEBUG_METRICS", "1").strip().lower() not in {"0", "false", "no", "off"}
+        # Checkpointing
+        try:
+            ckpt_every = int(os.environ.get("FOREX_BOT_DISCOVERY_CKPT_EVERY", "10") or 10)
+        except Exception:
+            ckpt_every = 10
+        ckpt_dir = str(os.environ.get("FOREX_BOT_DISCOVERY_CKPT_DIR", "cache") or "cache").strip()
+        ckpt_path = Path(ckpt_dir) / "tensor_discovery_ckpt.pt"
+        resume_enabled = str(os.environ.get("FOREX_BOT_DISCOVERY_RESUME", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+        # Early stopping (disabled by default)
+        early_stop = str(os.environ.get("FOREX_BOT_DISCOVERY_EARLY_STOP", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            early_patience = int(os.environ.get("FOREX_BOT_DISCOVERY_EARLY_PATIENCE", "100") or 100)
+        except Exception:
+            early_patience = 100
+        try:
+            early_min_delta = float(os.environ.get("FOREX_BOT_DISCOVERY_EARLY_MIN_DELTA", "0.01") or 0.01)
+        except Exception:
+            early_min_delta = 0.01
+        # Numeric stability + fitness guards
+        accum_fp32 = str(os.environ.get("FOREX_BOT_DISCOVERY_ACCUM_FP32", "1") or "1").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        try:
+            sharpe_cap = float(os.environ.get("FOREX_BOT_DISCOVERY_SHARPE_CAP", "20") or 20)
+        except Exception:
+            sharpe_cap = 20.0
+        try:
+            dd_cap = float(os.environ.get("FOREX_BOT_DISCOVERY_DD_CAP", "0.15") or 0.15)
+        except Exception:
+            dd_cap = 0.15
+        try:
+            dd_penalty_weight = float(os.environ.get("FOREX_BOT_DISCOVERY_DD_PENALTY", "5.0") or 5.0)
+        except Exception:
+            dd_penalty_weight = 5.0
         debug_validity = os.environ.get("FOREX_BOT_DISCOVERY_DEBUG_VALIDITY", "0").strip().lower() in {"1", "true", "yes", "on"}
         debug_snapshot = {
             "fitness": None, "sharpe": None, "mean_ret": None, "std_ret": None,
@@ -383,11 +437,14 @@ class TensorDiscoveryEngine:
                     logger.error(f"GPU {gpu_idx} fatal error: {e}")
                     return torch.full((chunk.shape[0],), -1e9)
 
-            def _eval_batch_safe(gpu_idx, dev, genomes, batch_size, n_samples, has_news, preload, 
+            def _eval_batch_safe(gpu_idx, dev, genomes, batch_size, n_samples, has_news, preload,
                                  gpu_data_cubes, gpu_ohlc_cubes, gpu_news, month_ids):
                 # Core evaluation logic separated for retryability
                 local_pop = genomes.shape[0]
-                accum_dtype = torch.float16 if (dev.type == "cuda" and self.full_fp16) else torch.float32
+                if accum_fp32:
+                    accum_dtype = torch.float32
+                else:
+                    accum_dtype = torch.float16 if (dev.type == "cuda" and self.full_fp16) else torch.float32
                 sum_ret = torch.zeros(local_pop, device=dev, dtype=accum_dtype)
                 sum_sq_ret = torch.zeros(local_pop, device=dev, dtype=accum_dtype)
                 effective_samples = 0
@@ -457,17 +514,17 @@ class TensorDiscoveryEngine:
                     rets = torch.nan_to_num(rets, nan=0.0, posinf=0.0, neginf=0.0)
                     rets = torch.clamp(rets, min=-1.0, max=1.0)
                     batch_rets = actions_aligned * rets.unsqueeze(0)
-                    batch_rets_acc = batch_rets.to(dtype=accum_dtype)
-                    
+
                     # Cost Model (Spread + Commission + Slippage)
                     spread_cost = 0.0001
                     batch_rets = batch_rets - (torch.abs(actions_aligned) * spread_cost)
-                    
+
                     if news_slice is not None:
                         impact = news_slice[1:, 1]
                         batch_rets = batch_rets - (torch.abs(actions_aligned) * impact.unsqueeze(0))
 
                     # Aggregation
+                    batch_rets_acc = batch_rets.to(dtype=accum_dtype)
                     sum_ret.add_(batch_rets_acc.sum(dim=1))
                     sum_sq_ret.add_((batch_rets_acc**2).sum(dim=1))
                     effective_samples += batch_rets.shape[1]
@@ -496,13 +553,20 @@ class TensorDiscoveryEngine:
                     running_peak.copy_(batch_peaks[:, -1])
 
                 # Finalize
-                mean_ret = sum_ret / effective_samples
-                std_ret = torch.sqrt(torch.clamp((sum_sq_ret / effective_samples) - mean_ret**2, min=1e-9)) + 1e-6
+                if effective_samples <= 1:
+                    return torch.full((local_pop,), -1e9, device=dev, dtype=torch.float32)
+                mean_ret = (sum_ret / effective_samples).to(dtype=torch.float32)
+                var = (sum_sq_ret / effective_samples).to(dtype=torch.float32) - mean_ret**2
+                std_ret = torch.sqrt(torch.clamp(var, min=1e-9)) + 1e-6
                 sharpe = (mean_ret / std_ret) * (252 * 1440)**0.5
-                
-                fitness = sharpe * (profitable_chunks / 10.0)
-                # Penalties
-                fitness = torch.where(max_dd > 0.15, torch.tensor(-1.0, device=dev), fitness)
+                if sharpe_cap > 0:
+                    sharpe = torch.clamp(sharpe, min=-sharpe_cap, max=sharpe_cap)
+
+                fitness = sharpe * (profitable_chunks.to(dtype=torch.float32) / 10.0)
+                # Penalties (soft drawdown penalty)
+                if dd_cap > 0 and dd_penalty_weight > 0:
+                    dd_penalty = torch.clamp((max_dd.to(dtype=torch.float32) - dd_cap) / max(dd_cap, 1e-9), min=0.0, max=1.0)
+                    fitness = fitness - (dd_penalty_weight * dd_penalty)
                 if debug_validity:
                     nan_count = int(torch.isnan(fitness).sum().item())
                     inf_count = int(torch.isinf(fitness).sum().item())
@@ -547,16 +611,32 @@ class TensorDiscoveryEngine:
 
         # 2. Start Evolution
         genome_dim = self.n_features + len(self.timeframes) + 2
-        problem = Problem("max", fitness_func, initial_bounds=(-1.0, 1.0), 
+        problem = Problem("max", fitness_func, initial_bounds=(-1.0, 1.0),
                          solution_length=genome_dim, device="cpu", vectorized=True)
         
         pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 30000))
         searcher = CMAES(problem, popsize=pop_size, stdev_init=0.5)
 
         logger.info(f"Starting COOPERATIVE {len(self.gpu_list)}-GPU Discovery (Pop: {pop_size})...")
-        
+
+        # Optional resume: reuse last checkpointed best experts (skip discovery)
+        if resume_enabled and ckpt_path.exists():
+            try:
+                data = torch.load(ckpt_path, map_location="cpu")
+                best = data.get("best_experts") or data.get("genomes")
+                if best is not None:
+                    self.best_experts = best
+                    logger.warning(
+                        f"Discovery resume: loaded best experts from checkpoint at gen {data.get('gen', 'N/A')}. "
+                        "Skipping discovery loop."
+                    )
+                    return
+            except Exception as exc:
+                logger.warning(f"Discovery resume failed: {exc}")
+
         # Main Loop
         best_val = -1e9
+        no_improve = 0
         for i in range(iterations):
             try:
                 searcher.step()
@@ -574,11 +654,46 @@ class TensorDiscoveryEngine:
                     pass
                 break
             current_best = searcher.status.get("best_eval", 0.0)
-            if current_best > best_val:
+            if current_best > best_val + early_min_delta:
                 best_val = current_best
-            
+                no_improve = 0
+            else:
+                no_improve += 1
+
             if i % 10 == 0:
                 logger.info(f"Generation {i}: Global Best Fitness = {float(current_best):.4f}")
+
+            # Periodic checkpoint (best experts so far)
+            if ckpt_every > 0 and (i % ckpt_every == 0):
+                try:
+                    pop = searcher.population.values.detach().cpu()
+                    evals = searcher.population.evaluations.detach().cpu()
+                    if evals.numel() == pop.shape[0]:
+                        idx = torch.argsort(evals, descending=True)
+                        best_experts = pop[idx[: self.n_experts]]
+                    else:
+                        best_experts = pop[: self.n_experts]
+                    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        {
+                            "gen": i,
+                            "best_eval": float(current_best),
+                            "best_experts": best_experts,
+                            "timeframes": self.timeframes,
+                            "n_features": self.n_features,
+                            "timestamp": time.time(),
+                        },
+                        ckpt_path,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Discovery checkpoint failed: {exc}")
+
+            if early_stop and no_improve >= max(1, early_patience):
+                logger.warning(
+                    f"Discovery early stop at gen {i}: no improvement "
+                    f"for {no_improve} generations (min_delta={early_min_delta})."
+                )
+                break
 
         # Extract best
         final_pop = searcher.population.values.detach().cpu()

@@ -13,7 +13,7 @@ import torch.nn.functional as F  # noqa: N812
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from .base import EarlyStopper, ExpertModel
+from .base import EarlyStopper, ExpertModel, get_early_stop_params
 from .device import (
     enable_flash_attention,
     enable_sdp_flash,
@@ -413,7 +413,8 @@ class TransformerExpertTorch(ExpertModel):
         fused_ok = torch.cuda.is_available() and str(self.device).startswith("cuda") and hasattr(optim.AdamW, "fused")
         optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, fused=fused_ok)
         criterion = nn.CrossEntropyLoss()
-        early_stopper = EarlyStopper(patience=8, min_delta=0.001)
+        es_pat, es_delta = get_early_stop_params(8, 0.001)
+        early_stopper = EarlyStopper(patience=es_pat, min_delta=es_delta)
 
         use_amp = is_cuda
         amp_dtype = torch.bfloat16 if (use_amp and gpu_supports_bf16(str(self.device))) else torch.float16

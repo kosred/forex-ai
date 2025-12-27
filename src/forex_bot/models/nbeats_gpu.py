@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from .base import EarlyStopper, ExpertModel, dataframe_to_float32_numpy
+from .base import EarlyStopper, ExpertModel, dataframe_to_float32_numpy, get_early_stop_params
 from .device import (
     maybe_init_distributed,
     preferred_amp_dtype,
@@ -188,7 +188,8 @@ class NBeatsExpert(ExpertModel):
             else optim.AdamW(self.model.parameters(), lr=self.lr)
         )
         criterion = nn.CrossEntropyLoss()
-        early_stopper = EarlyStopper(patience=8, min_delta=0.001)
+        es_pat, es_delta = get_early_stop_params(8, 0.001)
+        early_stopper = EarlyStopper(patience=es_pat, min_delta=es_delta)
         amp_dtype = preferred_amp_dtype(str(self.device))
         scaler = torch.amp.GradScaler("cuda", enabled=is_cuda, init_scale=1024.0)
 

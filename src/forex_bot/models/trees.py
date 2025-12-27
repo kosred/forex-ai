@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .base import ExpertModel, time_series_train_val_split, validate_time_ordering
+from .base import ExpertModel, get_early_stop_params, time_series_train_val_split, validate_time_ordering
 
 try:
     import lightgbm as lgb
@@ -78,6 +78,10 @@ def _tree_device_preference() -> str:
     if raw in {"1", "true", "yes", "on"}:
         return "gpu"
     return "auto"
+
+def _gpu_only_mode() -> bool:
+    raw = str(os.environ.get("FOREX_BOT_GPU_ONLY", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _torch_cuda_available() -> bool:
@@ -216,6 +220,7 @@ def _remap_labels_to_contiguous(y: pd.Series | np.ndarray) -> tuple[np.ndarray, 
 class LightGBMExpert(ExpertModel):
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
+        self._gpu_only_disabled = False
         self.params = params or {
             "n_estimators": 800,
             "num_leaves": 64,
@@ -267,6 +272,11 @@ class LightGBMExpert(ExpertModel):
             else:
                 # auto: prefer GPU if available
                 use_gpu = has_cuda
+            if _gpu_only_mode() and not use_gpu:
+                logger.warning("GPU-only mode: LightGBM GPU unavailable; skipping LightGBM.")
+                self._gpu_only_disabled = True
+                self.model = None
+                return False
 
             if use_gpu:
                 params["device_type"] = "gpu"
@@ -348,6 +358,11 @@ class LightGBMExpert(ExpertModel):
                 )
             except Exception as e:
                 if params.get("device_type") == "gpu":
+                    if _gpu_only_mode():
+                        logger.warning(f"GPU-only mode: LightGBM GPU training failed ({e}); skipping LightGBM.")
+                        self._gpu_only_disabled = True
+                        self.model = None
+                        return False
                     logger.warning(f"LightGBM GPU training failed ({e}), falling back to CPU.", exc_info=True)
                     params["device_type"] = "cpu"
                     params.pop("gpu_use_dp", None)
@@ -371,6 +386,8 @@ class LightGBMExpert(ExpertModel):
             return False
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+        if self._gpu_only_disabled:
+            raise RuntimeError("GPU-only mode: LightGBM skipped.")
         if self.model is None:
             raise RuntimeError("LightGBM model not loaded")
         try:
@@ -395,6 +412,7 @@ class LightGBMExpert(ExpertModel):
 class RandomForestExpert(ExpertModel):
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
+        self._gpu_only_disabled = False
         self.params = params or {
             "n_estimators": 400,
             "max_depth": 16,
@@ -446,10 +464,25 @@ class RandomForestExpert(ExpertModel):
                 self.model.fit(x_gpu, y_gpu)
             return True
         except ImportError:
+            if _gpu_only_mode():
+                logger.warning("GPU-only mode: RAPIDS (cuml) not available for RandomForest; skipping.")
+                self._gpu_only_disabled = True
+                self.model = None
+                return False
             pass  # Fallthrough to sklearn
         except Exception as e:
+            if _gpu_only_mode():
+                logger.warning(f"GPU-only mode: RAPIDS RF failed ({e}); skipping.")
+                self._gpu_only_disabled = True
+                self.model = None
+                return False
             logger.warning(f"RAPIDS RF failed ({e}), falling back to CPU.")
 
+        if _gpu_only_mode():
+            logger.warning("GPU-only mode: RandomForest CPU fallback blocked; skipping.")
+            self._gpu_only_disabled = True
+            self.model = None
+            return False
         if not SKLEARN_AVAILABLE:
             return False
         try:
@@ -473,6 +506,8 @@ class RandomForestExpert(ExpertModel):
             return False
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+        if self._gpu_only_disabled:
+            raise RuntimeError("GPU-only mode: RandomForest skipped.")
         if self.model is None:
             return np.zeros((len(x), 3))
         probs = self.model.predict_proba(x)
@@ -498,6 +533,7 @@ class ExtraTreesExpert(ExpertModel):
 
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
+        self._gpu_only_disabled = False
         self.params = params or {
             "n_estimators": 500,
             "max_depth": 18,
@@ -510,6 +546,11 @@ class ExtraTreesExpert(ExpertModel):
         }
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> bool:
+        if _gpu_only_mode():
+            logger.warning("GPU-only mode: ExtraTrees has no GPU backend; skipping.")
+            self._gpu_only_disabled = True
+            self.model = None
+            return False
         if not SKLEARN_AVAILABLE or ExtraTreesClassifier is None:
             return False
         try:
@@ -535,6 +576,8 @@ class ExtraTreesExpert(ExpertModel):
             return False
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+        if self._gpu_only_disabled:
+            raise RuntimeError("GPU-only mode: ExtraTrees skipped.")
         if self.model is None:
             return np.zeros((len(x), 3))
         x_aug = _augment_time_features(x)
@@ -623,6 +666,7 @@ class ElasticNetExpert(ExpertModel):
 class XGBoostExpert(ExpertModel):
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
+        self._gpu_only_disabled = False
 
         self.params = params or {
             "n_estimators": 800,
@@ -664,8 +708,14 @@ class XGBoostExpert(ExpertModel):
         else:
             self.params.pop("device", None)
             self.params["tree_method"] = "hist"
+            if _gpu_only_mode():
+                self._gpu_only_disabled = True
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+        if self._gpu_only_disabled:
+            logger.warning("GPU-only mode: XGBoost GPU unavailable; skipping.")
+            self.model = None
+            return
         if not XGB_AVAILABLE:
             logger.warning("XGBoost not available")
             return
@@ -681,18 +731,51 @@ class XGBoostExpert(ExpertModel):
             # Backward compat: some older pipelines used 2=sell.
             y_arr = np.where(y_arr == -1, 2, y_arr).astype(int, copy=False)
 
-            uniq, counts = np.unique(y, return_counts=True)
-            sample_weight = np.ones(len(y))
+            x_train = x
+            y_train = y_arr
+            eval_set = None
+            if len(y_arr) > 500:
+                try:
+                    validate_time_ordering(x, context="XGBoostExpert.fit")
+                    embargo = max(24, int(len(y_arr) * 0.01))
+                    x_train, x_val, y_train_s, y_val_s = time_series_train_val_split(
+                        x,
+                        pd.Series(y_arr, index=y.index),
+                        val_ratio=0.15,
+                        min_train_samples=100,
+                        embargo_samples=embargo,
+                    )
+                    y_train = y_train_s.to_numpy(dtype=int)
+                    y_val = y_val_s.to_numpy(dtype=int)
+                    eval_set = [(x_val, y_val)]
+                except ValueError:
+                    split_idx = int(len(x) * 0.85)
+                    x_train, x_val = x.iloc[:split_idx], x.iloc[split_idx:]
+                    y_train = y_arr[:split_idx]
+                    y_val = y_arr[split_idx:]
+                    eval_set = [(x_val, y_val)]
+
+            uniq, counts = np.unique(y_train, return_counts=True)
+            sample_weight = np.ones(len(y_train))
             for cls, cnt in zip(uniq, counts, strict=False):
                 if cnt > 0:
-                    sample_weight[y == cls] = len(y) / (len(uniq) * cnt)
+                    sample_weight[y_train == cls] = len(y_train) / (len(uniq) * cnt)
 
             self.model = xgb.XGBClassifier(**self.params)
-            self.model.fit(x, y_arr, sample_weight=sample_weight)
+            fit_kwargs = {}
+            if eval_set:
+                es_pat, _ = get_early_stop_params(50, 0.0)
+                if es_pat > 0:
+                    fit_kwargs["eval_set"] = eval_set
+                    fit_kwargs["early_stopping_rounds"] = es_pat
+                    fit_kwargs["verbose"] = False
+            self.model.fit(x_train, y_train, sample_weight=sample_weight, **fit_kwargs)
         except Exception as e:
             logger.error(f"XGBoost training failed: {e}")
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+        if self._gpu_only_disabled:
+            raise RuntimeError("GPU-only mode: XGBoost skipped.")
         if self.model is None:
             return np.zeros((len(x), 3))
         try:
@@ -715,6 +798,7 @@ class XGBoostExpert(ExpertModel):
 class CatBoostExpert(ExpertModel):
     def __init__(self, params: dict[str, Any] = None) -> None:
         self.model = None
+        self._gpu_only_disabled = False
 
         pref = _tree_device_preference()
         has_cuda = _torch_cuda_available()
@@ -753,8 +837,14 @@ class CatBoostExpert(ExpertModel):
             if str(self.params.get("task_type", "")).strip().lower() == "gpu":
                 self.params.pop("task_type", None)
                 self.params.pop("devices", None)
+            if _gpu_only_mode():
+                self._gpu_only_disabled = True
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+        if self._gpu_only_disabled:
+            logger.warning("GPU-only mode: CatBoost GPU unavailable; skipping.")
+            self.model = None
+            return
         if not CAT_AVAILABLE:
             logger.warning("CatBoost not available")
             return
@@ -772,12 +862,48 @@ class CatBoostExpert(ExpertModel):
             params = self.params.copy()
             params["class_weights"] = list(class_weights.values()) if class_weights else None
 
+            x_train = x
+            y_train = y
+            eval_set = None
+            if len(y) > 500:
+                try:
+                    validate_time_ordering(x, context="CatBoostExpert.fit")
+                    embargo = max(24, int(len(y) * 0.01))
+                    x_train, x_val, y_train_s, y_val_s = time_series_train_val_split(
+                        x,
+                        y,
+                        val_ratio=0.15,
+                        min_train_samples=100,
+                        embargo_samples=embargo,
+                    )
+                    y_train = y_train_s
+                    y_val = y_val_s
+                    eval_set = (x_val, y_val)
+                except ValueError:
+                    split_idx = int(len(x) * 0.85)
+                    x_train, x_val = x.iloc[:split_idx], x.iloc[split_idx:]
+                    y_train = y.iloc[:split_idx]
+                    y_val = y.iloc[split_idx:]
+                    eval_set = (x_val, y_val)
+
+            if eval_set is not None:
+                es_pat, _ = get_early_stop_params(50, 0.0)
+                if es_pat > 0:
+                    params.setdefault("od_type", "Iter")
+                    params.setdefault("od_wait", int(es_pat))
+                    params.setdefault("use_best_model", True)
+
             self.model = cb.CatBoostClassifier(**params)
-            self.model.fit(x, y)
+            if eval_set is not None:
+                self.model.fit(x_train, y_train, eval_set=eval_set, verbose=False)
+            else:
+                self.model.fit(x_train, y_train)
         except Exception as e:
             logger.error(f"CatBoost training failed: {e}")
 
     def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+        if self._gpu_only_disabled:
+            raise RuntimeError("GPU-only mode: CatBoost skipped.")
         if self.model is None:
             return np.zeros((len(x), 3))
         try:

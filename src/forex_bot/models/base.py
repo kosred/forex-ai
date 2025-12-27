@@ -45,6 +45,26 @@ class EarlyStopper:
         return self.early_stop
 
 
+def get_early_stop_params(default_patience: int, default_min_delta: float) -> tuple[int, float]:
+    """Return (patience, min_delta) with optional env overrides."""
+    patience = default_patience
+    min_delta = default_min_delta
+    try:
+        env_pat = os.environ.get("FOREX_BOT_EARLY_STOP_PATIENCE", "")
+        if env_pat != "":
+            val = int(env_pat)
+            if val > 0:
+                patience = val
+    except Exception:
+        pass
+    try:
+        env_delta = os.environ.get("FOREX_BOT_EARLY_STOP_MIN_DELTA", "")
+        if env_delta != "":
+            min_delta = float(env_delta)
+    except Exception:
+        pass
+    return patience, min_delta
+
 class ExpertModel(abc.ABC):
     """Abstract base class for all expert models."""
 

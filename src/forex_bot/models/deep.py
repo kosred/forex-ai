@@ -33,6 +33,7 @@ from .base import (
     EarlyStopper,
     ExpertModel,
     compute_class_weights,
+    get_early_stop_params,
     stratified_downsample,
     time_series_train_val_split,
     validate_time_ordering,
@@ -217,7 +218,8 @@ class NBeatsExpert(ExpertModel):
 
         optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss(weight=class_weights)
-        early_stopper = EarlyStopper(patience=8, min_delta=0.001)
+        es_pat, es_delta = get_early_stop_params(8, 0.001)
+        early_stopper = EarlyStopper(patience=es_pat, min_delta=es_delta)
 
         use_amp = is_cuda
         amp_dtype = torch.bfloat16 if (use_amp and gpu_supports_bf16(str(self.device))) else torch.float16
@@ -455,7 +457,8 @@ class TiDEExpert(ExpertModel):
 
         optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss(weight=class_weights)
-        early_stopper = EarlyStopper(patience=8, min_delta=0.001)
+        es_pat, es_delta = get_early_stop_params(8, 0.001)
+        early_stopper = EarlyStopper(patience=es_pat, min_delta=es_delta)
 
         use_amp = torch.cuda.is_available() and str(self.device).startswith("cuda")
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -676,7 +679,8 @@ class TabNetExpert(ExpertModel):
 
         optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss(weight=class_weights)
-        early_stopper = EarlyStopper(patience=8, min_delta=0.001)
+        es_pat, es_delta = get_early_stop_params(8, 0.001)
+        early_stopper = EarlyStopper(patience=es_pat, min_delta=es_delta)
 
         use_amp = torch.cuda.is_available() and str(self.device).startswith("cuda")
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -886,7 +890,8 @@ class KANExpert(ExpertModel):
 
         optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss(weight=class_weights)
-        early_stopper = EarlyStopper(patience=8, min_delta=0.001)
+        es_pat, es_delta = get_early_stop_params(8, 0.001)
+        early_stopper = EarlyStopper(patience=es_pat, min_delta=es_delta)
 
         use_amp = torch.cuda.is_available() and str(self.device).startswith("cuda")
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)

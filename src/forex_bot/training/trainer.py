@@ -492,6 +492,19 @@ class ModelTrainer:
         stop_event: asyncio.Event | None = None,
     ) -> None:
         logger.info("Starting training cycle...")
+        # Enforce GPU-only mode when explicitly requested (or preference is GPU)
+        try:
+            gpu_only_env = str(os.environ.get("FOREX_BOT_GPU_ONLY", "")).strip().lower()
+            gpu_only = gpu_only_env in {"1", "true", "yes", "on"}
+        except Exception:
+            gpu_only = False
+        if not gpu_only:
+            pref = str(getattr(self.settings.system, "enable_gpu_preference", "auto")).strip().lower()
+            if pref == "gpu":
+                gpu_only = True
+                os.environ["FOREX_BOT_GPU_ONLY"] = "1"
+        if gpu_only:
+            os.environ.setdefault("FOREX_BOT_TREE_DEVICE", "gpu")
 
         # 1. Setup Logging
         writer = None
@@ -505,23 +518,36 @@ class ModelTrainer:
         X_raw = dataset.X
         y_raw = pd.Series(dataset.y) if isinstance(dataset.y, (np.ndarray, list)) else dataset.y
 
-        mask = X_raw["base_signal"] != 0
-        if mask.sum() < 100:
-            logger.warning("Insufficient base signals for meta-labeling. Training on all data (fallback).")
-            X = X_raw
-            y = y_raw
-            meta_subset = dataset.metadata
-        elif int(mask.sum()) == int(len(X_raw)):
-            # Avoid an unnecessary full-frame copy when already pre-filtered upstream.
-            logger.info(f"Meta-Labeling: Using pre-filtered dataset ({len(X_raw)} active signal events).")
-            X = X_raw
-            y = y_raw
-            meta_subset = dataset.metadata
+        use_filter = bool(getattr(self.settings.models, "filter_to_base_signal", True))
+        has_base_signal = hasattr(X_raw, "columns") and "base_signal" in X_raw.columns
+        if use_filter and has_base_signal:
+            mask = X_raw["base_signal"] != 0
+            if mask.sum() < 100:
+                logger.warning("Insufficient base signals for meta-labeling. Training on all data (fallback).")
+                X = X_raw
+                y = y_raw
+                meta_subset = dataset.metadata
+            elif int(mask.sum()) == int(len(X_raw)):
+                # Avoid an unnecessary full-frame copy when already pre-filtered upstream.
+                logger.info(f"Meta-Labeling: Using pre-filtered dataset ({len(X_raw)} active signal events).")
+                X = X_raw
+                y = y_raw
+                meta_subset = dataset.metadata
+            else:
+                logger.info(
+                    f"Meta-Labeling: Filtering to {mask.sum()} active signal events (from {len(X_raw)} rows)."
+                )
+                X = X_raw.loc[mask].copy()
+                y = y_raw.loc[mask].copy()
+                meta_subset = dataset.metadata.loc[mask].copy() if dataset.metadata is not None else None
         else:
-            logger.info(f"Meta-Labeling: Filtering to {mask.sum()} active signal events (from {len(X_raw)} rows).")
-            X = X_raw.loc[mask].copy()
-            y = y_raw.loc[mask].copy()
-            meta_subset = dataset.metadata.loc[mask].copy() if dataset.metadata is not None else None
+            if not use_filter:
+                logger.info("Meta-Labeling: base_signal filter disabled; using full dataset.")
+            elif not has_base_signal:
+                logger.warning("Meta-Labeling: base_signal column missing; using full dataset.")
+            X = X_raw
+            y = y_raw
+            meta_subset = dataset.metadata
 
         try:
             self.run_summary["feature_columns"] = list(getattr(X, "columns", []))
@@ -1242,6 +1268,7 @@ class ModelTrainer:
         # (e.g., RLlib on Python 3.13 Windows where Ray wheels do not exist).
         filtered: list[str] = []
         skipped: list[str] = []
+        gpu_only = str(os.environ.get("FOREX_BOT_GPU_ONLY", "")).strip().lower() in {"1", "true", "yes", "on"}
 
         try:
             from ..models.rllib_agent import RAY_AVAILABLE  # type: ignore
@@ -1261,6 +1288,9 @@ class ModelTrainer:
             registry = set()
 
         for name in ordered:
+            if gpu_only and name in {"extra_trees", "elasticnet"}:
+                skipped.append(name)
+                continue
             if name in {"rllib_ppo", "rllib_sac"} and not bool(RAY_AVAILABLE):
                 skipped.append(name)
                 continue

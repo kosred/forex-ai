@@ -136,7 +136,10 @@ class TabNetExpert(ExpertModel):
 
         # Increase patience and epochs for deeper training
         max_epochs = 2000
-        patience = 50
+        try:
+            patience = int(os.environ.get("FOREX_BOT_EARLY_STOP_PATIENCE", "50") or 50)
+        except Exception:
+            patience = 50
 
         import time
         

@@ -85,6 +85,10 @@ class SystemConfig(BaseModel):
     deep_purge_on_train: bool = True
     n_jobs: int = 2
     enable_gpu_preference: str = "auto"
+    # Discovery data handling
+    discovery_auto_cap: bool = True  # auto-cap discovery rows by RAM if enabled
+    discovery_max_rows: int = 0  # explicit discovery row cap (0 = no cap)
+    discovery_stream: bool = False  # if true, skip auto-cap and stream to GPU
     enable_gpu: bool = False
     num_gpus: int = 0
     device: str = "cpu"
@@ -245,6 +249,11 @@ class ModelsConfig(BaseModel):
     hpo_max_rows: int = 500_000  # Cap rows for HPO speed; full data used for final training
     ray_tune_max_concurrency: int = 1  # Conservative default to avoid GPU OOM
     export_onnx: bool = False  # ONNX export is optional; disable by default for clean, portable runs
+    # Train on full dataset vs base-signal-only subset
+    filter_to_base_signal: bool = True
+    # Global pooled training caps (0 = no cap)
+    global_max_rows: int = 0
+    global_max_rows_per_symbol: int = 0
     symbol_hash_buckets: int = 32  # fixed-dim hashed one-hot for multi-symbol/global models
     global_train_ratio: float = 0.8  # time-based split for pooled multi-symbol training
     train_holdout_pct: float = 0.2  # holdout for per-model OOS eval + stacking
