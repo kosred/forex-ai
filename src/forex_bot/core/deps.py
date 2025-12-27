@@ -97,6 +97,37 @@ IMPORT_TO_PYPI = {
     "transformer_engine": "transformer-engine",
 }
 
+# Optional imports can be skipped unless explicitly enabled via env vars.
+# Set FOREX_BOT_INSTALL_ALL=1 to force-install everything.
+OPTIONAL_IMPORTS: dict[str, tuple[str, bool]] = {
+    # Heavy GPU stacks (RAPIDS) - off by default
+    "cudf": ("FOREX_BOT_INSTALL_RAPIDS", False),
+    "cuml": ("FOREX_BOT_INSTALL_RAPIDS", False),
+    # GPU array stack (optional; use only if you want GPU indicators)
+    "cupy": ("FOREX_BOT_INSTALL_CUPY", False),
+    # RL stack (very heavy) - off by default
+    "ray": ("FOREX_BOT_INSTALL_RL", False),
+    "stable_baselines3": ("FOREX_BOT_INSTALL_RL", False),
+    "gymnasium": ("FOREX_BOT_INSTALL_RL", False),
+    "sb3_contrib": ("FOREX_BOT_INSTALL_RL", False),
+    # Bayesian optimization (Ax/Botorch) - off by default
+    "ax": ("FOREX_BOT_INSTALL_BO", False),
+    "botorch": ("FOREX_BOT_INSTALL_BO", False),
+    # Forecasting stack - off by default (often constrains torch<=2.6)
+    "neuralforecast": ("FOREX_BOT_INSTALL_NEURALFORECAST", False),
+    # ONNX export/runtime - off by default
+    "onnx": ("FOREX_BOT_INSTALL_ONNX", False),
+    "onnxruntime": ("FOREX_BOT_INSTALL_ONNX", False),
+    "onnxmltools": ("FOREX_BOT_INSTALL_ONNX", False),
+    "skl2onnx": ("FOREX_BOT_INSTALL_ONNX", False),
+    # Flash attention + transformer engine - optional
+    "flash_attn": ("FOREX_BOT_INSTALL_FLASH_ATTN", False),
+    "transformer_engine": ("FOREX_BOT_INSTALL_TRANSFORMER_ENGINE", False),
+    # Optional data engines
+    "polars": ("FOREX_BOT_INSTALL_POLARS", False),
+    "duckdb": ("FOREX_BOT_INSTALL_DUCKDB", False),
+}
+
 # Known Standard Library modules to exclude (Python 3.10+)
 STDLIB_MODULES = {
     "__future__", "_thread", "abc", "aifc", "argparse", "array", "ast", "asyncio",
@@ -202,6 +233,29 @@ def ensure_dependencies() -> None:
                 local_modules.add(item.name)
 
     imported_modules = scan_imports(src_root)
+
+    def _truthy(val: str | None) -> bool:
+        if val is None:
+            return False
+        return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+    install_all = _truthy(os.environ.get("FOREX_BOT_INSTALL_ALL"))
+    # Enable cupy by default when a GPU is present, unless explicitly disabled.
+    default_cupy = bool(shutil.which("nvidia-smi"))
+
+    def _optional_enabled(mod: str) -> bool:
+        if install_all:
+            return True
+        opt = OPTIONAL_IMPORTS.get(mod)
+        if not opt:
+            return True
+        env_key, default_val = opt
+        if env_key == "FOREX_BOT_INSTALL_CUPY":
+            default_val = default_cupy
+        env_val = os.environ.get(env_key)
+        if env_val is None:
+            return default_val
+        return _truthy(env_val)
     
     # 3. Resolve to PyPI packages
     required_packages = set()
@@ -219,6 +273,14 @@ def ensure_dependencies() -> None:
         # Map only known modules to packages; skip unknowns to avoid false positives.
         pkg = IMPORT_TO_PYPI.get(mod)
         if not pkg:
+            continue
+
+        if not _optional_enabled(mod):
+            logger.info(
+                "Skipping optional dependency '%s'. Enable via %s=1 or FOREX_BOT_INSTALL_ALL=1.",
+                pkg,
+                OPTIONAL_IMPORTS[mod][0],
+            )
             continue
 
         # Skip packages known to lack wheels for Py3.13 (e.g., transformer-engine).
@@ -319,7 +381,9 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
         sys.executable, "-m", "pip", "install",
         "--user", "--upgrade",
         "--timeout", "120",
-        "--break-system-packages"
+        "--break-system-packages",
+        "--prefer-binary",
+        "--upgrade-strategy", "only-if-needed",
     ]
     if pre:
         cmd.append("--pre")
@@ -354,6 +418,10 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
 
     if final_pkgs:
         logger.info(f"Running pip: {' '.join(cmd + final_pkgs)}")
+        env = os.environ.copy()
+        # Disable hash enforcement if set globally; we don't use pinned hashes here.
+        env.setdefault("PIP_REQUIRE_HASHES", "0")
+        env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         try:
             result = subprocess.run(
                 cmd + final_pkgs,
@@ -361,19 +429,23 @@ def _install(packages: list[str], index_url: str | None = None, pre: bool = Fals
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=env,
             )
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or "")
             if "--break-system-packages" in cmd and "no such option: --break-system-packages" in stderr:
                 logger.warning("pip does not support --break-system-packages; retrying without it.")
                 cmd_no_break = [c for c in cmd if c != "--break-system-packages"]
-                subprocess.check_call(cmd_no_break + final_pkgs)
+                subprocess.check_call(cmd_no_break + final_pkgs, env=env)
             else:
                 raise
     if flash_build:
         build_cmd = list(cmd) + ["--no-build-isolation"]
         logger.info(f"Running pip (flash-attn source build): {' '.join(build_cmd + flash_build)}")
-        subprocess.check_call(build_cmd + flash_build)
+        env = os.environ.copy()
+        env.setdefault("PIP_REQUIRE_HASHES", "0")
+        env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        subprocess.check_call(build_cmd + flash_build, env=env)
 
 
 def _flash_attn_wheel_url() -> str | None:
