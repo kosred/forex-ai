@@ -35,7 +35,7 @@ class TensorDiscoveryEngine:
     def __init__(
         self,
         device: str = "cuda",
-        n_experts: int = 20,
+        n_experts: int = 100,
         timeframes: Optional[List[str]] = None,
         max_rows: int | None = None,
         stream_mode: bool | None = None,
