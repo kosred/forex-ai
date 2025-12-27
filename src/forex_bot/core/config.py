@@ -108,9 +108,9 @@ class RiskConfig(BaseModel):
     # Fallback balance used before MT5 fetch or when offline
     initial_balance: float = 10_000.0
     monthly_profit_target_pct: float = 0.04
-    min_risk_per_trade: float = 0.005
+    min_risk_per_trade: float = 0.0
     max_risk_per_trade: float = 0.030
-    risk_per_trade: float = 0.015
+    risk_per_trade: float = 0.030
     daily_drawdown_limit: float = 0.04
     total_drawdown_limit: float = 0.07
     min_risk_reward: float = 2.0
@@ -120,7 +120,7 @@ class RiskConfig(BaseModel):
     challenge_phase: str = "phase_1"
     prop_firm_rules: bool = True
     max_daily_risk_pct: float = 0.04
-    base_risk_per_trade: float = 0.01
+    base_risk_per_trade: float = 0.03
     daily_risk_budget: float = 0.040
     consistency_tracking: bool = True
     min_confidence_threshold: float = 0.55

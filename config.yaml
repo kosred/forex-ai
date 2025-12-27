@@ -38,9 +38,9 @@ system:
 
 risk:
   initial_balance: 10000  # Fallback used when MT5 balance unavailable
-  min_risk_per_trade: 0.005
+  min_risk_per_trade: 0.0
   max_risk_per_trade: 0.030
-  risk_per_trade: 0.015
+  risk_per_trade: 0.030
   daily_drawdown_limit: 0.04
   total_drawdown_limit: 0.07
   min_risk_reward: 2.0
@@ -50,7 +50,7 @@ risk:
   challenge_phase: phase_1
   prop_firm_rules: true
   max_daily_risk_pct: 0.04
-  base_risk_per_trade: 0.01
+  base_risk_per_trade: 0.03
   daily_risk_budget: 0.040
   consistency_tracking: true
   min_confidence_threshold: 0.55
