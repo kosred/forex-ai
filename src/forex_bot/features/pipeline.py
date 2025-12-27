@@ -297,25 +297,29 @@ class FeatureEngineer:
             except Exception:
                 pass
 
-        # === Feature Engineering Dispatch (Stability Fix: Numba for accuracy, GPU for Discovery) ===
+        # === High-Performance HPC Dispatch (252-Core Saturation) ===
+        cpu_budget = _feature_cpu_budget()
+        logger.info(f"Engineering features using {cpu_budget} cores...")
 
-        # 1. Basic Features (Always use Numba/CPU for 100% TA-Lib accuracy and Stability)
-        df = self._compute_basic_features(df, use_gpu=False)
+        # 1. Standard Indicators (Parallelized)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, cpu_budget)) as executor:
+            f1 = executor.submit(self._compute_basic_features, df, use_gpu=False)
+            f2 = executor.submit(self._compute_adx_safe, df)
+            f3 = executor.submit(self._compute_stochastic_safe, df)
+            f4 = executor.submit(self._compute_cci_safe, df)
+            
+            df = f1.result()
+            df["adx"] = f2.result()
+            df["stoch_k"], df["stoch_d"] = f3.result()
+            df["cci"] = f4.result()
+
         if not isinstance(df, pd.DataFrame):
             df = df.to_pandas()
 
-        # 2. Advanced Indicators (ADX, Stoch, CCI, MFI)
-        # Numba is preferred for speed/safety, but we also now inject full TA-Lib suite 
-        # to ensure the Deep Learning models have maximum information.
-        df["adx"] = self._compute_adx_safe(df)
-        df["stoch_k"], df["stoch_d"] = self._compute_stochastic_safe(df)
-        df["cci"] = self._compute_cci_safe(df)
-        
-        # Comprehensive TA-Lib Injection (Deep Learning Fuel)
+        # 2. Comprehensive TA-Lib Injection (Deep Learning Fuel)
         if TALIB_AVAILABLE:
             df = self._compute_comprehensive_talib_features(df)
         else:
-            # Fallback for minimal viable features if TA-Lib missing
             df["mfi14"] = 50.0
 
         df = self._merge_indices(df)
@@ -668,7 +672,9 @@ class FeatureEngineer:
                     except Exception:
                         pass
                 else:
-                    chunk_size = max(1, (len(indicator_names) + workers - 1) // workers)
+                    # HPC OPTIMIZATION: Use more chunks to fill all 252 cores
+                    num_chunks = max(workers, 128) 
+                    chunk_size = max(1, (len(indicator_names) + num_chunks - 1) // num_chunks)
                     chunks = [
                         indicator_names[i:i + chunk_size]
                         for i in range(0, len(indicator_names), chunk_size)
