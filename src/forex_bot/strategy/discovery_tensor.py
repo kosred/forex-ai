@@ -34,7 +34,15 @@ class TensorDiscoveryEngine:
         timeframes: Optional[List[str]] = None,
     ):
         from ..models.device import get_available_gpus
-        self.gpu_list = get_available_gpus() or ["cpu"]
+        gpu_list = get_available_gpus() or ["cpu"]
+        # Optional cap on GPUs used by discovery (e.g., FOREX_BOT_MAX_GPUS=4)
+        try:
+            max_gpus = int(os.environ.get("FOREX_BOT_MAX_GPUS", "0") or 0)
+        except Exception:
+            max_gpus = 0
+        if max_gpus and max_gpus > 0 and len(gpu_list) > max_gpus:
+            gpu_list = gpu_list[:max_gpus]
+        self.gpu_list = gpu_list
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.n_experts = n_experts
         self.data_cube = None
@@ -247,8 +255,12 @@ class TensorDiscoveryEngine:
                 
                 # Initialize batch size for this GPU if not set
                 if gpu_idx not in batch_size_map:
-                    # Heuristic start: 10000 or derived from VRAM
-                    batch_size_map[gpu_idx] = 10000 
+                    # Heuristic start: 10000 or env override
+                    try:
+                        batch_start = int(os.environ.get("FOREX_BOT_DISCOVERY_BATCH_START", "10000") or 10000)
+                    except Exception:
+                        batch_start = 10000
+                    batch_size_map[gpu_idx] = batch_start
                 
                 try:
                     if is_cuda: torch.cuda.set_device(dev)
@@ -263,7 +275,10 @@ class TensorDiscoveryEngine:
                                      self.month_ids_cpu.to(dev, non_blocking=True)) if self.month_ids_cpu is not None else None
 
                         # Sub-batching for Genomes (to avoid OOM on huge populations)
-                        max_genomes = 256 # Conservative default
+                        try:
+                            max_genomes = int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_GENOMES", "256") or 256)
+                        except Exception:
+                            max_genomes = 256
                         
                         fitness_all = []
                         for g_start in range(0, chunk.shape[0], max_genomes):
