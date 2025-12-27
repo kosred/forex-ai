@@ -18,6 +18,24 @@ from evotorch.algorithms import CMAES
 
 logger = logging.getLogger(__name__)
 
+
+def _discovery_cpu_budget() -> int:
+    """Best-effort CPU budget per rank/process for discovery prep."""
+    per_gpu = os.environ.get("FOREX_BOT_CPU_THREADS_PER_GPU")
+    if per_gpu and os.environ.get("LOCAL_RANK") is not None:
+        try:
+            return max(1, int(per_gpu))
+        except Exception:
+            pass
+    for key in ("FOREX_BOT_CPU_BUDGET", "FOREX_BOT_CPU_THREADS"):
+        val = os.environ.get(key)
+        if val:
+            try:
+                return max(1, int(val))
+            except Exception:
+                pass
+    return os.cpu_count() or 1
+
 class TensorDiscoveryEngine:
     """
     2025-Grade GPU Discovery Engine.
@@ -41,12 +59,25 @@ class TensorDiscoveryEngine:
     ):
         from ..models.device import get_available_gpus
         gpu_list = get_available_gpus() or ["cpu"]
+        local_rank = None
+        if os.environ.get("LOCAL_RANK") is not None:
+            try:
+                local_rank = int(os.environ.get("LOCAL_RANK"))
+            except Exception:
+                local_rank = None
         try:
             max_gpus = int(os.environ.get("FOREX_BOT_MAX_GPUS", "0") or 0)
         except Exception:
             max_gpus = 0
         if max_gpus and max_gpus > 0 and len(gpu_list) > max_gpus:
             gpu_list = gpu_list[:max_gpus]
+        restrict_local = str(os.environ.get("FOREX_BOT_DISCOVERY_LOCAL_RANK_ONLY", "1") or "1").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if local_rank is not None and restrict_local and torch.cuda.is_available():
+            if 0 <= local_rank < torch.cuda.device_count():
+                gpu_list = [f"cuda:{local_rank}"]
+                device = f"cuda:{local_rank}"
         self.gpu_list = gpu_list
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.n_experts = n_experts
@@ -54,6 +85,8 @@ class TensorDiscoveryEngine:
         self.ohlc_cube = None
         self.timeframes = timeframes
         self.best_experts = []
+        self.best_scores = None
+        self.local_rank = local_rank
         self.month_ids_cpu = None
         self.month_count = 0
         self.bar_change_cpu = None
@@ -146,7 +179,7 @@ class TensorDiscoveryEngine:
         except Exception:
             cpu_workers = 0
         if cpu_workers <= 0:
-            cpu_workers = os.cpu_count() or 1
+            cpu_workers = _discovery_cpu_budget()
         logger.info(f"Using {cpu_workers} concurrent threads for data alignment.")
         
         full_fp16_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_FULL_FP16", "auto") or "auto").strip().lower()
@@ -805,9 +838,25 @@ class TensorDiscoveryEngine:
                     break
         if final_scores is None:
             final_scores = torch.zeros(final_pop.shape[0], dtype=torch.float32)
-        self.best_experts = final_pop[torch.argsort(final_scores, descending=True)[:self.n_experts]]
+        order = torch.argsort(final_scores, descending=True)
+        topk = order[:self.n_experts]
+        self.best_experts = final_pop[topk]
+        self.best_scores = final_scores[topk]
         
-    def save_experts(self, path: str): torch.save({"genomes": self.best_experts, "timeframes": self.timeframes, "n_features": self.n_features}, path)
+    def save_experts(self, path: str):
+        torch.save(
+            {
+                "genomes": self.best_experts,
+                "scores": self.best_scores,
+                "timeframes": self.timeframes,
+                "n_features": self.n_features,
+            },
+            path,
+        )
     def load_experts(self, path: str):
         if not Path(path).exists(): return None
-        data = torch.load(path, map_location="cpu"); self.best_experts = data["genomes"]; self.timeframes = data["timeframes"]; return self.best_experts
+        data = torch.load(path, map_location="cpu")
+        self.best_experts = data["genomes"]
+        self.best_scores = data.get("scores")
+        self.timeframes = data["timeframes"]
+        return self.best_experts

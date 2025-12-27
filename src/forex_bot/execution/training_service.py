@@ -1097,6 +1097,9 @@ class TrainingService:
         is_ddp = dist.is_available() and dist.is_initialized()
         rank = dist.get_rank() if is_ddp else 0
         world_size = dist.get_world_size() if is_ddp else 1
+        keep_ranks = is_ddp and str(os.environ.get("FOREX_BOT_DDP_KEEP_RANKS", "1") or "1").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
 
         # Cache path for sharing data between ranks
         cache_path = Path(self.settings.system.cache_dir) / "hpc_datasets.pkl"
@@ -1227,13 +1230,15 @@ class TrainingService:
 
             if is_ddp:
                 dist.barrier()
-            if rank != 0:
+            if rank != 0 and not keep_ranks:
                 logger.info(f"Rank {rank}: Exiting (feature shard complete; rank 0 continues).")
                 try:
                     dist.destroy_process_group()
                 except Exception:
                     pass
                 return
+            if rank != 0 and keep_ranks:
+                logger.info(f"Rank {rank}: Feature shard complete; continuing to discovery.")
 
         if rank == 0 and not skip_rank0_heavy:
             # --- RANK 0: Heavy Lifting ---
@@ -1400,35 +1405,86 @@ class TrainingService:
                     datasets = joblib.load(cache_path)
                 except Exception as e:
                     logger.error(f"Rank {rank} failed to load datasets: {e}")
-            logger.info(f"Rank {rank}: Exiting (discovery/training handled on rank 0).")
-            try:
-                dist.destroy_process_group()
-            except Exception:
-                pass
-            return
+            if not keep_ranks:
+                logger.info(f"Rank {rank}: Exiting (discovery/training handled on rank 0).")
+                try:
+                    dist.destroy_process_group()
+                except Exception:
+                    pass
+                return
+            logger.info(f"Rank {rank}: Dataset cache loaded; continuing to discovery.")
 
-        if rank == 0:
-            # --- EXPERT DISCOVERY (Rank 0 only) ---
-            # Now that all symbols are loaded in raw_frames_map, find global experts
+        # --- EXPERT DISCOVERY (optionally multi-rank) ---
+        if (rank == 0) or (keep_ranks and is_ddp):
             logger.info("Launching GPU-Native Expert Discovery (Multi-Symbol)...")
             from ..strategy.discovery_tensor import TensorDiscoveryEngine
 
-            # We pick the largest symbol's timeframe set as the candidate for multi-TF discovery
-            target_sym = "EURUSD" if "EURUSD" in raw_frames_map else next(iter(raw_frames_map.keys()))
+            # Ensure datasets are available for non-zero ranks (for feature-rich discovery)
+            if not datasets and cache_path.exists():
+                try:
+                    cached = joblib.load(cache_path)
+                    if isinstance(cached, list) and cached:
+                        datasets = cached
+                except Exception as exc:
+                    logger.warning(f"Rank {rank}: Failed to load cached datasets for discovery: {exc}")
 
-            # ENRICHMENT: Locate the prepared dataset for the target symbol to get rich features
+            # Choose target symbol for discovery
+            if raw_frames_map:
+                target_sym = "EURUSD" if "EURUSD" in raw_frames_map else next(iter(raw_frames_map.keys()))
+            else:
+                target_sym = "EURUSD" if "EURUSD" in symbols else symbols[0]
+
+            # Ensure we have frames for target symbol on every rank
+            if target_sym not in raw_frames_map:
+                try:
+                    self.settings.system.symbol = target_sym
+                    await self.data_loader.ensure_history(target_sym)
+                    frames = await self.data_loader.get_training_data(target_sym)
+                    if isinstance(frames, dict) and frames:
+                        raw_frames_map[target_sym] = frames
+                except Exception as exc:
+                    logger.warning(f"Rank {rank}: Failed to load discovery frames for {target_sym}: {exc}")
+
             target_ds = next((ds for sym, ds in datasets if sym == target_sym), None)
-            if target_ds is not None:
+            if target_ds is not None and rank == 0:
                 print(f"DEBUG (Global): Enriching discovery with {target_ds.X.shape[1]} features.")
-            discovery_frames, timeframes = self._build_discovery_frames_for_tensor(
-                raw_frames_map[target_sym],
-                news_map.get(target_sym) if news_map else None,
-                target_sym,
-                base_dataset=target_ds,
-            )
+
+            frames_for_discovery = raw_frames_map.get(target_sym)
+            if not isinstance(frames_for_discovery, dict) or not frames_for_discovery:
+                logger.error(f"Rank {rank}: Discovery frames unavailable for {target_sym}; skipping discovery.")
+                if keep_ranks and is_ddp:
+                    try:
+                        dist.barrier()
+                    except Exception:
+                        pass
+                    if rank != 0:
+                        try:
+                            dist.destroy_process_group()
+                        except Exception:
+                            pass
+                        return
+                frames_for_discovery = None
+
+            if frames_for_discovery is None:
+                discovery_frames, timeframes = {}, []
+            else:
+                discovery_frames, timeframes = self._build_discovery_frames_for_tensor(
+                    frames_for_discovery,
+                    news_map.get(target_sym) if news_map else None,
+                    target_sym,
+                    base_dataset=target_ds,
+                )
+
+            local_rank_env = os.environ.get("LOCAL_RANK")
+            device = "cuda"
+            if local_rank_env is not None:
+                try:
+                    device = f"cuda:{int(local_rank_env)}"
+                except Exception:
+                    device = "cuda"
 
             discovery_tensor = TensorDiscoveryEngine(
-                device="cuda",
+                device=device,
                 n_experts=100,
                 timeframes=timeframes,
                 max_rows=int(getattr(self.settings.system, "discovery_max_rows", 0) or 0),
@@ -1441,7 +1497,76 @@ class TrainingService:
                 news_features=news_map.get(target_sym) if news_map else None,
                 iterations=1000
             )
-            discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
+
+            cache_dir = Path(self.settings.system.cache_dir)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            if keep_ranks and is_ddp:
+                expert_path = cache_dir / f"tensor_knowledge_rank{rank}.pt"
+            else:
+                expert_path = cache_dir / "tensor_knowledge.pt"
+            discovery_tensor.save_experts(str(expert_path))
+
+            if keep_ranks and is_ddp:
+                try:
+                    dist.barrier()
+                except Exception:
+                    pass
+                if rank == 0:
+                    import torch
+                    merged_genomes = []
+                    merged_scores = []
+                    meta_timeframes = None
+                    meta_features = None
+                    for r in range(world_size):
+                        p = cache_dir / f"tensor_knowledge_rank{r}.pt"
+                        if not p.exists():
+                            logger.warning(f"Discovery merge: missing expert file {p}")
+                            continue
+                        try:
+                            data = torch.load(p, map_location="cpu")
+                        except Exception as exc:
+                            logger.warning(f"Discovery merge: failed to load {p}: {exc}")
+                            continue
+                        tf = data.get("timeframes")
+                        nf = data.get("n_features")
+                        if meta_timeframes is None:
+                            meta_timeframes = tf
+                            meta_features = nf
+                        if tf != meta_timeframes or nf != meta_features:
+                            logger.warning(f"Discovery merge: skipping {p} due to schema mismatch.")
+                            continue
+                        genomes = data.get("genomes")
+                        if genomes is not None:
+                            merged_genomes.append(genomes)
+                        scores = data.get("scores")
+                        if scores is not None:
+                            merged_scores.append(scores)
+                    if merged_genomes:
+                        all_genomes = torch.cat(merged_genomes, dim=0)
+                        if merged_scores and len(merged_scores) == len(merged_genomes):
+                            all_scores = torch.cat(merged_scores, dim=0)
+                        else:
+                            all_scores = torch.zeros(all_genomes.shape[0], dtype=torch.float32)
+                        topk = torch.argsort(all_scores, descending=True)[:discovery_tensor.n_experts]
+                        torch.save(
+                            {
+                                "genomes": all_genomes[topk],
+                                "scores": all_scores[topk],
+                                "timeframes": meta_timeframes,
+                                "n_features": meta_features,
+                            },
+                            cache_dir / "tensor_knowledge.pt",
+                        )
+                try:
+                    dist.barrier()
+                except Exception:
+                    pass
+                if rank != 0:
+                    try:
+                        dist.destroy_process_group()
+                    except Exception:
+                        pass
+                    return
 
         if not datasets:
             logger.error("HPC: No datasets generated.")

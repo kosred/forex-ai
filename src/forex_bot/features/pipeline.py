@@ -329,62 +329,96 @@ class FeatureEngineer:
         
         import gc 
 
-        for tf_name in target_tfs:
-            if tf_name in frames and tf_name != base_tf:
-                htf = frames[tf_name].copy()
-                if not htf.empty:
-                    try:
-                        if "timestamp" in htf.columns:
-                            htf["timestamp"] = pd.to_datetime(htf["timestamp"], utc=True, errors="coerce")
-                            htf = htf.set_index("timestamp")
-                        elif not isinstance(htf.index, pd.DatetimeIndex):
-                            htf.index = pd.to_datetime(htf.index, utc=True, errors="coerce")
-                        htf = htf.sort_index()
+        try:
+            htf_parallel = str(os.environ.get("FOREX_BOT_HTF_PARALLEL", "1") or "1").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        except Exception:
+            htf_parallel = True
+        try:
+            htf_workers_env = os.environ.get("FOREX_BOT_HTF_WORKERS")
+            htf_workers = max(1, int(htf_workers_env)) if htf_workers_env else _feature_cpu_budget()
+        except Exception:
+            htf_workers = _feature_cpu_budget()
+        htf_workers = max(1, min(htf_workers, max(1, len(target_tfs) - 1)))
+        htf_use_gpu = use_gpu and str(os.environ.get("FOREX_BOT_HTF_USE_GPU", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
 
-                        htf = self._compute_basic_features(htf, use_gpu=use_gpu)
-                        if not isinstance(htf, pd.DataFrame):
-                            htf = htf.to_pandas()
+        def _build_htf_block(tf_name: str):
+            if tf_name == base_tf:
+                return None
+            htf = frames.get(tf_name)
+            if htf is None or htf.empty:
+                return None
+            try:
+                local = htf.copy()
+                if "timestamp" in local.columns:
+                    local["timestamp"] = pd.to_datetime(local["timestamp"], utc=True, errors="coerce")
+                    local = local.set_index("timestamp")
+                elif not isinstance(local.index, pd.DatetimeIndex):
+                    local.index = pd.to_datetime(local.index, utc=True, errors="coerce")
+                local = local.sort_index()
 
-                        htf = self._compute_volatility_features(htf)
-                        if use_volume:
-                            htf = self._compute_volume_profile_features(htf)
-                            htf = self._compute_obi_features(htf, use_gpu)
+                local = self._compute_basic_features(local, use_gpu=htf_use_gpu)
+                if not isinstance(local, pd.DataFrame):
+                    local = local.to_pandas()
 
-                        key_feats = [
-                            "rsi",
-                            "macd",
-                            "macd_hist",
-                            "atr14",
-                            "bb_width",
-                        ]
-                        if use_volume:
-                            key_feats += [
-                                "dist_to_poc",
-                                "in_value_area",
-                                "vol_imbalance",
-                            ]
-                        subset = htf[[c for c in key_feats if c in htf.columns]].copy()
-                        # Prevent lookahead leakage: align to the last *completed* HTF candle.
-                        subset = subset.shift(1)
-                        subset.columns = [f"{tf_name}_{c}" for c in subset.columns]
-                        
-                        # Reindex is still heavy, but now we store just the small subset, not the full df
-                        merged = subset.reindex(df.index).ffill().fillna(0.0)
-                        
-                        # Optimization: Downcast to float32 to save RAM
-                        merged = merged.astype(np.float32)
-                        
-                        htf_feature_blocks.append(merged)
-                        htf_cols.extend(merged.columns.tolist())
-                        
-                    except Exception as e:
-                        logger.warning(f"Failed to generate HTF features for {tf_name}: {e}")
-                    finally:
-                        # Aggressive cleanup
-                        del htf
-                        if 'subset' in locals(): del subset
-                        if 'merged' in locals(): del merged
-                        gc.collect()
+                local = self._compute_volatility_features(local)
+                if use_volume:
+                    local = self._compute_volume_profile_features(local)
+                    local = self._compute_obi_features(local, htf_use_gpu)
+
+                key_feats = [
+                    "rsi",
+                    "macd",
+                    "macd_hist",
+                    "atr14",
+                    "bb_width",
+                ]
+                if use_volume:
+                    key_feats += [
+                        "dist_to_poc",
+                        "in_value_area",
+                        "vol_imbalance",
+                    ]
+                subset = local[[c for c in key_feats if c in local.columns]].copy()
+                # Prevent lookahead leakage: align to the last *completed* HTF candle.
+                subset = subset.shift(1)
+                subset.columns = [f"{tf_name}_{c}" for c in subset.columns]
+
+                merged = subset.reindex(df.index).ffill().fillna(0.0)
+                merged = merged.astype(np.float32)
+                return merged
+            except Exception as e:
+                logger.warning(f"Failed to generate HTF features for {tf_name}: {e}")
+                return None
+            finally:
+                del htf
+                gc.collect()
+
+        if htf_parallel and len(target_tfs) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=htf_workers) as executor:
+                futures = {
+                    executor.submit(_build_htf_block, tf_name): tf_name
+                    for tf_name in target_tfs
+                    if tf_name != base_tf
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    merged = future.result()
+                    if merged is None:
+                        continue
+                    htf_feature_blocks.append(merged)
+                    htf_cols.extend(merged.columns.tolist())
+        else:
+            for tf_name in target_tfs:
+                if tf_name == base_tf:
+                    continue
+                merged = _build_htf_block(tf_name)
+                if merged is None:
+                    continue
+                htf_feature_blocks.append(merged)
+                htf_cols.extend(merged.columns.tolist())
 
         # Merge all HTF blocks at once
         if htf_feature_blocks:
@@ -597,23 +631,48 @@ class FeatureEngineer:
 
             new_features = {}
 
-            # 1. Standard "Kitchen Sink" (Defaults)
+            # 1. Standard "Kitchen Sink" (Defaults) - parallelized
+            indicator_names = []
             for ind_name in ALL_INDICATORS:
-                try:
-                    if (not self.use_volume_features) and ind_name in VOLUME_TALIB_INDICATORS:
-                        continue
-                    if ind_name in ["SMA", "EMA", "RSI", "BBANDS", "ADX", "CCI", "MOM", "ROC", "WILLR", "ATR"]:
-                        continue
-                    func = abstract.Function(ind_name)
-                    res = func(inputs)
-                    if isinstance(res, (list, tuple)):
-                        for i, arr in enumerate(res):
-                            new_features[f"ta_{ind_name.lower()}_{i}"] = arr.astype(np.float32)
-                    elif isinstance(res, (pd.Series, np.ndarray)):
-                        val = res.values if isinstance(res, pd.Series) else res
-                        new_features[f"ta_{ind_name.lower()}"] = val.astype(np.float32)
-                except Exception:
+                if (not self.use_volume_features) and ind_name in VOLUME_TALIB_INDICATORS:
                     continue
+                if ind_name in ["SMA", "EMA", "RSI", "BBANDS", "ADX", "CCI", "MOM", "ROC", "WILLR", "ATR"]:
+                    continue
+                indicator_names.append(ind_name)
+
+            if indicator_names:
+                workers_env = os.environ.get("FOREX_BOT_TALIB_WORKERS")
+                if workers_env:
+                    try:
+                        workers = max(1, int(workers_env))
+                    except Exception:
+                        workers = _feature_cpu_budget()
+                else:
+                    workers = _feature_cpu_budget()
+                workers = max(1, min(workers, len(indicator_names)))
+                if workers == 1:
+                    try:
+                        new_features.update(
+                            _talib_chunk_worker((inputs, indicator_names, self.use_volume_features))
+                        )
+                    except Exception:
+                        pass
+                else:
+                    chunk_size = max(1, (len(indicator_names) + workers - 1) // workers)
+                    chunks = [
+                        indicator_names[i:i + chunk_size]
+                        for i in range(0, len(indicator_names), chunk_size)
+                    ]
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = [
+                            executor.submit(_talib_chunk_worker, (inputs, chunk, self.use_volume_features))
+                            for chunk in chunks
+                        ]
+                        for future in concurrent.futures.as_completed(futures):
+                            try:
+                                new_features.update(future.result())
+                            except Exception:
+                                continue
 
             # 2. Hyperspace Variations
             simple_vars = {
@@ -848,6 +907,17 @@ class FeatureEngineer:
 
     def _add_smc_features(self, df: pd.DataFrame, use_gpu: bool) -> pd.DataFrame:
         dev = "cuda" if use_gpu else "cpu"
+        if NUMBA_AVAILABLE:
+            try:
+                import numba
+                smc_threads_env = os.environ.get("FOREX_BOT_SMC_THREADS")
+                if smc_threads_env:
+                    smc_threads = max(1, int(smc_threads_env))
+                else:
+                    smc_threads = _feature_cpu_budget()
+                numba.set_num_threads(smc_threads)
+            except Exception:
+                pass
         freshness, atr_disp, max_levels = self._auto_smc_params(df)
         return add_smc_features(
             df,
