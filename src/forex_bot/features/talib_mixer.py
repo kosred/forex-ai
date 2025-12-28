@@ -894,7 +894,9 @@ class TALibStrategyMixer:
         )
         if env_workers:
             try:
-                max_workers = max(1, int(env_workers))
+                # CRITICAL FIX: Cap environment variable to prevent unbounded workers
+                env_val = max(1, int(env_workers))
+                max_workers = min(32, env_val)  # Never exceed 32 workers
             except Exception:
                 max_workers = min(32, (os.cpu_count() or 1) * 2)
         else:
@@ -903,7 +905,7 @@ class TALibStrategyMixer:
             except Exception:
                 cpu_budget = 0
             if cpu_budget > 0:
-                max_workers = max(1, min(cpu_budget, os.cpu_count() or 1))
+                max_workers = max(1, min(cpu_budget, os.cpu_count() or 1, 32))  # Cap at 32
             else:
                 max_workers = min(32, (os.cpu_count() or 1) * 2)
         if mem.percent > 85:

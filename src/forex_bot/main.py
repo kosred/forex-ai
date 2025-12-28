@@ -626,7 +626,11 @@ async def main_async():
     # CRITICAL FIX: Limit parallel symbol execution to avoid resource explosion
     # Running all symbols in parallel multiplies all threading issues
     # Cap at 2-4 concurrent symbols max to prevent system overload
-    max_concurrent_symbols = int(os.environ.get("FOREX_BOT_MAX_CONCURRENT_SYMBOLS", "1"))
+    try:
+        max_concurrent_symbols = int(os.environ.get("FOREX_BOT_MAX_CONCURRENT_SYMBOLS", "1"))
+    except (ValueError, TypeError):
+        max_concurrent_symbols = 1
+
     if max_concurrent_symbols <= 0:
         max_concurrent_symbols = min(2, len(symbols))  # Default to 2 max
 
@@ -644,13 +648,28 @@ async def main_async():
                 return
             yield batch
 
+    # Use TaskGroup if available (Python 3.11+), else use gather()
+    has_task_group = hasattr(asyncio, 'TaskGroup')
+
     for batch in batched(symbols, max_concurrent_symbols):
         logger.info(f"Starting batch: {batch}")
-        async with asyncio.TaskGroup() as tg:
+
+        if has_task_group:
+            # Python 3.11+ with TaskGroup
+            async with asyncio.TaskGroup() as tg:
+                for symbol in batch:
+                    instance_settings = deepcopy(base_settings)
+                    instance_settings.system.symbol = symbol
+                    tg.create_task(run_bot_instance(instance_settings, stop_event))
+        else:
+            # Python 3.10 and earlier - use gather()
+            tasks = []
             for symbol in batch:
                 instance_settings = deepcopy(base_settings)
                 instance_settings.system.symbol = symbol
-                tg.create_task(run_bot_instance(instance_settings, stop_event))
+                tasks.append(run_bot_instance(instance_settings, stop_event))
+            await asyncio.gather(*tasks)
+
         logger.info(f"Batch {batch} completed")
 
     logger.info("All trading engines stopped.")

@@ -275,6 +275,10 @@ class CombinatorialPurgedCV:
         trade_limit_breaches = []
         min_days_ok_list = []
 
+        # CRITICAL FIX: Cap n_jobs to prevent worker explosion
+        # Cross-validation can be called with uncapped n_jobs parameter
+        n_jobs = max(1, min(n_jobs, 8))  # Never use more than 8 parallel CV folds
+
         if n_jobs > 1:
             import os
 

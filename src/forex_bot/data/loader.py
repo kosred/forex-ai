@@ -803,8 +803,21 @@ class DataLoader:
                 logger.warning(f"Failed to load {tf} data: {e}")
                 return None
 
-        # 252-Core HPC: Load all timeframes at once
-        results = await asyncio.gather(*[_load_tf(tf) for tf in tfs])
+        # CRITICAL FIX: Batch timeframe loading to prevent I/O explosion
+        # Loading 11+ timeframes in parallel can saturate disk I/O
+        # Use semaphore to limit concurrent file reads
+        max_concurrent_loads = int(os.environ.get("FOREX_BOT_MAX_CONCURRENT_TF_LOADS", "4"))
+        if max_concurrent_loads <= 0:
+            max_concurrent_loads = min(4, len(tfs))  # Safe default: 4 concurrent loads
+
+        # Use asyncio.Semaphore to limit concurrent I/O operations
+        semaphore = asyncio.Semaphore(max_concurrent_loads)
+
+        async def _load_tf_limited(tf):
+            async with semaphore:
+                return await _load_tf(tf)
+
+        results = await asyncio.gather(*[_load_tf_limited(tf) for tf in tfs])
         frames = {r[0]: r[1] for r in results if r is not None}
 
         if self.cache_training_frames:

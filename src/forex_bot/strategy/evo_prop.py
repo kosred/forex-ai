@@ -86,11 +86,15 @@ class PropAwareStrategySearch:
         if max_workers is None:
             try:
                 cpu_total = multiprocessing.cpu_count()
-                self.max_workers = max(1, cpu_total - 1)
+                # CRITICAL FIX: Cap max_workers to prevent process explosion
+                # On 252 cores, cpu_total - 1 = 251 workers!
+                # Use safe formula: min(8, cpu_total - 1)
+                self.max_workers = max(1, min(8, cpu_total - 1))
             except Exception:
                 self.max_workers = 1
         else:
-            self.max_workers = max(1, int(max_workers))
+            # CRITICAL FIX: Cap user-provided max_workers too
+            self.max_workers = max(1, min(8, int(max_workers)))
 
     def _load_checkpoint(self) -> None:
         if not self.checkpoint_path.exists():

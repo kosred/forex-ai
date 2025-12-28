@@ -103,23 +103,23 @@ def run_worker(argv: list[str] | None = None) -> int:
     cpu_total = max(1, os.cpu_count() or 1)
     cpu_threads = int(args.cpu_threads or 0)
     if cpu_threads <= 0:
-        cpu_threads = max(1, min(cpu_total, int(os.environ.get("FOREX_BOT_CPU_THREADS", cpu_total))))
+        # Safe default: cap at 8 threads to work on any hardware
+        cpu_threads = max(1, min(8, cpu_total, int(os.environ.get("FOREX_BOT_CPU_THREADS", "8"))))
 
     durations: dict[str, float] = {}
     trained: list[str] = []
 
-    # HPC FIX: Parallel Model Training Within Worker
-    # Calculate optimal parallelism: divide available threads among models
-    # Cap at 4 concurrent models to avoid excessive overhead
-    max_concurrent_models = min(4, len(models))
-    threads_per_model = max(1, cpu_threads // max_concurrent_models)
+    # HPC FIX: Parallel Model Training Within Worker (Thread-Safe)
+    # Use ThreadPoolExecutor for cross-platform compatibility
+    # NumPy/sklearn release GIL during heavy computation, so threads work well
+    max_concurrent_models = min(4, len(models), max(1, cpu_threads // 2))
+    threads_per_model = max(1, cpu_threads // max(1, max_concurrent_models))
 
     logger.info(f"[WORKER] Training {len(models)} models with {max_concurrent_models} concurrent, "
-                f"{threads_per_model} threads each")
+                f"{threads_per_model} threads each (CPU budget: {cpu_threads})")
 
-    def train_single_model(model_info: tuple[int, str]) -> tuple[str, float, bool]:
+    def train_single_model(idx: int, name: str) -> tuple[str, float, bool]:
         """Train a single model and return (name, duration, success)"""
-        idx, name = model_info
         t0 = time.perf_counter()
         try:
             model = factory.create_model(name, best_params, idx)
@@ -130,22 +130,34 @@ def run_worker(argv: list[str] | None = None) -> int:
             logger.info(f"[WORKER] Successfully trained {name} in {duration:.1f}s")
             return (name, duration, True)
         except Exception as e:
-            logger.error(f"[WORKER] Failed {name}: {e}")
+            logger.error(f"[WORKER] Failed {name}: {e}", exc_info=True)
             return (name, 0.0, False)
 
-    # Use process pool for CPU-bound model training to avoid GIL
-    # Fall back to threading if process spawn fails
-    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+    # Use ThreadPoolExecutor for reliable cross-platform parallel training
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    try:
-        # Try process pool first (best for CPU-bound work)
-        with ProcessPoolExecutor(max_workers=max_concurrent_models) as executor:
-            results = list(executor.map(train_single_model, enumerate(models, start=1)))
-    except Exception as proc_err:
-        logger.warning(f"[WORKER] ProcessPool failed ({proc_err}), falling back to ThreadPool")
-        # Fallback to thread pool
+    results: list[tuple[str, float, bool]] = []
+
+    if max_concurrent_models > 1:
+        # Parallel training
         with ThreadPoolExecutor(max_workers=max_concurrent_models) as executor:
-            results = list(executor.map(train_single_model, enumerate(models, start=1)))
+            future_to_model = {
+                executor.submit(train_single_model, idx, name): name
+                for idx, name in enumerate(models, start=1)
+            }
+            for future in as_completed(future_to_model):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    model_name = future_to_model[future]
+                    logger.error(f"[WORKER] Exception training {model_name}: {e}")
+                    results.append((model_name, 0.0, False))
+    else:
+        # Sequential training (fallback for low-resource systems)
+        logger.info("[WORKER] Sequential training mode (limited CPU resources)")
+        for idx, name in enumerate(models, start=1):
+            results.append(train_single_model(idx, name))
 
     # Collect results
     for name, duration, success in results:
