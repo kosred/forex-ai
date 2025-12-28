@@ -51,6 +51,11 @@ class StrategyLedger:
         with conn:
             # Enable Write-Ahead Logging for concurrency
             conn.execute("PRAGMA journal_mode=WAL;")
+            # CRITICAL FIX: WAL checkpoint tuning to prevent unbounded growth
+            # With 300+ parallel workers, WAL file can grow huge without proper checkpointing
+            conn.execute("PRAGMA wal_autocheckpoint=1000;")  # Checkpoint every 1000 pages
+            conn.execute("PRAGMA synchronous=NORMAL;")  # Balance between safety and performance
+            conn.execute("PRAGMA busy_timeout=5000;")  # Wait 5s for locks instead of failing immediately
             cursor = conn.cursor()
 
             cursor.execute("""

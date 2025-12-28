@@ -17,7 +17,7 @@ class AutonomousDiscoveryEngine:
         self.cache_dir = cache_dir
         # HPC: Use a dedicated discovery ledger
         self.ledger = StrategyLedger(str(cache_dir / "strategy_ledger.sqlite"), symbol="DISCOVERY")
-        self.n_jobs = n_jobs
+        self.n_jobs = n_jobs  # NOTE: Currently unused - GeneticStrategyEvolution doesn't support parallel evolution yet
         self.mixer = TALibStrategyMixer(use_volume_features=True)
         self.evolution = GeneticStrategyEvolution(population_size=100, mixer=self.mixer)
 

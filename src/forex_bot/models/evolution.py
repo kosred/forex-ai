@@ -691,14 +691,18 @@ class EvoExpertCMA(ExpertModel):
                 except Exception:
                     cpu_cores = 0
                 if cpu_cores <= 0:
-                    cpu_cores = max(1, os.cpu_count() or 1)
+                    cpu_total = max(1, os.cpu_count() or 1)
+                    # CRITICAL FIX: Cap evolution cores to avoid thread explosion
+                    # CMA-ES islands should be limited to prevent oversubscription
+                    cpu_cores = min(8, cpu_total)
                 else:
                     cpu_cores = max(1, min(cpu_cores, max(1, os.cpu_count() or cpu_cores)))
 
                 # Safety: cap active islands by both time budget and available CPU threads.
+                # Additional safety: never spawn more than 8 islands
                 max_by_time = max(1, int(math.ceil(total_budget / 60.0)))
                 requested_islands = islands
-                active_islands = max(1, min(requested_islands, cpu_cores, max_by_time))
+                active_islands = max(1, min(requested_islands, cpu_cores, max_by_time, 8))
                 if active_islands <= 1:
                     island_budgets = [total_budget]
                 else:

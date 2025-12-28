@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -9,6 +10,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows doesn't have fcntl
 
 from ..core.config import Settings
 from ..core.storage import RiskLedger
@@ -127,19 +133,18 @@ class RiskManager:
 
     def save_state(self) -> None:
         try:
-            import fcntl
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             state = {
                 "date": self._last_session_date.isoformat() if self._last_session_date else None,
                 # ...
             }
-            
+
             with open(self.state_file, 'w') as f:
-                # HPC FIX: Exclusive File Lock
-                if sys.platform != "win32":
+                # HPC FIX: Exclusive File Lock (Unix only)
+                if fcntl is not None and sys.platform != "win32":
                     fcntl.flock(f, fcntl.LOCK_EX)
                 json.dump(state, f)
-                if sys.platform != "win32":
+                if fcntl is not None and sys.platform != "win32":
                     fcntl.flock(f, fcntl.LOCK_UN)
         except Exception as e:
             logger.error(f"Failed to save risk state: {e}")

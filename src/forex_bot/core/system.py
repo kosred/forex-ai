@@ -433,8 +433,11 @@ class AutoTuner:
         # Fallbacks if no explicit override was set.
         if blas_threads is None:
             if hints.is_hpc:
-                # HPC Beast: Allow massive thread pools for data prep
-                blas_threads = max(32, cpu_cores // 4)
+                # CRITICAL FIX: Cap BLAS threads to avoid oversubscription on HPC
+                # Each process should use only a small portion of cores
+                # If we have many parallel workers, each needs fewer BLAS threads
+                # Cap at 4 threads per process to prevent 252-core explosion
+                blas_threads = min(4, max(1, cpu_cores // max(8, hints.n_jobs or 1)))
             elif hints.n_jobs > 1:
                 blas_threads = 1
             else:
@@ -475,10 +478,12 @@ class AutoTuner:
         
         # 2. Saturate Cores
         cpu_cores = self.profile.cpu_cores
-        
+
         # 3. Final Automated Decision
-        target = max(1, min(cpu_cores, max_ram_workers))
-        
+        # CRITICAL FIX: Cap feature workers at 8 to avoid thread explosion
+        # Feature engineering is pandas/I/O bound, not CPU bound
+        target = max(1, min(8, min(cpu_cores, max_ram_workers)))
+
         # FORCE overrides (Bypass any manual ENV set by the user to ensure it 'just works')
         os.environ["FOREX_BOT_FEATURE_WORKERS"] = str(target)
         os.environ["FEATURE_WORKERS"] = str(target)

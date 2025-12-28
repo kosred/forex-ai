@@ -104,7 +104,10 @@ def _feature_cpu_budget() -> int:
                 return max(1, int(val))
             except Exception:
                 pass
-    return os.cpu_count() or 1
+    # CRITICAL FIX: Cap at 8 workers to avoid thread explosion on HPC systems
+    # Feature engineering is I/O and pandas-bound, excessive parallelism causes GIL contention
+    cpu_count = os.cpu_count() or 1
+    return min(8, cpu_count)
 
 
 def _talib_chunk_worker(payload):

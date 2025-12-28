@@ -623,15 +623,36 @@ async def main_async():
             logger.info("ONNX export requested and no manifest found; exporting ONNX models now...")
             await asyncio.to_thread(_export_onnx_from_saved_models, models_dir)
 
-    # HPC LIVE: Launch all symbols in parallel tasks
-    logger.info(f"HPC: Launching {len(symbols)} parallel trading engines...")
-    
-    async with asyncio.TaskGroup() as tg:
-        for symbol in symbols:
-            instance_settings = deepcopy(base_settings)
-            instance_settings.system.symbol = symbol
-            tg.create_task(run_bot_instance(instance_settings, stop_event))
-            
+    # CRITICAL FIX: Limit parallel symbol execution to avoid resource explosion
+    # Running all symbols in parallel multiplies all threading issues
+    # Cap at 2-4 concurrent symbols max to prevent system overload
+    max_concurrent_symbols = int(os.environ.get("FOREX_BOT_MAX_CONCURRENT_SYMBOLS", "1"))
+    if max_concurrent_symbols <= 0:
+        max_concurrent_symbols = min(2, len(symbols))  # Default to 2 max
+
+    logger.info(f"Running {len(symbols)} symbols with max {max_concurrent_symbols} concurrent instances...")
+
+    # Process symbols in batches
+    from itertools import islice
+
+    def batched(iterable, n):
+        """Batch data into tuples of length n. The last batch may be shorter."""
+        it = iter(iterable)
+        while True:
+            batch = list(islice(it, n))
+            if not batch:
+                return
+            yield batch
+
+    for batch in batched(symbols, max_concurrent_symbols):
+        logger.info(f"Starting batch: {batch}")
+        async with asyncio.TaskGroup() as tg:
+            for symbol in batch:
+                instance_settings = deepcopy(base_settings)
+                instance_settings.system.symbol = symbol
+                tg.create_task(run_bot_instance(instance_settings, stop_event))
+        logger.info(f"Batch {batch} completed")
+
     logger.info("All trading engines stopped.")
 
 

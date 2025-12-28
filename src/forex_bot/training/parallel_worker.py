@@ -108,24 +108,50 @@ def run_worker(argv: list[str] | None = None) -> int:
     durations: dict[str, float] = {}
     trained: list[str] = []
 
-    # HPC FIX: Pure-Sharded Task Execution
-    # Instead of nesting threads (which hits the GIL), we process models sequentially
-    # and let the master orchestrator launch more processes.
-    logger.info(f"[WORKER] Sequentially training {len(models)} models to avoid GIL-locking.")
-    
-    for idx, name in enumerate(models, start=1):
+    # HPC FIX: Parallel Model Training Within Worker
+    # Calculate optimal parallelism: divide available threads among models
+    # Cap at 4 concurrent models to avoid excessive overhead
+    max_concurrent_models = min(4, len(models))
+    threads_per_model = max(1, cpu_threads // max_concurrent_models)
+
+    logger.info(f"[WORKER] Training {len(models)} models with {max_concurrent_models} concurrent, "
+                f"{threads_per_model} threads each")
+
+    def train_single_model(model_info: tuple[int, str]) -> tuple[str, float, bool]:
+        """Train a single model and return (name, duration, success)"""
+        idx, name = model_info
         t0 = time.perf_counter()
         try:
             model = factory.create_model(name, best_params, idx)
-            # Use full thread budget for THIS model
-            with thread_limits(blas_threads=cpu_threads):
+            with thread_limits(blas_threads=threads_per_model):
                 model.fit(X, y)
             model.save(str(out_dir))
-            trained.append(name)
-            durations[name] = time.perf_counter() - t0
-            logger.info(f"[WORKER] Successfully trained {name} in {durations[name]:.1f}s")
+            duration = time.perf_counter() - t0
+            logger.info(f"[WORKER] Successfully trained {name} in {duration:.1f}s")
+            return (name, duration, True)
         except Exception as e:
             logger.error(f"[WORKER] Failed {name}: {e}")
+            return (name, 0.0, False)
+
+    # Use process pool for CPU-bound model training to avoid GIL
+    # Fall back to threading if process spawn fails
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+    try:
+        # Try process pool first (best for CPU-bound work)
+        with ProcessPoolExecutor(max_workers=max_concurrent_models) as executor:
+            results = list(executor.map(train_single_model, enumerate(models, start=1)))
+    except Exception as proc_err:
+        logger.warning(f"[WORKER] ProcessPool failed ({proc_err}), falling back to ThreadPool")
+        # Fallback to thread pool
+        with ThreadPoolExecutor(max_workers=max_concurrent_models) as executor:
+            results = list(executor.map(train_single_model, enumerate(models, start=1)))
+
+    # Collect results
+    for name, duration, success in results:
+        if success:
+            trained.append(name)
+            durations[name] = duration
 
     # Write a small manifest for the coordinator.
     try:

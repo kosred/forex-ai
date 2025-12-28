@@ -857,7 +857,11 @@ class ModelTrainer:
                 except Exception:
                     cpu_threads = 0
                 if cpu_threads <= 0:
-                    cpu_threads = multiprocessing.cpu_count()
+                    cpu_total = multiprocessing.cpu_count()
+                    # CRITICAL FIX: Cap BLAS threads to avoid oversubscription
+                    # If training in parallel, each model gets fewer threads
+                    # Cap at 8 threads per model to prevent resource contention
+                    cpu_threads = min(8, cpu_total)
                 with thread_limits(blas_threads=cpu_threads):
                     # Fit logic (simplified here, assume factory configured it well)
                     fit_kwargs = {}
