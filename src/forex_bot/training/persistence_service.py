@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import joblib
 
-from ..core.system import normalize_device_preference
+from ..core.system import normalize_device_preference, resolve_cpu_budget
 from ..models.base import ExpertModel
 from ..models.device import get_available_gpus
 from ..models.registry import get_model_class
@@ -140,7 +140,7 @@ class PersistenceService:
             return name, None
 
         # HPC: Load all models in parallel threads
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(active), 32)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=resolve_cpu_budget()) as executor:
             results = list(executor.map(_load_single, active))
             
         for name, model in results:

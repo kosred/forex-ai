@@ -52,7 +52,7 @@ class SystemConfig(BaseModel):
     cache_max_age_minutes: int = 60
     deep_purge_mode: str = "off"
     deep_purge_on_train: bool = True
-    n_jobs: int = 2
+    n_jobs: int = 0
     enable_gpu_preference: str = "auto"
     discovery_auto_cap: bool = True
     discovery_max_rows: int = 0
@@ -69,12 +69,15 @@ class SystemConfig(BaseModel):
     smc_freshness_limit: int = 0
     smc_atr_displacement: float = 0.0
     smc_max_levels: int = 0
-    smc_use_cuda: bool = True
+    smc_use_cuda: bool = False
 
     @field_validator("n_jobs")
     @classmethod
     def validate_n_jobs(cls, v: int) -> int:
-        return max(1, min(v, os.cpu_count() or 1))
+        cpu_total = os.cpu_count() or 1
+        if v <= 0:
+            return max(1, cpu_total - 1)
+        return max(1, min(v, cpu_total))
 
     @field_validator("poll_interval_seconds")
     @classmethod
@@ -186,6 +189,14 @@ class ModelsConfig(BaseModel):
     evo_hidden_size: int = 64
     evo_population: int = 32
     evo_islands: int = 4
+    prop_search_enabled: bool = False
+    prop_search_population: int = 200
+    prop_search_generations: int = 50
+    prop_search_max_hours: float = 1.0
+    prop_search_max_rows: int = 200_000
+    prop_search_portfolio_size: int = 100
+    prop_search_checkpoint: str = "models/strategy_evo_checkpoint.json"
+    prop_search_device: str = "cpu"
     train_batch_size: int = 32
     inference_batch_size: int = 32
     enable_transformer_expert: bool = True

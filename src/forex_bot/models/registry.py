@@ -61,12 +61,10 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
             raise ValueError(f"Model '{name}' not found in registry.")
         
         module_name, class_name = MODEL_MAPPING[name]
-        
+
         # Handle CPU fallback for GPU models if needed
-        if not prefer_gpu:
-            if name in ["kan", "nbeats", "tabnet", "tide"]:
-                # Many GPU models have same module name as CPU path
-                pass
+        if not prefer_gpu and name in {"kan", "nbeats", "tabnet", "tide"}:
+            module_name = module_name.replace("_gpu", "")
 
         try:
             # Import with package context
@@ -75,6 +73,26 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
             _CLASS_CACHE[name] = cls
             return cls
         except Exception as e:
+            # If GPU module import fails, try CPU implementation as fallback.
+            if name in {"kan", "nbeats", "tabnet", "tide"} and module_name.endswith("_gpu"):
+                try:
+                    cpu_module = module_name.replace("_gpu", "")
+                    module = importlib.import_module(f".{cpu_module}", package="forex_bot.models")
+                    cls = getattr(module, class_name)
+                    _CLASS_CACHE[name] = cls
+                    logger.warning(
+                        "Falling back to CPU model for '%s' after GPU import failure: %s",
+                        name,
+                        e,
+                    )
+                    return cls
+                except Exception as cpu_exc:
+                    logger.error(
+                        "CPU fallback import failed for '%s' after GPU import error: %s",
+                        name,
+                        cpu_exc,
+                    )
+                    raise ImportError(f"Could not load model {name}") from cpu_exc
             logger.error(f"Failed to lazy-import model '{name}': {e}")
             raise ImportError(f"Could not load model {name}") from e
 

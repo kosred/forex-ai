@@ -158,6 +158,21 @@ class EvaluationService:
                     return LogisticRegression(max_iter=200, n_jobs=-1)
                 return None
 
+            def _cpu_budget() -> int:
+                for key in ("FOREX_BOT_CPU_BUDGET", "FOREX_BOT_CPU_THREADS"):
+                    val = os.environ.get(key)
+                    if val:
+                        try:
+                            return max(1, int(val))
+                        except Exception:
+                            pass
+                cpu_count = os.cpu_count() or 1
+                try:
+                    reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
+                except Exception:
+                    reserve = 1
+                return max(1, cpu_count - max(0, reserve))
+
             if meta is not None:
                 res = cpcv_backtest(
                     x=X,
@@ -168,7 +183,7 @@ class EvaluationService:
                     n_test_groups=self.settings.models.cpcv_n_test_groups,
                     embargo_pct=self.settings.models.cpcv_embargo_pct,
                     purge_pct=self.settings.models.cpcv_purge_pct,
-                    n_jobs=1,
+                    n_jobs=_cpu_budget(),
                 )
                 (self.models_dir / "cpcv_metrics.json").write_text(json.dumps(res, indent=2))
                 return res

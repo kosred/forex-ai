@@ -129,7 +129,8 @@ class ModelTrainer:
                 self.world_size = dist.get_world_size()
                 return
             # Default to env:// init (expect MASTER_ADDR/PORT set by launcher)
-            dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+            backend = "gloo" if os.name == "nt" else ("nccl" if torch.cuda.is_available() else "gloo")
+            dist.init_process_group(backend=backend)
             self.distributed_enabled = True
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
@@ -183,6 +184,111 @@ class ModelTrainer:
         )
         return est_time
 
+    @staticmethod
+    def _read_int_env(name: str, default: int | None = None) -> int | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            return int(str(raw).strip())
+        except Exception:
+            return default
+
+    @staticmethod
+    def _read_float_env(name: str, default: float | None = None) -> float | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            return float(str(raw).strip())
+        except Exception:
+            return default
+
+    def _resolve_cpu_budget(self) -> int:
+        cpu_total = max(1, os.cpu_count() or 1)
+        override = self._read_int_env("FOREX_BOT_CPU_BUDGET", None)
+        if override is None:
+            override = self._read_int_env("FOREX_BOT_CPU_THREADS", None)
+        if override is not None and override > 0:
+            return max(1, min(cpu_total, override))
+        reserve = self._read_int_env("FOREX_BOT_CPU_RESERVE", 1)
+        reserve = max(0, reserve or 0)
+        return max(1, cpu_total - reserve)
+
+    def _available_ram_gb(self) -> float | None:
+        try:
+            import psutil  # type: ignore
+
+            return float(psutil.virtual_memory().available) / (1024**3)
+        except Exception:
+            return None
+
+    def _resolve_cpu_worker_count(self, models_count: int, cpu_budget: int) -> int:
+        requested = self._read_int_env("FOREX_BOT_CPU_WORKERS", None)
+        if requested is not None and requested > 0:
+            return max(1, min(models_count, cpu_budget, requested))
+
+        per_worker_gb = self._read_float_env("FOREX_BOT_CPU_WORKER_GB", 2.0) or 2.0
+        if per_worker_gb is not None:
+            per_worker_gb = float(per_worker_gb)
+        available_gb = self._available_ram_gb()
+        if per_worker_gb <= 0:
+            max_ram_workers = cpu_budget
+        elif available_gb is None or available_gb <= 0:
+            max_ram_workers = cpu_budget
+        else:
+            per_worker_gb = max(0.25, per_worker_gb)
+            max_ram_workers = max(1, int(available_gb // per_worker_gb))
+
+        return max(1, min(models_count, cpu_budget, max_ram_workers))
+
+    def _resolve_gpu_worker_count(self, models_count: int) -> int:
+        num_gpus = int(getattr(self.settings.system, "num_gpus", 0) or 0)
+        if not bool(getattr(self.settings.system, "enable_gpu", False)):
+            num_gpus = 0
+        requested = self._read_int_env("FOREX_BOT_GPU_WORKERS", None)
+        if requested is not None and requested > 0:
+            num_gpus = min(num_gpus, requested)
+        max_gpus = self._read_int_env("FOREX_BOT_MAX_GPUS", None)
+        if max_gpus is not None and max_gpus > 0:
+            num_gpus = min(num_gpus, max_gpus)
+        if num_gpus <= 0:
+            return 0
+        return max(1, min(num_gpus, models_count))
+
+    def _visible_gpu_ids(self, num_gpus: int) -> list[int]:
+        raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if raw is not None:
+            raw = raw.strip()
+            if not raw:
+                return []
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            ids: list[int] = []
+            for part in parts:
+                if part.isdigit():
+                    ids.append(int(part))
+            if ids:
+                return ids[:num_gpus] if num_gpus > 0 else ids
+        return list(range(max(0, num_gpus)))
+
+    def _split_models_by_device(self, enabled_models: list[str]) -> tuple[list[str], list[str]]:
+        gpu_preferred = {
+            "transformer",
+            "kan",
+            "nbeats",
+            "tide",
+            "tabnet",
+            "mlp",
+            "rl_ppo",
+            "rl_sac",
+            "rllib_ppo",
+            "rllib_sac",
+            "evolution",
+        }
+        gpu_models = [m for m in enabled_models if m in gpu_preferred]
+        cpu_models = [m for m in enabled_models if m not in gpu_preferred]
+        return gpu_models, cpu_models
+
     def _parallel_models_enabled(self, enabled_models: list[str]) -> bool:
         mode = str(os.environ.get("FOREX_BOT_PARALLEL_MODELS", "auto")).lower().strip()
         if mode in {"0", "false", "no", "off"}:
@@ -194,27 +300,19 @@ class ModelTrainer:
             pass
         if os.environ.get("FOREX_BOT_TRAIN_WORKER") == "1":
             return False
-        if not bool(getattr(self.settings.system, "enable_gpu", False)):
-            return False
-        num_gpus = int(getattr(self.settings.system, "num_gpus", 0) or 0)
-        if num_gpus <= 1:
-            return False
         if len(enabled_models) < 2:
             return False
-        # Windows can do this via subprocess, but it's easy to overwhelm local dev boxes.
-        if os.name == "nt" and mode not in {"1", "true", "yes", "force"}:
+        cpu_budget = self._resolve_cpu_budget()
+        num_gpus = int(getattr(self.settings.system, "num_gpus", 0) or 0)
+        if not bool(getattr(self.settings.system, "enable_gpu", False)):
+            num_gpus = 0
+        if mode in {"gpu", "gpus"} and num_gpus <= 0:
+            return False
+        if mode in {"cpu"} and cpu_budget <= 1:
+            return False
+        if num_gpus <= 0 and cpu_budget <= 1:
             return False
         return True
-
-    def _parallel_worker_count(self, enabled_models: list[str]) -> int:
-        num_gpus = int(getattr(self.settings.system, "num_gpus", 0) or 0)
-        requested = str(os.environ.get("FOREX_BOT_MAX_GPUS", "")).strip()
-        if requested:
-            try:
-                num_gpus = max(1, min(num_gpus, int(requested)))
-            except Exception:
-                pass
-        return max(1, min(num_gpus, len(enabled_models)))
 
     def _write_tuned_config(self, out_path: Path) -> None:
         try:
@@ -320,30 +418,91 @@ class ModelTrainer:
         X_fit: pd.DataFrame,
         y_fit: pd.Series,
         *,
+        meta_fit: pd.DataFrame | None = None,
         stop_event: asyncio.Event | None,
+        memmap_dataset_dir: Path | str | None = None,
     ) -> dict[str, float]:
         """
-        Train models across available GPUs using subprocess workers pinned via CUDA_VISIBLE_DEVICES.
+        Train models across available CPUs/GPUs using subprocess workers pinned via CUDA_VISIBLE_DEVICES.
         Returns per-model durations (best effort).
         """
-        worker_count = self._parallel_worker_count(enabled_models)
-        buckets = self._schedule_models(enabled_models, worker_count)
+        mode = str(os.environ.get("FOREX_BOT_PARALLEL_MODELS", "auto")).lower().strip()
+        cpu_budget = self._resolve_cpu_budget()
 
-        cpu_total = max(1, os.cpu_count() or 1)
-        try:
-            cpu_budget = int(os.environ.get("FOREX_BOT_CPU_BUDGET", "0") or 0)
-        except Exception:
-            cpu_budget = 0
-        if cpu_budget <= 0:
-            cpu_budget = cpu_total  # default: use all available CPU cores
-        cpu_budget = max(1, min(cpu_total, cpu_budget))
-        base_threads = max(1, cpu_budget // worker_count)
-        extra = max(0, cpu_budget % worker_count)
+        enable_gpu = bool(getattr(self.settings.system, "enable_gpu", False))
+        num_gpus = int(getattr(self.settings.system, "num_gpus", 0) or 0)
+        if not enable_gpu:
+            num_gpus = 0
+
+        gpu_models, cpu_models = self._split_models_by_device(enabled_models)
+        if num_gpus <= 0:
+            gpu_models = []
+            cpu_models = list(enabled_models)
+
+        if mode in {"gpu", "gpus"}:
+            cpu_models = []
+        elif mode in {"cpu"}:
+            gpu_models = []
+            cpu_models = list(enabled_models)
+
+        if meta_fit is None:
+            require_meta = {"genetic", "rl_ppo", "rl_sac", "rllib_ppo", "rllib_sac"}
+            dropped = [m for m in (gpu_models + cpu_models) if m in require_meta]
+            if dropped:
+                logger.info(f"Parallel: skipping metadata-dependent models without metadata: {dropped}")
+            gpu_models = [m for m in gpu_models if m not in require_meta]
+            cpu_models = [m for m in cpu_models if m not in require_meta]
+
+        gpu_workers = self._resolve_gpu_worker_count(len(gpu_models)) if gpu_models else 0
+        cpu_workers = self._resolve_cpu_worker_count(len(cpu_models), cpu_budget) if cpu_models else 0
+
+        if gpu_workers <= 0 and cpu_workers <= 0:
+            raise RuntimeError("Parallel training requested but no workers available")
+
+        worker_specs: list[dict[str, Any]] = []
+        if gpu_workers > 0 and gpu_models:
+            buckets = self._schedule_models(gpu_models, gpu_workers)
+            gpu_ids = self._visible_gpu_ids(num_gpus)
+            for wid, models in enumerate(buckets):
+                if not models:
+                    continue
+                gpu_id = gpu_ids[wid % len(gpu_ids)] if gpu_ids else None
+                worker_specs.append(
+                    {
+                        "kind": "gpu",
+                        "label": f"gpu_{wid}",
+                        "gpu_id": gpu_id,
+                        "models": models,
+                    }
+                )
+
+        if cpu_workers > 0 and cpu_models:
+            buckets = self._schedule_models(cpu_models, cpu_workers)
+            for wid, models in enumerate(buckets):
+                if not models:
+                    continue
+                worker_specs.append(
+                    {
+                        "kind": "cpu",
+                        "label": f"cpu_{wid}",
+                        "gpu_id": None,
+                        "models": models,
+                    }
+                )
+
+        total_workers = len(worker_specs)
+        if total_workers <= 0:
+            raise RuntimeError("Parallel training requested but no workers were scheduled")
+
+        base_threads = max(1, cpu_budget // total_workers)
+        extra = max(0, cpu_budget % total_workers)
+        for idx, spec in enumerate(worker_specs):
+            spec["threads"] = base_threads + (1 if idx < extra else 0)
 
         cache_root = Path(getattr(self.settings.system, "cache_dir", "cache")) / "parallel_training"
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = cache_root / f"run_{run_id}_{os.getpid()}"
-        dataset_dir = run_dir / "dataset"
+        dataset_dir = Path(memmap_dataset_dir) if memmap_dataset_dir else (run_dir / "dataset")
         cfg_path = run_dir / "tuned_config.yaml"
         logs_dir = self.logs_dir / "parallel_workers" / run_dir.name
         workers_root = self.models_dir / "_workers" / run_dir.name
@@ -352,35 +511,91 @@ class ModelTrainer:
         workers_root.mkdir(parents=True, exist_ok=True)
 
         logger.info(
-            f"Parallel model training enabled: workers={worker_count}, cpu_budget={cpu_budget}, "
-            f"threads/worker={base_threads}+{extra}"
+            "Parallel model training enabled: gpu_workers=%s cpu_workers=%s cpu_budget=%s "
+            "threads/worker=%s+%s",
+            gpu_workers,
+            cpu_workers,
+            cpu_budget,
+            base_threads,
+            extra,
         )
 
         self._write_tuned_config(cfg_path)
         cfg_exists = cfg_path.exists()
-        self._export_memmap_dataset(X_fit, y_fit, dataset_dir)
+
+        dataset_ok = False
+        if memmap_dataset_dir:
+            try:
+                dataset_ok = (
+                    dataset_dir.exists()
+                    and (dataset_dir / "X.npy").exists()
+                    and (dataset_dir / "y.npy").exists()
+                    and (dataset_dir / "columns.json").exists()
+                )
+            except Exception:
+                dataset_ok = False
+
+        if dataset_ok:
+            logger.info(f"Parallel: Reusing memmap dataset at {dataset_dir}.")
+        else:
+            if memmap_dataset_dir:
+                logger.warning(
+                    f"Parallel: Provided memmap dataset missing or incomplete; regenerating at {dataset_dir}."
+                )
+            self._export_memmap_dataset(X_fit, y_fit, dataset_dir)
+
+        metadata_path = None
+        if meta_fit is not None:
+            try:
+                metadata_path = run_dir / "metadata.pkl"
+                meta_fit.to_pickle(metadata_path)
+            except Exception as exc:
+                metadata_path = None
+                logger.warning(f"Failed to persist metadata for workers: {exc}")
 
         entry = _find_entrypoint_script()
 
-        procs: list[tuple[int, Path, subprocess.Popen, Any]] = []
+        gpu_max_concurrent = self._read_int_env("FOREX_BOT_GPU_MAX_CONCURRENT_MODELS", 1)
+        if gpu_max_concurrent is None or gpu_max_concurrent <= 0:
+            gpu_max_concurrent = 1
+        cpu_max_concurrent = self._read_int_env("FOREX_BOT_CPU_MAX_CONCURRENT_MODELS", None)
+
+        procs: list[tuple[str, Path, subprocess.Popen, Any]] = []
         try:
-            for wid, models in enumerate(buckets):
+            for idx, spec in enumerate(worker_specs):
+                models = spec.get("models") or []
                 if not models:
                     continue
-                out_dir = workers_root / f"worker_{wid}"
+                label = str(spec.get("label") or idx)
+                out_dir = workers_root / f"worker_{label}"
                 out_dir.mkdir(parents=True, exist_ok=True)
-                log_path = logs_dir / f"worker_{wid}.log"
+                log_path = logs_dir / f"worker_{label}.log"
 
                 env = os.environ.copy()
                 env["PYTHONUNBUFFERED"] = "1"
                 env["FOREX_BOT_TRAIN_WORKER"] = "1"
                 if cfg_exists:
                     env["CONFIG_FILE"] = str(cfg_path)
-                env["CUDA_VISIBLE_DEVICES"] = str(wid)
-                worker_threads = base_threads + (1 if wid < extra else 0)
+
+                if spec.get("kind") == "gpu" and spec.get("gpu_id") is not None:
+                    env["CUDA_VISIBLE_DEVICES"] = str(spec.get("gpu_id"))
+                else:
+                    env["CUDA_VISIBLE_DEVICES"] = ""
+
+                worker_threads = int(spec.get("threads") or base_threads)
+                worker_threads = max(1, worker_threads)
+                env["FOREX_BOT_CPU_BUDGET"] = str(worker_threads)
                 env["FOREX_BOT_CPU_THREADS"] = str(worker_threads)
                 for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
                     env[k] = str(worker_threads)
+
+                if spec.get("kind") == "gpu":
+                    max_concurrent = min(len(models), int(gpu_max_concurrent))
+                else:
+                    if cpu_max_concurrent is not None and cpu_max_concurrent > 0:
+                        max_concurrent = min(len(models), int(cpu_max_concurrent))
+                    else:
+                        max_concurrent = 0
 
                 cmd = [
                     sys.executable,
@@ -394,7 +609,11 @@ class ModelTrainer:
                     str(out_dir),
                     "--cpu-threads",
                     str(worker_threads),
+                    "--max-concurrent-models",
+                    str(max_concurrent),
                 ]
+                if metadata_path is not None and metadata_path.exists():
+                    cmd += ["--metadata-path", str(metadata_path)]
 
                 log_f = open(log_path, "w", encoding="utf-8")
                 try:
@@ -411,8 +630,15 @@ class ModelTrainer:
                     except Exception:
                         pass
                     raise
-                procs.append((wid, out_dir, proc, log_f))
-                logger.info(f"Worker {wid}: models={models} log={log_path}")
+                procs.append((label, out_dir, proc, log_f))
+                logger.info(
+                    "Worker %s (%s): models=%s threads=%s log=%s",
+                    label,
+                    spec.get("kind"),
+                    models,
+                    worker_threads,
+                    log_path,
+                )
 
             # Wait for completion / cancellation.
             while True:
@@ -423,7 +649,9 @@ class ModelTrainer:
                 time.sleep(5)
 
             failed = [
-                (wid, int(p.returncode)) for wid, _, p, _ in procs if (p.poll() is not None and p.returncode != 0)
+                (wid, int(p.returncode))
+                for wid, _, p, _ in procs
+                if (p.poll() is not None and p.returncode != 0)
             ]
             if failed:
                 logger.error(f"Parallel workers failed: {failed}. See logs under {logs_dir}")
@@ -490,6 +718,9 @@ class ModelTrainer:
         dataset: PreparedDataset,
         optimize: bool = True,
         stop_event: asyncio.Event | None = None,
+        models_override: list[str] | None = None,
+        exclude_models: list[str] | None = None,
+        memmap_dataset_dir: Path | str | None = None,
     ) -> None:
         logger.info("Starting training cycle...")
         # Enforce GPU-only mode when explicitly requested (or preference is GPU)
@@ -693,6 +924,18 @@ class ModelTrainer:
         # 4. Model Selection
         enabled_models = self._get_enabled_models()
         enabled_models = self._maybe_shard_models(enabled_models)
+        if models_override is not None:
+            override_ordered = [m for m in models_override if m in enabled_models]
+            if not override_ordered:
+                logger.warning("No override models available; skipping training.")
+                return
+            enabled_models = override_ordered
+        if exclude_models:
+            exclude_set = set(exclude_models)
+            enabled_models = [m for m in enabled_models if m not in exclude_set]
+            if not enabled_models:
+                logger.warning("All models excluded; skipping training.")
+                return
 
         # 5. Benchmark
         device = (
@@ -736,7 +979,14 @@ class ModelTrainer:
         trained_in_parallel = False
         if self._parallel_models_enabled(enabled_models):
             try:
-                durations = self._train_models_parallel(enabled_models, X_fit, y_fit, stop_event=stop_event)
+                durations = self._train_models_parallel(
+                    enabled_models,
+                    X_fit,
+                    y_fit,
+                    meta_fit=meta_fit_models,
+                    stop_event=stop_event,
+                    memmap_dataset_dir=memmap_dataset_dir,
+                )
                 trained_in_parallel = True
             except Exception as exc:
                 logger.warning(f"Parallel model training failed; falling back to sequential: {exc}", exc_info=True)
@@ -857,11 +1107,17 @@ class ModelTrainer:
                 except Exception:
                     cpu_threads = 0
                 if cpu_threads <= 0:
+                    try:
+                        cpu_threads = int(os.environ.get("FOREX_BOT_CPU_BUDGET", "0") or 0)
+                    except Exception:
+                        cpu_threads = 0
+                if cpu_threads <= 0:
                     cpu_total = multiprocessing.cpu_count()
-                    # CRITICAL FIX: Cap BLAS threads to avoid oversubscription
-                    # If training in parallel, each model gets fewer threads
-                    # Cap at 8 threads per model to prevent resource contention
-                    cpu_threads = min(8, cpu_total)
+                    try:
+                        reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
+                    except Exception:
+                        reserve = 1
+                    cpu_threads = max(1, cpu_total - max(0, reserve))
                 with thread_limits(blas_threads=cpu_threads):
                     # Fit logic (simplified here, assume factory configured it well)
                     fit_kwargs = {}
@@ -1206,7 +1462,23 @@ class ModelTrainer:
 
                 from ..core.system import thread_limits
 
-                with thread_limits(blas_threads=multiprocessing.cpu_count()):
+                try:
+                    cpu_threads = int(os.environ.get("FOREX_BOT_CPU_THREADS", "0") or 0)
+                except Exception:
+                    cpu_threads = 0
+                if cpu_threads <= 0:
+                    try:
+                        cpu_threads = int(os.environ.get("FOREX_BOT_CPU_BUDGET", "0") or 0)
+                    except Exception:
+                        cpu_threads = 0
+                if cpu_threads <= 0:
+                    cpu_total = multiprocessing.cpu_count()
+                    try:
+                        reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
+                    except Exception:
+                        reserve = 1
+                    cpu_threads = max(1, cpu_total - max(0, reserve))
+                with thread_limits(blas_threads=cpu_threads):
                     fit_kwargs = {}
                     # Inspect signature...
                     if hasattr(model, "fit"):

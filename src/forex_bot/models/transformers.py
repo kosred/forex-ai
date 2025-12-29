@@ -22,6 +22,7 @@ from .device import (
     select_device,
     tune_torch_backend,
 )
+from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
 
@@ -398,8 +399,11 @@ class TransformerExpertTorch(ExpertModel):
                 batch_size = max(16, min(self.batch_size, target_bs))
             except Exception:
                 pass
-        num_workers = max(0, min(os.cpu_count() or 0, 8) - 1) if is_cuda else 0
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        cpu_budget = resolve_cpu_budget()
+        if world_size > 1:
+            cpu_budget = max(1, cpu_budget // world_size)
+        num_workers = max(1, cpu_budget - 1) if is_cuda else 0
         sampler = torch.utils.data.distributed.DistributedSampler(train_ds) if world_size > 1 else None
         train_loader = DataLoader(
             train_ds,
@@ -579,7 +583,7 @@ class TransformerExpertTorch(ExpertModel):
                 batch_size=self.PRED_BATCH_SIZE,
                 shuffle=False,
                 pin_memory=pin_mem,
-                num_workers=max(0, min(os.cpu_count() or 0, 8) - 1) if is_cuda else 0,
+                num_workers=max(1, resolve_cpu_budget() - 1) if is_cuda else 0,
                 persistent_workers=is_cuda,
                 prefetch_factor=2 if is_cuda else None,
                 collate_fn=_collate_pred,

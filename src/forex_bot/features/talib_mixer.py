@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..core.system import resolve_cpu_budget
+
 # Optional Numba acceleration for signal combination
 try:  # pragma: no cover
     from numba import njit
@@ -162,10 +164,18 @@ class TALibStrategyMixer:
         self.use_volume_features = use_volume_features
         self._volume_indicators = set(TALIB_INDICATORS.get("volume", [])) | {"VWAP"}
 
-        # GPU flag is explicit to avoid surprise memory usage
+        # GPU flag is explicit to avoid surprise memory usage and indicator drift.
         self.device = device.lower()
-        self.use_gpu = self.device in ("cuda", "gpu") and CUPY_AVAILABLE
+        allow_gpu = str(os.environ.get("FOREX_BOT_TALIB_GPU", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.use_gpu = self.device in ("cuda", "gpu") and CUPY_AVAILABLE and allow_gpu
 
+        if self.device in ("cuda", "gpu") and not allow_gpu:
+            logger.info("TA-Lib mixer GPU disabled (FOREX_BOT_TALIB_GPU not set); using CPU.")
         if self.use_gpu and not CUPY_AVAILABLE:
             logger.warning("CUDA requested but CuPy not available; falling back to CPU.")
             self.use_gpu = False
@@ -892,22 +902,15 @@ class TALibStrategyMixer:
             or os.environ.get("FOREX_BOT_CPU_BUDGET")
             or os.environ.get("FOREX_BOT_CPU_THREADS")
         )
+        cpu_budget = resolve_cpu_budget()
         if env_workers:
             try:
-                # CRITICAL FIX: Cap environment variable to prevent unbounded workers
                 env_val = max(1, int(env_workers))
-                max_workers = min(32, env_val)  # Never exceed 32 workers
             except Exception:
-                max_workers = min(32, (os.cpu_count() or 1) * 2)
+                env_val = cpu_budget
+            max_workers = max(1, min(env_val, cpu_budget))
         else:
-            try:
-                cpu_budget = int(os.environ.get("FOREX_BOT_CPU_BUDGET", "0") or 0)
-            except Exception:
-                cpu_budget = 0
-            if cpu_budget > 0:
-                max_workers = max(1, min(cpu_budget, os.cpu_count() or 1, 32))  # Cap at 32
-            else:
-                max_workers = min(32, (os.cpu_count() or 1) * 2)
+            max_workers = max(1, cpu_budget)
         if mem.percent > 85:
             max_workers = max(1, max_workers // 2)
             logger.warning(f"High RAM ({mem.percent}%), throttling indicator calc to {max_workers} workers.")

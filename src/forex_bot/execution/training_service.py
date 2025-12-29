@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import concurrent.futures
+import gc
 import json
 import logging
 import multiprocessing
@@ -203,7 +205,13 @@ class TrainingService:
         try:
             import torch
 
-            mixer_device = "cuda" if torch.cuda.is_available() else "cpu"
+            allow_gpu = str(os.environ.get("FOREX_BOT_TALIB_GPU", "0") or "0").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            mixer_device = "cuda" if (allow_gpu and torch.cuda.is_available()) else "cpu"
         except Exception:
             mixer_device = "cpu"
 
@@ -474,6 +482,71 @@ class TrainingService:
         if "M1" in discovery_frames:
             logger.debug(f"M1 Columns: {len(discovery_frames['M1'].columns)}")
 
+        prop_task = None
+        if bool(getattr(self.settings.models, "prop_search_enabled", False)):
+            try:
+                from ..strategy.evo_prop import run_evo_search
+
+                base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
+                prop_df = frames.get(base_tf) or frames.get("M1")
+                if prop_df is not None and not prop_df.empty:
+                    try:
+                        max_rows = int(getattr(self.settings.models, "prop_search_max_rows", 0) or 0)
+                    except Exception:
+                        max_rows = 0
+                    if max_rows > 0 and len(prop_df) > max_rows:
+                        prop_df = prop_df.tail(max_rows)
+
+                    prop_settings = self.settings.model_copy()
+                    prop_device = str(
+                        getattr(self.settings.models, "prop_search_device", "cpu") or "cpu"
+                    )
+                    prop_settings.system.device = prop_device
+
+                    try:
+                        pop = int(getattr(self.settings.models, "prop_search_population", 64) or 64)
+                    except Exception:
+                        pop = 64
+                    try:
+                        gens = int(getattr(self.settings.models, "prop_search_generations", 50) or 50)
+                    except Exception:
+                        gens = 50
+                    try:
+                        max_hours = float(
+                            getattr(self.settings.models, "prop_search_max_hours", 1.0) or 1.0
+                        )
+                    except Exception:
+                        max_hours = 1.0
+                    checkpoint = str(
+                        getattr(
+                            self.settings.models,
+                            "prop_search_checkpoint",
+                            "models/strategy_evo_checkpoint.json",
+                        )
+                        or "models/strategy_evo_checkpoint.json"
+                    )
+                    try:
+                        actual_balance = float(
+                            getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0
+                        )
+                    except Exception:
+                        actual_balance = 100000.0
+
+                    loop = asyncio.get_running_loop()
+                    prop_task = loop.run_in_executor(
+                        None,
+                        run_evo_search,
+                        prop_df,
+                        prop_settings,
+                        pop,
+                        gens,
+                        checkpoint,
+                        max_hours,
+                        actual_balance,
+                    )
+            except Exception as exc:
+                logger.warning(f"Failed to start prop-aware search: {exc}")
+
         # New Unsupervised Tensor Engine (Million-Search)
         # We increase experts to 100 to create a diverse "Council of 100" for the deep models
         discovery_tensor = TensorDiscoveryEngine(
@@ -487,14 +560,37 @@ class TrainingService:
         
         # We need to pass the enriched multi-timeframe frames to the engine
         discovery_tensor.run_unsupervised_search(
-            discovery_frames, 
+            discovery_frames,
             news_features=news_feats,
             iterations=1000
         )
         discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(asyncio.to_thread(self.trainer.train_all, dataset, optimize, stop_event))
+        exclude_models = ["genetic"] if prop_task is not None else None
+        await asyncio.to_thread(
+            self.trainer.train_all,
+            dataset,
+            optimize,
+            stop_event,
+            None,
+            exclude_models,
+        )
+
+        if prop_task is not None:
+            try:
+                await prop_task
+            except Exception as exc:
+                logger.warning(f"Prop-aware search failed: {exc}")
+
+            # Train genetic last so it consumes the merged prop-aware portfolio.
+            await asyncio.to_thread(
+                self.trainer.train_all,
+                dataset,
+                False,
+                stop_event,
+                ["genetic"],
+                None,
+            )
 
 
         logger.info("Training cycle complete.")
@@ -805,10 +901,11 @@ class TrainingService:
         symbols: list[str],
         optimize: bool,
         stop_event: asyncio.Event | None,
-    ) -> None:
+        exclude_models: list[str] | None = None,
+    ) -> PreparedDataset | None:
         if not datasets:
             logger.error("Global training: no datasets provided.")
-            return
+            return None
 
         # Apply an additional cap here (covers HPC path and any callers that didn't cap during dataset creation).
         try:
@@ -832,7 +929,7 @@ class TrainingService:
         cols, aligned = self._align_global_feature_space(datasets)
         if not aligned:
             logger.error("Global training: all datasets failed to align.")
-            return
+            return None
 
         train_ratio = float(getattr(self.settings.models, "global_train_ratio", 0.8) or 0.8)
         train_ratio = float(min(0.95, max(0.50, train_ratio)))
@@ -848,20 +945,14 @@ class TrainingService:
         )
         if not train_parts:
             logger.error("Global training: no train splits produced.")
-            return
+            return None
         if not eval_map:
             logger.warning("Global training: no eval splits produced; metrics will be limited.")
 
-        # Pool training data.
-        X_parts: list[pd.DataFrame] = []
-        y_parts: list[pd.Series] = []
+        # Pool training data (streaming out-of-core to avoid RAM spikes).
         pooled_meta: list[pd.DataFrame] = []
         for sym, d in train_parts:
             X_part = d.X
-            y_part = d.y if isinstance(d.y, pd.Series) else pd.Series(d.y, index=X_part.index)
-            X_parts.append(X_part)
-            y_parts.append(y_part)
-
             if d.metadata is not None and isinstance(d.metadata, pd.DataFrame) and len(d.metadata) == len(X_part):
                 try:
                     m = d.metadata[["high", "low", "close"]].copy()
@@ -870,27 +961,136 @@ class TrainingService:
                 except Exception:
                     pass
 
-        # --- HPC HIGH-SPEED DATA CONSOLIDATION ---
         total_rows = sum(len(d.X) for _, d in train_parts)
         n_features = len(cols)
-        logger.info(f"HPC: Pre-allocating master matrix for {total_rows:,} rows...")
-        
-        # Pre-allocate large contiguous blocks
-        X_train_np = np.zeros((total_rows, n_features), dtype=np.float32)
-        y_train_np = np.zeros(total_rows, dtype=np.int8)
-        
-        current_offset = 0
-        for sym, d in train_parts:
-            n = len(d.X)
-            X_train_np[current_offset : current_offset + n] = d.X.to_numpy(dtype=np.float32)
-            y_train_np[current_offset : current_offset + n] = d.y.to_numpy(dtype=np.int8)
-            current_offset += n
-            
-        X_train = pd.DataFrame(X_train_np, columns=cols)
-        y_train = pd.Series(y_train_np)
-        
-        del X_train_np, y_train_np # Cleanup immediately
-        gc.collect()
+        if total_rows <= 0 or n_features <= 0:
+            logger.error("Global training: pooled dataset is empty.")
+            return None
+
+        use_memmap = str(os.environ.get("FOREX_BOT_GLOBAL_POOL_MEMMAP", "1") or "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        memmap_dir: Path | None = None
+        X_train: pd.DataFrame | None = None
+        y_train: pd.Series | None = None
+
+        if use_memmap:
+            try:
+                cache_root = Path(getattr(self.settings.system, "cache_dir", "cache")) / "global_pool"
+                run_id = f"{int(time.time())}_{os.getpid()}"
+                memmap_dir = cache_root / f"pool_{run_id}"
+                memmap_dir.mkdir(parents=True, exist_ok=True)
+
+                (memmap_dir / "columns.json").write_text(json.dumps(cols), encoding="utf-8")
+                index_kind = "datetime_ns"
+                try:
+                    if not all(isinstance(d.X.index, pd.DatetimeIndex) for _, d in train_parts):
+                        index_kind = "none"
+                except Exception:
+                    index_kind = "none"
+                (memmap_dir / "meta.json").write_text(
+                    json.dumps({"index_kind": index_kind}),
+                    encoding="utf-8",
+                )
+
+                x_path = memmap_dir / "X.npy"
+                y_path = memmap_dir / "y.npy"
+                idx_path = memmap_dir / "index.npy"
+
+                logger.info(
+                    f"GLOBAL: Streaming pooled dataset to memmap ({total_rows:,} rows, {n_features} features) at {memmap_dir}."
+                )
+
+                x_mm = np.lib.format.open_memmap(
+                    x_path, mode="w+", dtype=np.float32, shape=(total_rows, n_features)
+                )
+                y_mm = np.lib.format.open_memmap(
+                    y_path, mode="w+", dtype=np.int8, shape=(total_rows,)
+                )
+                idx_mm = None
+                if index_kind != "none":
+                    idx_mm = np.lib.format.open_memmap(
+                        idx_path, mode="w+", dtype=np.int64, shape=(total_rows,)
+                    )
+
+                try:
+                    chunk = int(os.environ.get("FOREX_BOT_MEMMAP_CHUNK_ROWS", "250000") or 250000)
+                except Exception:
+                    chunk = 250000
+                chunk = max(10_000, min(chunk, max(10_000, total_rows)))
+
+                offset = 0
+                for _sym, d in train_parts:
+                    X_src = d.X
+                    y_src = d.y if isinstance(d.y, pd.Series) else pd.Series(d.y, index=X_src.index)
+                    n = len(X_src)
+                    if n <= 0:
+                        continue
+                    for start in range(0, n, chunk):
+                        end = min(n, start + chunk)
+                        x_mm[offset + start : offset + end] = X_src.iloc[start:end].to_numpy(
+                            dtype=np.float32, copy=False
+                        )
+                        y_mm[offset + start : offset + end] = y_src.iloc[start:end].to_numpy(
+                            dtype=np.int8, copy=False
+                        )
+                        if idx_mm is not None:
+                            idx_slice = X_src.index[start:end]
+                            if isinstance(idx_slice, pd.DatetimeIndex):
+                                idx_mm[offset + start : offset + end] = idx_slice.view("int64")
+                            else:
+                                idx_mm[offset + start : offset + end] = np.asarray(
+                                    idx_slice, dtype=np.int64
+                                )
+                    offset += n
+
+                x_mm.flush()
+                y_mm.flush()
+                if idx_mm is not None:
+                    idx_mm.flush()
+
+                X_mm = np.load(x_path, mmap_mode="c")
+                y_loaded = np.load(y_path, mmap_mode="c")
+                index = None
+                if index_kind != "none" and idx_path.exists():
+                    try:
+                        idx_ns = np.load(idx_path, mmap_mode="r")
+                        index = pd.to_datetime(idx_ns.astype(np.int64), utc=True)
+                    except Exception:
+                        index = None
+                X_train = pd.DataFrame(X_mm, columns=cols, index=index)
+                y_train = pd.Series(y_loaded, index=X_train.index, dtype=np.int8)
+            except Exception as exc:
+                logger.warning(
+                    f"Global memmap pooling failed; falling back to in-memory: {exc}",
+                    exc_info=True,
+                )
+                memmap_dir = None
+                X_train = None
+                y_train = None
+
+        if X_train is None or y_train is None:
+            logger.info(
+                f"HPC: Pre-allocating master matrix for {total_rows:,} rows (in-memory fallback)."
+            )
+            X_train_np = np.zeros((total_rows, n_features), dtype=np.float32)
+            y_train_np = np.zeros(total_rows, dtype=np.int8)
+
+            current_offset = 0
+            for _sym, d in train_parts:
+                n = len(d.X)
+                X_train_np[current_offset : current_offset + n] = d.X.to_numpy(dtype=np.float32)
+                y_train_np[current_offset : current_offset + n] = d.y.to_numpy(dtype=np.int8)
+                current_offset += n
+
+            X_train = pd.DataFrame(X_train_np, columns=cols)
+            y_train = pd.Series(y_train_np)
+
+            del X_train_np, y_train_np
+            gc.collect()
 
         meta_train: pd.DataFrame | None = None
         if pooled_meta:
@@ -930,11 +1130,19 @@ class TrainingService:
             f"GLOBAL: Training pooled dataset (symbols={len(train_parts)}, rows={len(full_ds.X):,}, "
             f"features={len(full_ds.feature_names)})"
         )
-        await asyncio.to_thread(self.trainer.train_all, full_ds, optimize, stop_event)
+        await asyncio.to_thread(
+            self.trainer.train_all,
+            full_ds,
+            optimize,
+            stop_event,
+            None,
+            exclude_models,
+            memmap_dataset_dir=memmap_dir,
+        )
 
         # Post-train: evaluate each trained model out-of-sample per symbol.
         if stop_event and stop_event.is_set():
-            return
+            return full_ds
 
         try:
             import inspect
@@ -1103,6 +1311,8 @@ class TrainingService:
         except Exception as exc:
             logger.warning(f"Global post-train evaluation skipped: {exc}", exc_info=True)
 
+        return full_ds
+
     async def _train_global_hpc(self, symbols: list[str], optimize: bool, stop_event: asyncio.Event | None) -> None:
         logger.info("?? HPC Mode Active: Switching to Parallel Global Training.")
 
@@ -1149,12 +1359,84 @@ class TrainingService:
                 logger.info(f"HPC: Ready data for {sym}")
 
             # 2. Hyper-Parallel Feature Engineering (ZERO-COPY HPC)
-            max_workers = int(os.environ.get("FOREX_BOT_FEATURE_WORKERS", 252))
-            logger.info(f"HPC: Initializing Zero-Copy Sharding for {max_workers} cores...")
+            cpu_total = max(1, os.cpu_count() or 1)
+            cpu_reserve = self._parse_int_env("FOREX_BOT_CPU_RESERVE")
+            if cpu_reserve is None:
+                cpu_reserve = 1
+            cpu_budget_env = self._parse_int_env("FOREX_BOT_CPU_BUDGET")
+            if cpu_budget_env is not None and cpu_budget_env > 0:
+                cpu_budget = max(1, min(cpu_total, cpu_budget_env))
+            else:
+                cpu_budget = max(1, cpu_total - max(0, cpu_reserve))
+
+            per_worker_gb = 2.0
+            try:
+                per_worker_gb = float(os.environ.get("FOREX_BOT_FEATURE_WORKER_GB", "2.0") or 2.0)
+            except Exception:
+                per_worker_gb = 2.0
+
+            available_gb = None
+            with contextlib.suppress(Exception):
+                import psutil
+
+                available_gb = float(psutil.virtual_memory().available) / (1024**3)
+            if available_gb is None:
+                try:
+                    available_gb = float(os.environ.get("FOREX_BOT_RAM_GB", 0) or 0)
+                except Exception:
+                    available_gb = 0.0
+            if available_gb <= 0:
+                available_gb = 16.0
+
+            max_ram_workers = int(available_gb // max(0.5, per_worker_gb))
+            requested_workers = self._parse_int_env("FOREX_BOT_FEATURE_WORKERS")
+            if requested_workers is not None and requested_workers > 0:
+                max_workers = max(1, min(cpu_budget, requested_workers))
+                recommended = max(1, min(cpu_budget, max_ram_workers))
+                if max_workers > recommended:
+                    logger.warning(
+                        "HPC: Requested %s feature workers exceeds RAM-safe "
+                        "recommendation %s (available_ram=%.1fGB, per_worker_gb=%.2f).",
+                        max_workers,
+                        recommended,
+                        available_gb,
+                        per_worker_gb,
+                    )
+            else:
+                max_workers = max(1, min(cpu_budget, max_ram_workers))
+
+            feature_threads = self._parse_int_env("FOREX_BOT_FEATURE_WORKER_THREADS")
+            if feature_threads is not None and feature_threads > 0:
+                max_workers = max(1, min(max_workers, max(1, cpu_budget // feature_threads)))
+                worker_threads = max(1, feature_threads)
+            else:
+                worker_threads = max(1, cpu_budget // max_workers)
+
+            os.environ.setdefault("FOREX_BOT_FEATURE_WORKERS", str(max_workers))
+            logger.info(
+                "HPC: Initializing Zero-Copy Sharding for %s workers "
+                "(cpu_budget=%s, threads/worker=%s, available_ram=%.1fGB).",
+                max_workers,
+                cpu_budget,
+                worker_threads,
+                available_gb,
+            )
             
             # Implementation Note: We use a simplified sharding for now to avoid complexity,
             # but we force the workers to use the shared RAM space.
+            gpu_count = 0
+            force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+            if not force_cpu:
+                with contextlib.suppress(Exception):
+                    import torch
+
+                    if torch.cuda.is_available():
+                        gpu_count = int(torch.cuda.device_count())
+
             all_tasks = []
+            shards_by_symbol: dict[str, int] = {}
             for sym, frames in raw_frames_map.items():
                 base_df = frames.get(self.settings.system.base_timeframe)
                 if base_df is None or (isinstance(base_df, pd.DataFrame) and base_df.empty):
@@ -1164,17 +1446,19 @@ class TrainingService:
                 
                 # Shard each symbol into 32 time-slices
                 n_shards = max(1, max_workers // len(symbols))
+                shards_by_symbol[sym] = n_shards
                 chunk_indices = np.array_split(np.arange(len(base_df)), n_shards)
                 
                 for i, idx_range in enumerate(chunk_indices):
                     if len(idx_range) == 0: continue
                     # Extract slice
                     chunk_frames = {tf: df.iloc[idx_range[0]:idx_range[-1]+1] for tf, df in frames.items()}
+                    assigned_gpu = (len(all_tasks) % gpu_count) if gpu_count > 0 else 0
                     all_tasks.append({
                         "sym": sym,
                         "frames": chunk_frames,
                         "shard_id": i,
-                        "gpu": (len(all_tasks) % 8)
+                        "gpu": assigned_gpu
                     })
 
             logger.info(f"HPC: Dispatching {len(all_tasks)} zero-copy tasks...")
@@ -1185,12 +1469,13 @@ class TrainingService:
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
                 futures = {
                     executor.submit(
-                        _hpc_feature_worker, 
-                        self.settings.model_copy(), 
-                        t["frames"], 
-                        t["sym"], 
+                        _hpc_feature_worker,
+                        self.settings.model_copy(),
+                        t["frames"],
+                        t["sym"],
                         news_map.get(t["sym"]),
-                        t["gpu"]
+                        t["gpu"],
+                        worker_threads,
                     ): t for t in all_tasks
                 }
                 for fut in concurrent.futures.as_completed(futures):
@@ -1210,8 +1495,12 @@ class TrainingService:
                     logger.error(f"HPC FAILURE: All shards for {sym} failed! Skipping symbol.")
                     continue
                 
-                if len(sym_parts) < n_shards:
-                    logger.warning(f"HPC WARNING: Only {len(sym_parts)}/{n_shards} shards succeeded for {sym}. Proceeding with partial data.")
+                expected_shards = shards_by_symbol.get(sym, n_shards)
+                if len(sym_parts) < expected_shards:
+                    logger.warning(
+                        f"HPC WARNING: Only {len(sym_parts)}/{expected_shards} shards succeeded for {sym}. "
+                        "Proceeding with partial data."
+                    )
                 
                 # Re-assemble using only valid parts
                 try:
@@ -1259,12 +1548,96 @@ class TrainingService:
             raw_frames, None, target_sym, base_dataset=target_ds
         )
 
+        prop_task = None
+        if bool(getattr(self.settings.models, "prop_search_enabled", False)):
+            try:
+                from ..strategy.evo_prop import run_evo_search
+
+                base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
+                prop_df = raw_frames.get(base_tf) or raw_frames.get("M1")
+                if prop_df is not None and not prop_df.empty:
+                    try:
+                        max_rows = int(getattr(self.settings.models, "prop_search_max_rows", 0) or 0)
+                    except Exception:
+                        max_rows = 0
+                    if max_rows > 0 and len(prop_df) > max_rows:
+                        prop_df = prop_df.tail(max_rows)
+
+                    prop_settings = self.settings.model_copy()
+                    prop_device = str(
+                        getattr(self.settings.models, "prop_search_device", "cpu") or "cpu"
+                    )
+                    prop_settings.system.device = prop_device
+
+                    try:
+                        pop = int(getattr(self.settings.models, "prop_search_population", 64) or 64)
+                    except Exception:
+                        pop = 64
+                    try:
+                        gens = int(getattr(self.settings.models, "prop_search_generations", 50) or 50)
+                    except Exception:
+                        gens = 50
+                    try:
+                        max_hours = float(
+                            getattr(self.settings.models, "prop_search_max_hours", 1.0) or 1.0
+                        )
+                    except Exception:
+                        max_hours = 1.0
+                    checkpoint = str(
+                        getattr(
+                            self.settings.models,
+                            "prop_search_checkpoint",
+                            "models/strategy_evo_checkpoint.json",
+                        )
+                        or "models/strategy_evo_checkpoint.json"
+                    )
+                    try:
+                        actual_balance = float(
+                            getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0
+                        )
+                    except Exception:
+                        actual_balance = 100000.0
+
+                    loop = asyncio.get_running_loop()
+                    prop_task = loop.run_in_executor(
+                        None,
+                        run_evo_search,
+                        prop_df,
+                        prop_settings,
+                        pop,
+                        gens,
+                        checkpoint,
+                        max_hours,
+                        actual_balance,
+                    )
+            except Exception as exc:
+                logger.warning(f"Failed to start prop-aware search: {exc}")
+
         discovery_tensor = TensorDiscoveryEngine(n_experts=100, timeframes=timeframes)
         discovery_tensor.run_unsupervised_search(discovery_frames, iterations=1000)
         discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
         # --- Final Global Training ---
-        await self._train_global_from_datasets(datasets, symbols, optimize, stop_event)
+        exclude_models = ["genetic"] if prop_task is not None else None
+        full_ds = await self._train_global_from_datasets(
+            datasets, symbols, optimize, stop_event, exclude_models=exclude_models
+        )
+
+        if prop_task is not None:
+            try:
+                await prop_task
+            except Exception as exc:
+                logger.warning(f"Prop-aware search failed: {exc}")
+
+            if full_ds is not None:
+                await asyncio.to_thread(
+                    self.trainer.train_all,
+                    full_ds,
+                    False,
+                    stop_event,
+                    ["genetic"],
+                    None,
+                )
 
     async def _train_global_sequential(
         self, symbols: list[str], optimize: bool, stop_event: asyncio.Event | None
@@ -1341,17 +1714,18 @@ class TrainingService:
 
 
 # Standalone worker function for ProcessPoolExecutor (must be picklable)
-def _hpc_feature_worker(settings, frames, sym, news_features=None, assigned_gpu=0):
+def _hpc_feature_worker(settings, frames, sym, news_features=None, assigned_gpu=0, worker_threads=1):
     try:
         import sys
         import os
         from pathlib import Path
 
         # Limit internal math threads to 1 per worker to prevent thrashing
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["MKL_NUM_THREADS"] = "1"
-        os.environ["NUMEXPR_NUM_THREADS"] = "1"
-        os.environ["NUMEXPR_MAX_THREADS"] = "64"
+        threads = max(1, int(worker_threads or 1))
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+        os.environ["MKL_NUM_THREADS"] = str(threads)
+        os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
+        os.environ["NUMEXPR_MAX_THREADS"] = str(threads)
 
         # Optionally force CPU-only feature engineering to avoid GPU OOM in workers.
         force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {

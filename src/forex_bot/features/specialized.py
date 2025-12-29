@@ -189,8 +189,8 @@ def add_smc_features(
     """
     Add Smart Money Concepts (SMC) features to dataframe.
 
-    NOTE: CUDA implementation has been removed as it was slower than CPU.
-    Always uses Numba CPU parallelization which is faster for typical data sizes.
+    NOTE: CPU (Numba) is the default and preferred path for accuracy/stability.
+    CUDA is optional and will fall back to CPU if unavailable or unstable.
     """
     try:
         open_Arr = df["open"].values.astype(np.float32)
@@ -199,7 +199,8 @@ def add_smc_features(
         close_Arr = df["close"].values.astype(np.float32)
         atr_Arr = df["atr"].values.astype(np.float32) if "atr" in df.columns else np.zeros_like(close_Arr)
 
-        if prefer_gpu and CUDA_AVAILABLE:
+        use_cuda = prefer_gpu and CUDA_AVAILABLE
+        if use_cuda:
             try:
                 fvg, sweep, ob, bos, choch, trend, dist_liq, dist_fvg, pd_zone, inducement = _compute_smc_cuda(
                     open_Arr,
@@ -214,10 +215,9 @@ def add_smc_features(
                 )
             except Exception as exc:
                 logger.warning(f"SMC CUDA failed, falling back to CPU: {exc}")
-                fvg = sweep = ob = bos = choch = trend = dist_liq = dist_fvg = pd_zone = inducement = np.zeros_like(
-                    close_Arr
-                )
-        elif NUMBA_AVAILABLE:
+                use_cuda = False
+
+        if not use_cuda and NUMBA_AVAILABLE:
             fvg, sweep, ob, bos, choch, trend, dist_liq, dist_fvg, pd_zone, inducement = _compute_smc_numba(
                 open_Arr,
                 high_Arr,
@@ -229,7 +229,7 @@ def add_smc_features(
                 atr_displacement=atr_displacement,
                 max_levels=max_levels,
             )
-        else:
+        elif not use_cuda:
             logger.warning("Numba not available, SMC features will be zeros")
             fvg = sweep = ob = bos = choch = trend = dist_liq = dist_fvg = pd_zone = inducement = np.zeros_like(
                 close_Arr

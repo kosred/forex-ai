@@ -12,11 +12,20 @@ import shutil
 from pathlib import Path
 
 # --- 0. HPC GLOBAL ENVIRONMENT (NO MANUAL EXPORTS NEEDED) ---
-os.environ["NUMEXPR_MAX_THREADS"] = "64"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# Respect user overrides, otherwise default to (cores - reserve).
+cpu_total = os.cpu_count() or 1
+try:
+    cpu_reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
+except Exception:
+    cpu_reserve = 1
+cpu_budget = max(1, cpu_total - max(0, cpu_reserve))
+os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
+os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(cpu_budget))
+os.environ.setdefault("NUMEXPR_MAX_THREADS", str(cpu_budget))
+os.environ.setdefault("OMP_NUM_THREADS", str(cpu_budget))
+os.environ.setdefault("MKL_NUM_THREADS", str(cpu_budget))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cpu_budget))
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # NCCL optimizations for 8x A6000 P2P topology
 os.environ["NCCL_P2P_LEVEL"] = "5"
 os.environ["NCCL_IB_DISABLE"] = "1"

@@ -2,6 +2,7 @@ import concurrent.futures
 import json
 import logging
 import multiprocessing
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ import pandas as pd
 import torch.distributed as dist
 
 from ..core.config import Settings
+from ..core.system import resolve_cpu_budget
 from ..features.talib_mixer import TALIB_AVAILABLE, TALibStrategyMixer
 from .fast_backtest import fast_evaluate_strategy, infer_pip_metrics
 from .stop_target import infer_stop_target_pips
@@ -85,16 +87,27 @@ class PropAwareStrategySearch:
         self.world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
         if max_workers is None:
             try:
-                cpu_total = multiprocessing.cpu_count()
-                # CRITICAL FIX: Cap max_workers to prevent process explosion
-                # On 252 cores, cpu_total - 1 = 251 workers!
-                # Use safe formula: min(8, cpu_total - 1)
-                self.max_workers = max(1, min(8, cpu_total - 1))
+                self.max_workers = resolve_cpu_budget()
             except Exception:
                 self.max_workers = 1
         else:
-            # CRITICAL FIX: Cap user-provided max_workers too
-            self.max_workers = max(1, min(8, int(max_workers)))
+            try:
+                cpu_total = multiprocessing.cpu_count()
+            except Exception:
+                cpu_total = 1
+            self.max_workers = max(1, min(cpu_total, int(max_workers)))
+        try:
+            self._prop_portfolio_size = int(
+                getattr(self.settings.models, "prop_search_portfolio_size", 100) or 100
+            )
+        except Exception:
+            self._prop_portfolio_size = 100
+        try:
+            self._prop_min_trades = int(
+                getattr(self.settings.models, "prop_min_trades", 0) or 0
+            )
+        except Exception:
+            self._prop_min_trades = 0
 
     def _load_checkpoint(self) -> None:
         if not self.checkpoint_path.exists():
@@ -269,7 +282,14 @@ class PropAwareStrategySearch:
             return
             
         max_workers = self.max_workers or 1
-        spawn_ctx = multiprocessing.get_context("spawn")
+        ctx_name = str(os.environ.get("FOREX_BOT_PROP_MP_CONTEXT", "auto") or "auto").strip().lower()
+        if ctx_name == "auto":
+            # Prefer fork on Unix for copy-on-write to reduce RAM, unless GPU is used.
+            if os.name != "nt" and not getattr(self.mixer, "use_gpu", False):
+                ctx_name = "fork"
+            else:
+                ctx_name = "spawn"
+        spawn_ctx = multiprocessing.get_context(ctx_name)
         
         # HPC: True Multi-Process Evaluation
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as ex:
@@ -338,6 +358,108 @@ class PropAwareStrategySearch:
             best_fit = self.fitness_cache.get(best_gene.strategy_id, FitnessResult(0, 0, 1, 0, 0, 0, 0, 0, 0, 0))
         return best_gene, best_fit
 
+    def _gene_payload(self, gene: GeneticGene, fit: FitnessResult | None) -> dict[str, Any]:
+        return {
+            "indicators": list(getattr(gene, "indicators", []) or []),
+            "params": dict(getattr(gene, "params", {}) or {}),
+            "combination_method": getattr(gene, "combination_method", "weighted_vote"),
+            "long_threshold": float(getattr(gene, "long_threshold", 0.6)),
+            "short_threshold": float(getattr(gene, "short_threshold", -0.6)),
+            "weights": dict(getattr(gene, "weights", {}) or {}),
+            "preferred_regime": getattr(gene, "preferred_regime", "any"),
+            "fitness": float(getattr(fit, "fitness", 0.0)) if fit else float(getattr(gene, "fitness", 0.0)),
+            "sharpe_ratio": float(getattr(fit, "sharpe", getattr(gene, "sharpe_ratio", 0.0))) if fit else float(getattr(gene, "sharpe_ratio", 0.0)),
+            "win_rate": float(getattr(fit, "win_rate", getattr(gene, "win_rate", 0.0))) if fit else float(getattr(gene, "win_rate", 0.0)),
+            "profit_factor": float(getattr(fit, "profit_factor", getattr(gene, "profit_factor", 0.0))) if fit else float(getattr(gene, "profit_factor", 0.0)),
+            "expectancy": float(getattr(fit, "expectancy", getattr(gene, "expectancy", 0.0))) if fit else float(getattr(gene, "expectancy", 0.0)),
+            "max_dd": float(getattr(fit, "max_dd", getattr(gene, "max_drawdown", 0.0))) if fit else float(getattr(gene, "max_drawdown", 0.0)),
+            "trades": int(getattr(fit, "trades", getattr(gene, "trades_count", 0))) if fit else int(getattr(gene, "trades_count", 0)),
+            "strategy_id": getattr(gene, "strategy_id", ""),
+            "use_ob": bool(getattr(gene, "use_ob", False)),
+            "use_fvg": bool(getattr(gene, "use_fvg", False)),
+            "use_liq_sweep": bool(getattr(gene, "use_liq_sweep", False)),
+            "mtf_confirmation": bool(getattr(gene, "mtf_confirmation", False)),
+            "use_premium_discount": bool(getattr(gene, "use_premium_discount", False)),
+            "use_inducement": bool(getattr(gene, "use_inducement", False)),
+            "tp_pips": float(getattr(gene, "tp_pips", 40.0)),
+            "sl_pips": float(getattr(gene, "sl_pips", 20.0)),
+            "source": "propaware",
+        }
+
+    def export_portfolio(self, cache_dir: Path, *, merge: bool = True, max_genes: int | None = None) -> int:
+        max_genes = int(max_genes or self._prop_portfolio_size or 100)
+        if not self.evolver.population:
+            return 0
+
+        # Build payloads for top strategies
+        sorted_pop = sorted(self.evolver.population, key=lambda g: g.fitness, reverse=True)
+        payloads: list[dict[str, Any]] = []
+        for gene in sorted_pop:
+            fit = self.fitness_cache.get(gene.strategy_id)
+            if self._prop_min_trades > 0 and fit and fit.trades < self._prop_min_trades:
+                continue
+            payloads.append(self._gene_payload(gene, fit))
+            if len(payloads) >= max_genes:
+                break
+
+        if not payloads:
+            return 0
+
+        knowledge_path = cache_dir / "talib_knowledge.json"
+        combined = payloads
+
+        if merge and knowledge_path.exists():
+            try:
+                existing = json.loads(knowledge_path.read_text())
+                existing_genes = []
+                if isinstance(existing, dict):
+                    if "best_genes" in existing:
+                        existing_genes = list(existing.get("best_genes") or [])
+                    elif "best_gene" in existing:
+                        existing_genes = [existing.get("best_gene")]
+                if existing_genes:
+                    combined = existing_genes + payloads
+            except Exception as exc:
+                logger.warning(f"Failed to read existing knowledge for merge: {exc}")
+
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for gene in combined:
+            if not isinstance(gene, dict):
+                continue
+            key = str(gene.get("strategy_id") or "")
+            if not key:
+                key = json.dumps(
+                    {
+                        "indicators": gene.get("indicators", []),
+                        "params": gene.get("params", {}),
+                        "long_threshold": gene.get("long_threshold", 0.0),
+                        "short_threshold": gene.get("short_threshold", 0.0),
+                        "weights": gene.get("weights", {}),
+                    },
+                    sort_keys=True,
+                )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(gene)
+
+        deduped.sort(key=lambda g: float(g.get("fitness", 0.0) or 0.0), reverse=True)
+        deduped = deduped[:max_genes]
+
+        payload = {
+            "best_genes": deduped,
+            "timestamp": pd.Timestamp.now().isoformat(),
+            "sources": {
+                "propaware": len(payloads),
+                "merged_total": len(deduped),
+            },
+        }
+        knowledge_path.parent.mkdir(parents=True, exist_ok=True)
+        knowledge_path.write_text(json.dumps(payload, indent=2))
+        logger.info("Prop-aware portfolio merged into %s (%s strategies).", knowledge_path, len(deduped))
+        return len(deduped)
+
 
 def run_evo_search(
     ohlcv: pd.DataFrame,
@@ -357,4 +479,10 @@ def run_evo_search(
         max_time_hours=max_time_hours,
         actual_balance=actual_balance,
     )
-    return search.run(generations=generations)
+    result = search.run(generations=generations)
+    try:
+        cache_dir = Path(getattr(settings.system, "cache_dir", "cache"))
+        search.export_portfolio(cache_dir, merge=True)
+    except Exception as exc:
+        logger.warning(f"Failed to export prop-aware portfolio: {exc}")
+    return result

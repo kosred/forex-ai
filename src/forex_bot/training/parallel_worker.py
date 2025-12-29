@@ -78,6 +78,8 @@ def run_worker(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", required=True, help="Comma-separated model names to train")
     parser.add_argument("--out-dir", required=True, help="Directory to save trained model artifacts")
     parser.add_argument("--cpu-threads", type=int, default=0, help="BLAS/OMP threads to use (0=auto)")
+    parser.add_argument("--max-concurrent-models", type=int, default=0, help="Max models to train concurrently (0=auto)")
+    parser.add_argument("--metadata-path", default="", help="Optional path to metadata pickle for model.fit")
     args = parser.parse_args(argv)
 
     models = [m.strip() for m in str(args.models).split(",") if m.strip()]
@@ -103,16 +105,38 @@ def run_worker(argv: list[str] | None = None) -> int:
     cpu_total = max(1, os.cpu_count() or 1)
     cpu_threads = int(args.cpu_threads or 0)
     if cpu_threads <= 0:
-        # Safe default: cap at 8 threads to work on any hardware
-        cpu_threads = max(1, min(8, cpu_total, int(os.environ.get("FOREX_BOT_CPU_THREADS", "8"))))
+        env_threads = os.environ.get("FOREX_BOT_CPU_THREADS") or os.environ.get("FOREX_BOT_CPU_BUDGET")
+        try:
+            cpu_threads = int(env_threads) if env_threads else cpu_total
+        except Exception:
+            cpu_threads = cpu_total
+        cpu_threads = max(1, min(cpu_total, cpu_threads))
 
     durations: dict[str, float] = {}
     trained: list[str] = []
 
-    # HPC FIX: Parallel Model Training Within Worker (Thread-Safe)
-    # Use ThreadPoolExecutor for cross-platform compatibility
+    # Optional metadata for OHLC-dependent models
+    metadata = None
+    if args.metadata_path:
+        try:
+            meta_path = Path(str(args.metadata_path))
+            if meta_path.exists():
+                metadata = pd.read_pickle(meta_path)
+        except Exception:
+            metadata = None
+
+    # Parallel Model Training Within Worker (Thread-Safe)
     # NumPy/sklearn release GIL during heavy computation, so threads work well
-    max_concurrent_models = min(4, len(models), max(1, cpu_threads // 2))
+    max_concurrent_models = int(args.max_concurrent_models or 0)
+    if max_concurrent_models <= 0:
+        # Auto: scale to available threads with a minimum threads-per-model target
+        try:
+            min_threads = int(os.environ.get("FOREX_BOT_CPU_MIN_THREADS_PER_MODEL", "1") or 1)
+        except Exception:
+            min_threads = 1
+        min_threads = max(1, min_threads)
+        max_concurrent_models = max(1, min(len(models), cpu_threads // min_threads))
+    max_concurrent_models = max(1, min(len(models), max_concurrent_models))
     threads_per_model = max(1, cpu_threads // max(1, max_concurrent_models))
 
     logger.info(f"[WORKER] Training {len(models)} models with {max_concurrent_models} concurrent, "
@@ -124,7 +148,20 @@ def run_worker(argv: list[str] | None = None) -> int:
         try:
             model = factory.create_model(name, best_params, idx)
             with thread_limits(blas_threads=threads_per_model):
-                model.fit(X, y)
+                fit_kwargs = {}
+                if metadata is not None:
+                    try:
+                        import inspect
+
+                        sig = inspect.signature(model.fit)
+                        has_kwargs = any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                        )
+                        if "metadata" in sig.parameters or has_kwargs:
+                            fit_kwargs["metadata"] = metadata
+                    except Exception:
+                        pass
+                model.fit(X, y, **fit_kwargs)
             model.save(str(out_dir))
             duration = time.perf_counter() - t0
             logger.info(f"[WORKER] Successfully trained {name} in {duration:.1f}s")

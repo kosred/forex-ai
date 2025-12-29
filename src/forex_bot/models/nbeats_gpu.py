@@ -20,6 +20,7 @@ from .device import (
     tune_torch_backend,
     wrap_ddp,
 )
+from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
 
@@ -168,9 +169,10 @@ class NBeatsExpert(ExpertModel):
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
         sampler = torch.utils.data.distributed.DistributedSampler(dataset) if world_size > 1 else None
         # GPU Optimization with spawn context to avoid CUDA fork issues
-        num_workers = max(1, min(os.cpu_count() or 4, 8)) if is_cuda else 0
+        cpu_budget = resolve_cpu_budget()
         if world_size > 1:
-            num_workers = max(1, num_workers // world_size)
+            cpu_budget = max(1, cpu_budget // world_size)
+        num_workers = max(1, cpu_budget - 1) if is_cuda else 0
         loader_kwargs = {
             "batch_size": max(1, eff_batch // max(1, world_size)),
             "shuffle": (sampler is None),
@@ -184,7 +186,7 @@ class NBeatsExpert(ExpertModel):
             loader_kwargs["multiprocessing_context"] = "spawn"
         loader = DataLoader(dataset, **loader_kwargs)
 
-        fused_ok = is_cuda and hasattr(optim.AdamW, "fused") and "fused" in optim.AdamW.__init__.__code__.co_varnames
+        fused_ok = is_cuda and "fused" in optim.AdamW.__init__.__code__.co_varnames
         optimizer = (
             optim.AdamW(self.model.parameters(), lr=self.lr, fused=fused_ok)
             if fused_ok

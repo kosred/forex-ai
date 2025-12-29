@@ -9,6 +9,7 @@ import pandas as pd
 
 from .base import ExpertModel
 from .device import select_device, tune_torch_backend
+from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +163,8 @@ class TabNetExpert(ExpertModel):
         else:
             logger.warning("TabNet callbacks unavailable; time-limit enforcement disabled.")
 
-        num_workers = min(os.cpu_count() or 4, 8) if device_name == "cuda" else 0
+        cpu_budget = resolve_cpu_budget()
+        num_workers = max(1, cpu_budget - 1) if device_name == "cuda" else 0
         try:
             self.model.fit(
                 X_train=x_train,

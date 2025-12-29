@@ -39,6 +39,7 @@ from .base import (
     validate_time_ordering,
 )
 from .device import gpu_supports_bf16, maybe_init_distributed, select_device, tune_torch_backend, wrap_ddp
+from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,11 @@ class NBeatsExpert(ExpertModel):
 
         dataset = TensorDataset(X_t, y_t)
         is_cuda = torch.cuda.is_available() and str(self.device).startswith("cuda")
-        num_workers = max(0, min(os.cpu_count() or 0, 4) - 1) if is_cuda else 0
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        cpu_budget = resolve_cpu_budget()
+        if world_size > 1:
+            cpu_budget = max(1, cpu_budget // world_size)
+        num_workers = max(0, cpu_budget - 1) if is_cuda else 0
         loader = DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -237,17 +242,33 @@ class NBeatsExpert(ExpertModel):
 
             epoch_loss = 0.0
             steps = 0
-            # HPC: Robust Volatility Weighting
-            # Locating 'returns' feature (assuming it's normalized near 0)
-            # We use a safer approach: compute per-sample importance based on label rarity
-            with torch.no_grad():
-                # Penalize errors on actual trade signals more than noise
-                vol_weight = torch.ones(len(by), device=self.device)
-                vol_weight[by != 1] *= 1.5 # Boost importance of trade signals (0, 2)
-                
-                # If feature 0 is indeed returns (high correlation check), use it
-                if torch.std(bx[:, 0]) < 5.0: # Sanity check for normalized returns
-                    vol_weight += torch.abs(bx[:, 0]) * 5.0
+            for bx, by in loader:
+                if is_cuda:
+                    bx = bx.to(self.device, non_blocking=True)
+                    by = by.to(self.device, non_blocking=True)
+                else:
+                    bx = bx.to(self.device)
+                    by = by.to(self.device)
+
+                # HPC: Robust Volatility Weighting
+                # Locating 'returns' feature (assuming it's normalized near 0)
+                # We use a safer approach: compute per-sample importance based on label rarity
+                with torch.no_grad():
+                    # Penalize errors on actual trade signals more than noise
+                    vol_weight = torch.ones(len(by), device=self.device)
+                    vol_weight[by != 1] *= 1.5  # Boost importance of trade signals (0, 2)
+
+                    # If feature 0 is indeed returns (high correlation check), use it
+                    if torch.std(bx[:, 0]) < 5.0:  # Sanity check for normalized returns
+                        vol_weight += torch.abs(bx[:, 0]) * 5.0
+
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                    logits = self.model(bx)
+                    raw_loss = nn.functional.cross_entropy(
+                        logits, by, weight=class_weights, reduction="none"
+                    )
+                    loss = (raw_loss * vol_weight).mean()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -445,6 +466,7 @@ class TiDEExpert(ExpertModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        is_cuda = torch.cuda.is_available() and str(self.device).startswith("cuda")
         pin_mem = torch.cuda.is_available()
         loader = DataLoader(
             dataset, batch_size=self.batch_size, shuffle=(sampler is None), sampler=sampler, pin_memory=pin_mem
@@ -668,6 +690,7 @@ class TabNetExpert(ExpertModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        is_cuda = torch.cuda.is_available() and str(self.device).startswith("cuda")
         pin_mem = torch.cuda.is_available()
         loader = DataLoader(
             dataset, batch_size=self.batch_size, shuffle=(sampler is None), sampler=sampler, pin_memory=pin_mem
@@ -889,6 +912,7 @@ class KANExpert(ExpertModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        is_cuda = torch.cuda.is_available() and str(self.device).startswith("cuda")
         pin_mem = torch.cuda.is_available()
         loader = DataLoader(
             dataset, batch_size=self.batch_size, shuffle=(sampler is None), sampler=sampler, pin_memory=pin_mem

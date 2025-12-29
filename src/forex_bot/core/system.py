@@ -60,6 +60,45 @@ def thread_limits(blas_threads: int | None = None) -> None:
         yield
 
 
+def resolve_cpu_budget(reserve_default: int = 1) -> int:
+    """
+    Resolve the CPU budget (usable cores) as: total_cores - reserve.
+
+    Priority:
+      1) per-rank override (FOREX_BOT_CPU_THREADS_PER_GPU) if LOCAL_RANK set
+      2) FOREX_BOT_CPU_THREADS / FOREX_BOT_CPU_BUDGET
+      3) total cores minus reserve (FOREX_BOT_CPU_RESERVE or reserve_default)
+    """
+    cpu_total = max(1, os.cpu_count() or 1)
+
+    # Per-rank overrides (DDP)
+    if os.environ.get("LOCAL_RANK") is not None:
+        per_gpu = os.environ.get("FOREX_BOT_CPU_THREADS_PER_GPU")
+        if per_gpu:
+            try:
+                return max(1, min(cpu_total, int(per_gpu)))
+            except Exception:
+                pass
+
+    override = os.environ.get("FOREX_BOT_CPU_THREADS") or os.environ.get("FOREX_BOT_CPU_BUDGET")
+    if override:
+        try:
+            return max(1, min(cpu_total, int(override)))
+        except Exception:
+            pass
+
+    reserve_raw = os.environ.get("FOREX_BOT_CPU_RESERVE")
+    if reserve_raw is None:
+        reserve = reserve_default
+    else:
+        try:
+            reserve = int(reserve_raw)
+        except Exception:
+            reserve = reserve_default
+    reserve = max(0, reserve or 0)
+    return max(1, cpu_total - reserve)
+
+
 @dataclass(slots=True)
 class HardwareProfile:
     """Summary of detected compute resources."""
@@ -256,6 +295,34 @@ class AutoTuner:
         self.profile = profile
         self.logger = logging.getLogger(__name__)
 
+    @staticmethod
+    def _read_int_env(name: str, default: int | None = None) -> int | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            return int(str(raw).strip())
+        except Exception:
+            return default
+
+    @staticmethod
+    def _read_float_env(name: str, default: float | None = None) -> float | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            return float(str(raw).strip())
+        except Exception:
+            return default
+
+    def _resolve_cpu_budget(self, cpu_cores: int) -> int:
+        override = self._read_int_env("FOREX_BOT_CPU_BUDGET", None)
+        if override is not None and override > 0:
+            return max(1, min(cpu_cores, override))
+        reserve = self._read_int_env("FOREX_BOT_CPU_RESERVE", 1)
+        reserve = max(0, reserve or 0)
+        return max(1, cpu_cores - reserve)
+
     def apply(self) -> AutoTuneHints:
         hints = self._evaluate_hints()
         # Apply settings...
@@ -310,7 +377,7 @@ class AutoTuner:
             if hints.is_hpc and hints.num_gpus > 0:
                 cpu_cores = max(1, int(getattr(self.profile, "cpu_cores", 1) or 1))
                 per_worker_threads = max(1, cpu_cores // max(1, int(hints.num_gpus)))
-                target_islands = max(4, min(32, per_worker_threads))
+                target_islands = max(4, per_worker_threads)
                 if cur_islands <= 0 or cur_islands < target_islands:
                     self.settings.models.evo_islands = target_islands
                     self.logger.info(
@@ -341,15 +408,26 @@ class AutoTuner:
         ram_gb = getattr(self.profile, "available_ram_gb", self.profile.total_ram_gb)
         gpu_mem_gb = getattr(self.profile, "gpu_mem_gb", []) or []
         min_vram_gb = min(gpu_mem_gb) if gpu_mem_gb else 0.0
+        cpu_budget = self._resolve_cpu_budget(cpu_cores)
 
         is_hpc = False
 
-        # Detect Cloud/HPC Beast (e.g. 8x A6000, 256GB+ RAM)
-        if enable_gpu and self.profile.num_gpus >= 4 and ram_gb > 64:
+        # Detect Cloud/HPC Beast (GPU or CPU-heavy).
+        force_hpc = str(os.environ.get("FOREX_BOT_FORCE_HPC", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        min_hpc_cores = max(1, self._read_int_env("FOREX_BOT_HPC_MIN_CORES", 64) or 64)
+        min_hpc_ram = max(1.0, self._read_float_env("FOREX_BOT_HPC_MIN_RAM_GB", 64.0) or 64.0)
+        cpu_hpc = cpu_cores >= min_hpc_cores and ram_gb >= min_hpc_ram
+
+        if force_hpc or (enable_gpu and self.profile.num_gpus >= 4 and ram_gb > 64) or cpu_hpc:
             is_hpc = True
-            # HPC BEAST: Saturate the machine (Leave 4 cores for OS)
-            n_jobs = max(1, cpu_cores - 4) 
-            
+            # HPC BEAST: Saturate the machine (Leave reserve for OS)
+            n_jobs = max(1, cpu_budget)
+
             # Scale batch size based on VRAM (A6000 = 48GB)
             if min_vram_gb >= 40:
                 train_batch = 2048
@@ -365,13 +443,14 @@ class AutoTuner:
             hpo_trials = max(base_trials, 100)
             adaptive_budget = 10800.0  # 3 hours per model default
             self.logger.info(
-                f"HPC BEAST detected: {self.profile.num_gpus} GPUs, {ram_gb:.0f}GB RAM. Saturating all {cpu_cores} cores."
+                f"HPC BEAST detected: cpu_cores={cpu_cores}, gpus={self.profile.num_gpus}, "
+                f"ram={ram_gb:.0f}GB. Saturating cpu_budget={cpu_budget}."
             )
 
         elif enable_gpu:
             # High-End Workstation (Local or Cloud)
             is_hpc = False
-            n_jobs = max(1, cpu_cores - 2)
+            n_jobs = max(1, cpu_budget)
             train_batch = 512 if min_vram_gb >= 12 else 256
             infer_batch = 2048 if min_vram_gb >= 12 else 1024
             hpo_trials = 50
@@ -379,7 +458,7 @@ class AutoTuner:
         else:
             # CPU Only (Your Home PC)
             is_hpc = False
-            n_jobs = max(1, cpu_cores - 1)
+            n_jobs = max(1, cpu_budget)
             train_batch = 64
             infer_batch = 128
             hpo_trials = 20
@@ -387,7 +466,7 @@ class AutoTuner:
 
         # Feature worker scaling: 1 worker per 2GB of available RAM, capped by CPU cores
         ram_based_workers = int(ram_gb // 2.0)
-        feature_workers = max(1, min(cpu_cores, ram_based_workers))
+        feature_workers = max(1, min(cpu_budget, ram_based_workers))
 
         return AutoTuneHints(
             enable_gpu=enable_gpu,
@@ -405,6 +484,11 @@ class AutoTuner:
     def _apply_thread_env_defaults(self, hints: AutoTuneHints) -> None:
         """Set reasonable BLAS/OpenMP thread defaults based on hardware."""
         cpu_cores = max(1, self.profile.cpu_cores)
+        cpu_budget = self._resolve_cpu_budget(cpu_cores)
+
+        # Ensure the CPU budget is visible to downstream components.
+        os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
+        os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(cpu_budget))
 
         # Prefer explicit per-rank budgets (e.g., 20 cores per GPU under DDP).
         local_rank = os.environ.get("LOCAL_RANK")
@@ -432,16 +516,8 @@ class AutoTuner:
                     blas_threads = None
         # Fallbacks if no explicit override was set.
         if blas_threads is None:
-            if hints.is_hpc:
-                # CRITICAL FIX: Cap BLAS threads to avoid oversubscription on HPC
-                # Each process should use only a small portion of cores
-                # If we have many parallel workers, each needs fewer BLAS threads
-                # Cap at 4 threads per process to prevent 252-core explosion
-                blas_threads = min(4, max(1, cpu_cores // max(8, hints.n_jobs or 1)))
-            elif hints.n_jobs > 1:
-                blas_threads = 1
-            else:
-                blas_threads = min(16, max(1, cpu_cores))
+            # Default to using the full CPU budget unless user overrides.
+            blas_threads = max(1, cpu_budget)
 
         # HPC FIX: Strategic Thread Saturation
         # Ensure NumPy/SciPy/PyTorch can actually use the 252 cores
@@ -474,22 +550,28 @@ class AutoTuner:
         # 1. Calculate how many workers fit in RAM
         # Each worker needs roughly 2GB for 5M rows + indicators
         ram_gb = getattr(self.profile, "available_ram_gb", 16.0)
-        max_ram_workers = int(ram_gb // 2.0)
-        
+        per_worker_gb = self._read_float_env("FOREX_BOT_FEATURE_WORKER_GB", 2.0) or 2.0
+        max_ram_workers = int(ram_gb // max(0.5, per_worker_gb))
+
         # 2. Saturate Cores
         cpu_cores = self.profile.cpu_cores
+        cpu_budget = self._resolve_cpu_budget(cpu_cores)
 
-        # 3. Final Automated Decision
-        # CRITICAL FIX: Cap feature workers at 8 to avoid thread explosion
-        # Feature engineering is pandas/I/O bound, not CPU bound
-        target = max(1, min(8, min(cpu_cores, max_ram_workers)))
+        requested = self._read_int_env("FOREX_BOT_FEATURE_WORKERS", None)
+        if requested is not None and requested > 0:
+            target = max(1, min(cpu_budget, requested))
+        else:
+            target = max(1, min(cpu_budget, max_ram_workers))
 
-        # FORCE overrides (Bypass any manual ENV set by the user to ensure it 'just works')
-        os.environ["FOREX_BOT_FEATURE_WORKERS"] = str(target)
-        os.environ["FEATURE_WORKERS"] = str(target)
-        os.environ["FOREX_BOT_TALIB_WORKERS"] = str(target)
-        
-        self.logger.info(f"AUTO-TUNE: Unleashing {target} workers across {cpu_cores} cores ({ram_gb:.0f}GB RAM).")
+        # Apply defaults only when the user has not explicitly set them.
+        os.environ.setdefault("FOREX_BOT_FEATURE_WORKERS", str(target))
+        os.environ.setdefault("FEATURE_WORKERS", str(target))
+        os.environ.setdefault("FOREX_BOT_TALIB_WORKERS", str(target))
+
+        self.logger.info(
+            f"AUTO-TUNE: Feature workers={target} (cpu_budget={cpu_budget}, "
+            f"ram={ram_gb:.0f}GB, per_worker_gb={per_worker_gb})."
+        )
 
     def _apply_discovery_autotune(self, hints: AutoTuneHints) -> None:
         """Auto-tune discovery settings based on GPU/RAM if env not set."""

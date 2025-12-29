@@ -101,13 +101,18 @@ def _feature_cpu_budget() -> int:
         val = os.environ.get(key)
         if val:
             try:
+                # If explicitly set, respect it (user knows what they're doing)
                 return max(1, int(val))
             except Exception:
                 pass
-    # CRITICAL FIX: Cap at 8 workers to avoid thread explosion on HPC systems
-    # Feature engineering is I/O and pandas-bound, excessive parallelism causes GIL contention
+    # Default: use all cores minus reserve.
     cpu_count = os.cpu_count() or 1
-    return min(8, cpu_count)
+    try:
+        reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
+    except Exception:
+        reserve = 1
+    reserve = max(0, reserve)
+    return max(1, cpu_count - reserve)
 
 
 def _talib_chunk_worker(payload):
@@ -305,7 +310,7 @@ class FeatureEngineer:
         logger.info(f"Engineering features using {cpu_budget} cores...")
 
         # 1. Standard Indicators (Parallelized)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, cpu_budget)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_budget) as executor:
             f1 = executor.submit(self._compute_basic_features, df, use_gpu=False)
             f2 = executor.submit(self._compute_adx_safe, df)
             f3 = executor.submit(self._compute_stochastic_safe, df)
@@ -506,6 +511,9 @@ class FeatureEngineer:
         else:
             self._compute_atr_wicks_cpu(df)
 
+        # SMC features (CPU by default; CUDA only when explicitly allowed)
+        df = self._add_smc_features(df, use_gpu=(use_gpu and smc_cuda_enabled))
+
         if use_volume:
             df = self._compute_volume_profile_features(df)
         if use_volume:
@@ -614,7 +622,7 @@ class FeatureEngineer:
         X = df[valid_cols].fillna(0.0)
         
         # Labels & Metadata (HPC: Vectorized Generation)
-        base_sigs = self._generate_base_signals(df)
+        base_sigs = self._generate_base_signals(df, frames)
         labels = self._meta_label_outcomes(df, base_sigs)
         
         meta = df[["close", "high", "low", "open"]].copy()
@@ -1052,7 +1060,7 @@ class FeatureEngineer:
         raw_outcomes = _get_outcomes_numba(close, high, low, sigs, sl_dist, tp_dist, horizon)
         return pd.Series(raw_outcomes, index=df.index)
 
-    def _generate_base_signals(self, df: DataFrame) -> Series:
+    def _generate_base_signals(self, df: DataFrame, frames: dict[str, DataFrame]) -> Series:
         """
         Generates base signals using an ensemble of evolved experts.
         Prioritizes the new GPU-Native Tensor Experts.
@@ -1073,9 +1081,12 @@ class FeatureEngineer:
                 # We need features for ALL timeframes used during discovery
                 all_signals = torch.zeros((len(df),), device="cuda")
                 
+                frames_local = frames or {}
                 for t_idx, tf_name in enumerate(timeframes):
-                    tf_df = frames.get(tf_name, df).reindex(df.index).ffill().fillna(0.0)
-                    f_vals = tf_df.select_dtypes(include=[np.number]).to_numpy(dtype=np.float32)
+                    tf_df = frames_local.get(tf_name, df).reindex(df.index).ffill().fillna(0.0)
+                    num_df = tf_df.select_dtypes(include=[np.number]).copy()
+                    num_df = num_df.shift(1).fillna(0.0)
+                    f_vals = num_df.to_numpy(dtype=np.float32)
                     f_tens = torch.from_numpy(f_vals).to("cuda")
                     
                     # Correct slice from genomes for logic weights
@@ -1095,7 +1106,11 @@ class FeatureEngineer:
                 final_sig = torch.tanh(all_signals)
                 df["signal_strength"] = torch.abs(final_sig).cpu().numpy()
                 
-                out = torch.where(torch.abs(final_sig) > 0.3, torch.sign(final_sig), 0.0)
+                try:
+                    sig_thresh = float(os.environ.get("FOREX_BOT_TENSOR_SIGNAL_THRESHOLD", "0.2") or 0.2)
+                except Exception:
+                    sig_thresh = 0.2
+                out = torch.where(torch.abs(final_sig) > sig_thresh, torch.sign(final_sig), 0.0)
                 return pd.Series(out.cpu().numpy().astype(np.int8), index=df.index)
                 
             except Exception as e:

@@ -530,7 +530,12 @@ class EvoExpertCMA(ExpertModel):
             try:
                 device_torch = torch.device(gpus[0])
                 x_t_evotorch = torch.as_tensor(xb_norm_np, device=device_torch, dtype=torch.float32)
-                y_t = torch.as_tensor(yb, device=device_torch, dtype=torch.long)
+                # Map labels to class indices for cross-entropy: -1->0, 0->1, 1->2
+                class_idx_evotorch = np.zeros_like(yb, dtype=np.int64)
+                class_idx_evotorch[yb == -1] = 0
+                class_idx_evotorch[yb == 0] = 1
+                class_idx_evotorch[yb == 1] = 2
+                y_t = torch.as_tensor(class_idx_evotorch, device=device_torch, dtype=torch.long)
                 theta_dim_evotorch = d_features * hidden + hidden + hidden * 3 + 3
 
                 def eval_func(sol: torch.Tensor) -> torch.Tensor:
@@ -546,10 +551,10 @@ class EvoExpertCMA(ExpertModel):
                     logits = hidden_act @ w2 + b2
                     loss = functional.cross_entropy(logits, y_t)
                     reg = self.weight_decay * (theta_vec.pow(2).sum())
-                    return -(loss + reg)
+                    return loss + reg
 
                 problem = Problem(
-                    "max",
+                    "min",
                     eval_func,
                     solution_length=theta_dim_evotorch,
                     initial_bounds=(-0.5, 0.5),
@@ -566,14 +571,26 @@ class EvoExpertCMA(ExpertModel):
                     if torch.is_tensor(theta_best):
                         theta_best = theta_best.detach().cpu().numpy()
                     self.theta = np.asarray(theta_best, dtype=float)
-                    self.island_losses = [float(-best.evaluation)] if hasattr(best, "evaluation") else None
+                    self.island_losses = [float(best.evaluation)] if hasattr(best, "evaluation") else None
                     self._last_device = str(gpus[0])
                     return
             except Exception as exc:
                 logger.warning(f"EvoTorch path failed, falling back to CMA-ES: {exc}")
 
+        popsize = max(4, int(self.population))
         theta_dim = d_features * hidden + hidden + hidden * 3 + 3
         x0_cma = np.zeros(theta_dim, dtype=float)
+
+        def _available_ram_gb() -> float:
+            try:
+                import psutil
+
+                return float(psutil.virtual_memory().available) / (1024**3)
+            except Exception:
+                try:
+                    return float(os.environ.get("FOREX_BOT_RAM_GB", "0") or 0)
+                except Exception:
+                    return 0.0
 
         def _unpack(theta_vec: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
             idx = 0
@@ -602,7 +619,66 @@ class EvoExpertCMA(ExpertModel):
 
         use_multiproc = bool(self.evo_multiproc_per_gpu) and CUPY_AVAILABLE and len(gpus) > 1 and islands > 1
 
+        available_gb = _available_ram_gb()
+        try:
+            mem_frac = float(os.environ.get("FOREX_BOT_EVO_MEM_FRAC", "0.4") or 0.4)
+        except Exception:
+            mem_frac = 0.4
+        mem_frac = max(0.05, min(0.95, mem_frac))
+
+        try:
+            data_overhead = float(os.environ.get("FOREX_BOT_EVO_DATA_OVERHEAD", "2.0") or 2.0)
+        except Exception:
+            data_overhead = 2.0
+        try:
+            cma_overhead = float(os.environ.get("FOREX_BOT_EVO_CMA_OVERHEAD", "4.0") or 4.0)
+        except Exception:
+            cma_overhead = 4.0
+
+        cma_bytes = float(popsize) * float(theta_dim) * 8.0
+        data_bytes = float(xb_norm_np.nbytes + yb.nbytes)
+
+        max_gpu_by_mem = None
+        max_cpu_by_mem = None
+        if available_gb > 0:
+            try:
+                per_gpu_bytes = data_bytes * max(1.0, data_overhead) + cma_bytes * max(1.0, cma_overhead)
+                if per_gpu_bytes > 0:
+                    max_gpu_by_mem = int((available_gb * mem_frac * 1024**3) // per_gpu_bytes)
+            except Exception:
+                max_gpu_by_mem = None
+            try:
+                per_cpu_bytes = cma_bytes * max(1.0, cma_overhead)
+                if per_cpu_bytes > 0:
+                    max_cpu_by_mem = int((available_gb * mem_frac * 1024**3) // per_cpu_bytes)
+            except Exception:
+                max_cpu_by_mem = None
+
+        gpu_islands = 0
+        cpu_islands = islands
+
         if use_multiproc:
+            try:
+                per_gpu = int(os.environ.get("FOREX_BOT_EVO_GPU_ISLANDS_PER_GPU", "1") or 1)
+            except Exception:
+                per_gpu = 1
+            per_gpu = max(1, per_gpu)
+            gpu_islands = min(islands, len(gpus) * per_gpu)
+            if max_gpu_by_mem is not None:
+                if max_gpu_by_mem <= 0:
+                    logger.warning(
+                        "Evo GPU islands disabled by RAM cap (available_ram=%.1fGB, mem_frac=%.2f).",
+                        available_gb,
+                        mem_frac,
+                    )
+                    gpu_islands = 0
+                else:
+                    gpu_islands = min(gpu_islands, max_gpu_by_mem)
+            if gpu_islands <= 0:
+                use_multiproc = False
+            else:
+                cpu_islands = max(0, islands - gpu_islands)
+
             tasks: list[
                 tuple[
                     int,
@@ -622,16 +698,16 @@ class EvoExpertCMA(ExpertModel):
                     int | None,
                 ]
             ] = []
-            proc_count = min(len(gpus), islands)
+            proc_count = min(len(gpus), gpu_islands)
             blas_threads = 1
-            for island in range(islands):
+            for island in range(gpu_islands):
                 remaining = self.max_time_sec - (time.time() - total_start)
                 if remaining <= 0:
                     break
                 island_budget = min(budget_per_island, remaining)
                 opts = {
                     "verbose": -9,
-                    "popsize": max(4, int(self.population)),
+                    "popsize": popsize,
                     "maxfevals": 20000,
                     "seed": int(time.time()) + island,
                     # IMPORTANT: without diagonal mode, CMA allocates O(N^2) matrices and will OOM for large theta_dim.
@@ -661,11 +737,139 @@ class EvoExpertCMA(ExpertModel):
             try:
                 ctx = multiprocessing.get_context("spawn")
                 with ctx.Pool(processes=proc_count) as pool:
-                    results = pool.map(_run_island, tasks)
+                    async_results = pool.map_async(_run_island, tasks)
+
+                    hybrid = str(os.environ.get("FOREX_BOT_EVO_HYBRID", "1")).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }
+                    if hybrid and cpu_islands > 0:
+                        # Run remaining CPU islands in parallel while GPU islands execute.
+                        use_cpu_parallel_islands = True
+                    else:
+                        use_cpu_parallel_islands = False
+
+                    cpu_results: list[tuple[float, np.ndarray]] = []
+                    if use_cpu_parallel_islands:
+                        total_budget = float(max(0, int(self.max_time_sec)))
+                        if total_budget > 0:
+                            row_idx = row_idx_np
+                            class_idx = class_idx_np
+
+                            try:
+                                cpu_cores = int(os.environ.get("FOREX_BOT_CPU_THREADS", "0") or 0)
+                            except Exception:
+                                cpu_cores = 0
+                            if cpu_cores <= 0:
+                                try:
+                                    cpu_cores = int(os.environ.get("FOREX_BOT_CPU_BUDGET", "0") or 0)
+                                except Exception:
+                                    cpu_cores = 0
+                            if cpu_cores <= 0:
+                                cpu_total = max(1, os.cpu_count() or 1)
+                                try:
+                                    reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
+                                except Exception:
+                                    reserve = 1
+                                cpu_cores = max(1, cpu_total - max(0, reserve))
+
+                            max_by_time = max(1, int(math.ceil(total_budget / 60.0)))
+                            active_islands = max(1, min(cpu_islands, cpu_cores, max_by_time))
+                            if max_cpu_by_mem is not None and max_cpu_by_mem > 0:
+                                active_islands = min(active_islands, max_cpu_by_mem)
+                            if active_islands <= 1:
+                                island_budgets = [total_budget]
+                            else:
+                                per_island = float(total_budget) / float(active_islands)
+                                if per_island >= 60.0:
+                                    island_budgets = [per_island for _ in range(active_islands)]
+                                else:
+                                    rem = max(0.0, total_budget - 60.0 * float(active_islands - 1))
+                                    island_budgets = [60.0 for _ in range(active_islands - 1)] + [rem]
+
+                            if active_islands != cpu_islands:
+                                logger.info(
+                                    f"Evo hybrid CPU islands capped: requested={cpu_islands}, active={active_islands}, "
+                                    f"cpu_threads={cpu_cores}, budget={total_budget:.0f}s"
+                                )
+
+                            blas_threads = max(1, cpu_cores // max(1, active_islands))
+
+                            def _run_cpu_island(island: int, island_budget: float) -> tuple[float, np.ndarray]:
+                                opts = {
+                                    "verbose": -9,
+                                    "popsize": popsize,
+                                    "maxfevals": 20000,
+                                    "seed": int(time.time()) + island,
+                                    # IMPORTANT: avoid O(N^2) memory in full CMA covariance matrices.
+                                    "CMA_diagonal": True,
+                                }
+                                es = cma.CMAEvolutionStrategy(x0_cma, self.sigma, opts)
+                                island_start = time.time()
+                                last_log = island_start
+                                iters = 0
+                                while not es.stop() and (time.time() - island_start) < island_budget:
+                                    xc = es.ask()
+                                    es.tell(
+                                        xc,
+                                        [
+                                            _loss_cpu(
+                                                np.asarray(theta),
+                                                xb_norm_np,
+                                                yb,
+                                                self.weight_decay,
+                                                d_features,
+                                                hidden,
+                                                row_idx=row_idx,
+                                                class_idx=class_idx,
+                                            )
+                                            for theta in xc
+                                        ],
+                                    )
+                                    iters += 1
+                                    now = time.time()
+                                    if now - last_log >= 60.0:
+                                        last_log = now
+                                        logger.info(
+                                            f"Evo island {island + 1}/{active_islands}: iters={iters} "
+                                            f"elapsed={now - island_start:.0f}s/{island_budget:.0f}s"
+                                        )
+                                candidate = np.asarray(es.result.xbest, dtype=float)
+                                candidate_loss = _loss_cpu(
+                                    candidate,
+                                    xb_norm_np,
+                                    yb,
+                                    self.weight_decay,
+                                    d_features,
+                                    hidden,
+                                    row_idx=row_idx,
+                                    class_idx=class_idx,
+                                )
+                                return float(candidate_loss), candidate
+
+                            with thread_limits(blas_threads):
+                                with ThreadPoolExecutor(max_workers=active_islands) as ex:
+                                    futures = {
+                                        ex.submit(_run_cpu_island, i, island_budgets[i]): i
+                                        for i in range(active_islands)
+                                    }
+                                    for fut in as_completed(futures):
+                                        loss_val, theta_candidate = fut.result()
+                                        cpu_results.append((float(loss_val), theta_candidate))
+
+                    results = async_results.get()
                 for loss_val, theta_candidate, _island_idx, dev_used in results:
                     island_losses.append(float(loss_val))
                     if dev_used:
                         self._last_device = str(dev_used)
+                    if loss_val < best_loss:
+                        best_loss = loss_val
+                        best_theta = theta_candidate
+                for loss_val, theta_candidate in cpu_results:
+                    island_losses.append(float(loss_val))
+                    self._last_device = "cpu"
                     if loss_val < best_loss:
                         best_loss = loss_val
                         best_theta = theta_candidate
@@ -691,18 +895,28 @@ class EvoExpertCMA(ExpertModel):
                 except Exception:
                     cpu_cores = 0
                 if cpu_cores <= 0:
+                    try:
+                        cpu_cores = int(os.environ.get("FOREX_BOT_CPU_BUDGET", "0") or 0)
+                    except Exception:
+                        cpu_cores = 0
+                if cpu_cores <= 0:
                     cpu_total = max(1, os.cpu_count() or 1)
-                    # CRITICAL FIX: Cap evolution cores to avoid thread explosion
-                    # CMA-ES islands should be limited to prevent oversubscription
-                    cpu_cores = min(8, cpu_total)
+                    try:
+                        reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
+                    except Exception:
+                        reserve = 1
+                    cpu_cores = max(1, cpu_total - max(0, reserve))
                 else:
                     cpu_cores = max(1, min(cpu_cores, max(1, os.cpu_count() or cpu_cores)))
 
                 # Safety: cap active islands by both time budget and available CPU threads.
-                # Additional safety: never spawn more than 8 islands
+                # Scale islands with cores: up to 32 islands for HPC systems
                 max_by_time = max(1, int(math.ceil(total_budget / 60.0)))
                 requested_islands = islands
-                active_islands = max(1, min(requested_islands, cpu_cores, max_by_time, 8))
+                max_islands = cpu_cores
+                active_islands = max(1, min(requested_islands, max_islands, max_by_time))
+                if max_cpu_by_mem is not None and max_cpu_by_mem > 0:
+                    active_islands = min(active_islands, max_cpu_by_mem)
                 if active_islands <= 1:
                     island_budgets = [total_budget]
                 else:
@@ -724,7 +938,7 @@ class EvoExpertCMA(ExpertModel):
                 def _run_cpu_island(island: int, island_budget: float) -> tuple[float, np.ndarray]:
                     opts = {
                         "verbose": -9,
-                        "popsize": max(4, int(self.population)),
+                    "popsize": popsize,
                         "maxfevals": 20000,
                         "seed": int(time.time()) + island,
                         # IMPORTANT: avoid O(N^2) memory in full CMA covariance matrices.
@@ -806,7 +1020,7 @@ class EvoExpertCMA(ExpertModel):
 
                     opts = {
                         "verbose": -9,
-                        "popsize": max(4, int(self.population)),
+                        "popsize": popsize,
                         "maxfevals": 20000,
                         "seed": int(time.time()) + island,
                         # IMPORTANT: avoid O(N^2) memory in full CMA covariance matrices.

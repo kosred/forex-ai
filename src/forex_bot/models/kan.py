@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -163,7 +164,13 @@ class KANExpert(ExpertModel):
         train_model.train()
 
         if str(self.device) == "cpu":
-            with thread_limits(blas_threads=max(1, multiprocessing.cpu_count() - 1)):
+            try:
+                cpu_threads = int(os.environ.get("FOREX_BOT_CPU_THREADS", "0") or 0)
+            except Exception:
+                cpu_threads = 0
+            if cpu_threads <= 0:
+                cpu_threads = max(1, multiprocessing.cpu_count() - 1)
+            with thread_limits(blas_threads=cpu_threads):
                 self._train_loop(loader, optimizer, criterion, start, early_stopper, X_val_norm, X_v, y_v, sampler, train_model)
         else:
             self._train_loop(loader, optimizer, criterion, start, early_stopper, X_val_norm, X_v, y_v, sampler, train_model)

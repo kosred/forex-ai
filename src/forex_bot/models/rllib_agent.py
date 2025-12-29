@@ -9,6 +9,7 @@ import pandas as pd
 
 from .base import ExpertModel, get_early_stop_params
 from .device import get_available_gpus
+from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
 
@@ -49,20 +50,17 @@ def _default_config(device: str, num_workers: int = 1) -> dict[str, Any]:
 def _apply_resources(cfg: Any, device: str, num_workers: int) -> Any:
     """
     HPC Resource Strategy:
-    - 252 Cores: Deploy up to 128 environment runners.
-    - 8 GPUs: Distribute learner across all cards if using PyTorch DDP.
+    - Use all available CPU cores (minus reserve) for environment runners.
+    - Distribute learner across all available GPUs.
     """
-    import multiprocessing
     import torch
     
-    cpu_total = multiprocessing.cpu_count()
+    cpu_budget = resolve_cpu_budget()
     gpu_total = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    
+
     # 1. Scaling Workers (Rollout)
-    # Use 50% of cores for environment simulation
-    target_workers = max(1, cpu_total // 2)
-    # Cap at 128 to avoid Ray scheduling overhead
-    worker_count = min(target_workers, 128)
+    # Use all available cores minus reserve for environment simulation
+    worker_count = max(1, cpu_budget)
     
     # 2. Scaling Learner (Training)
     # Use all GPUs for the learner if we have them

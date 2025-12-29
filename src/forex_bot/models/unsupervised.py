@@ -114,10 +114,12 @@ class MarketRegimeClassifier(ExpertModel):
             adx = df["adx"].to_numpy(dtype=np.float32) if "adx" in df.columns else volatility * 100
 
             data = pd.DataFrame({
-                "returns": returns, 
-                "volatility": volatility, 
+                "returns": returns,
+                "volatility": volatility,
                 "adx": adx
             }, index=df.index)
+            # Shift by 1 bar to avoid look-ahead leakage on the current candle.
+            data = data.shift(1)
             return data.dropna()
         except Exception:
             return pd.DataFrame()

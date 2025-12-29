@@ -17,6 +17,7 @@ from .base import (
     time_series_train_val_split,
 )
 from .device import select_device
+from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,11 @@ class KANExpert(ExpertModel):
         # HPC FIX: Unified Protocol Mapping
         # -1 (Sell) -> 2, 0 (Neutral) -> 0, 1 (Buy) -> 1
         y_mapped = np.where(y_train.to_numpy() == -1, 2, y_train.to_numpy()).astype(int)
+        X_t = torch.as_tensor(
+            dataframe_to_float32_numpy(X_train),
+            dtype=torch.float32,
+            device="cpu",
+        )
         y_t = torch.as_tensor(y_mapped, dtype=torch.long, device="cpu")
 
         X_v = None
@@ -95,7 +101,12 @@ class KANExpert(ExpertModel):
         if len(X_val) > 0:
             # ...
             y_v_mapped = np.where(y_val.to_numpy() == -1, 2, y_val.to_numpy()).astype(int)
-            y_v = torch.as_tensor(y_v_mapped, dtype=torch.long, device=self.device)
+            X_v = torch.as_tensor(
+                dataframe_to_float32_numpy(X_val),
+                dtype=torch.float32,
+                device="cpu",
+            )
+            y_v = torch.as_tensor(y_v_mapped, dtype=torch.long, device="cpu")
 
         # KAN library expects [Input -> Hidden -> Output] layers list
         # We construct a simple 2-layer KAN: Input -> Hidden -> 3 (Classes)
@@ -124,7 +135,11 @@ class KANExpert(ExpertModel):
 
         # GPU Optimization with spawn context to avoid CUDA fork issues
         is_cuda = str(self.device).startswith("cuda")
-        num_workers = 4 if is_cuda else 0
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        cpu_budget = resolve_cpu_budget()
+        if world_size > 1:
+            cpu_budget = max(1, cpu_budget // world_size)
+        num_workers = max(1, cpu_budget - 1) if is_cuda else 0
         loader_kwargs = {
             "batch_size": self.batch_size,
             "shuffle": (sampler is None),
@@ -137,6 +152,16 @@ class KANExpert(ExpertModel):
             loader_kwargs["persistent_workers"] = True
             loader_kwargs["multiprocessing_context"] = "spawn"
         loader = DataLoader(dataset, **loader_kwargs)
+        val_loader = None
+        if X_v is not None and y_v is not None:
+            val_dataset = TensorDataset(X_v, y_v)
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=max(1024, int(self.batch_size)),
+                shuffle=False,
+                num_workers=0,
+                pin_memory=is_cuda,
+            )
 
         import time
 
@@ -178,17 +203,26 @@ class KANExpert(ExpertModel):
             if tensorboard_writer:
                 tensorboard_writer.add_scalar("Loss/train_KAN", total_loss / len(loader), epoch)
 
-            if X_v is not None and y_v is not None and len(X_val) > 0:
+            if val_loader is not None:
                 self.model.eval()
+                v_loss_sum = 0.0
+                v_count = 0
                 with torch.no_grad():
-                    v_logits = self.model(X_v)
-                    v_loss = criterion(v_logits, y_v).item()
+                    for vx, vy in val_loader:
+                        vx = vx.to(self.device, non_blocking=is_cuda)
+                        vy = vy.to(self.device, non_blocking=is_cuda)
+                        with torch.amp.autocast("cuda", enabled=is_cuda, dtype=amp_dtype):
+                            v_logits = self.model(vx)
+                            v_loss = criterion(v_logits, vy)
+                        v_loss_sum += float(v_loss.item()) * len(vx)
+                        v_count += len(vx)
                 self.model.train()
-                if early_stopper(v_loss):
+                v_loss_avg = v_loss_sum / max(1, v_count)
+                if early_stopper(v_loss_avg):
                     logger.info(
                         "KAN GPU early stopping at epoch %s (val_loss=%.6f)",
                         epoch,
-                        v_loss,
+                        v_loss_avg,
                     )
                     break
 

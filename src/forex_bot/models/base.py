@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..core.system import resolve_cpu_budget
+
 logger = logging.getLogger(__name__)
 
 
@@ -430,8 +432,8 @@ def detect_feature_drift(
             return None
 
     # HPC: Use all cores for parallel drift detection
-    cpu_budget = int(os.environ.get("FOREX_BOT_CPU_BUDGET", os.cpu_count() or 1))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(cpu_budget, 32)) as executor:
+    cpu_budget = resolve_cpu_budget()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_budget) as executor:
         results = list(executor.map(_check_col, numeric_cols))
         
     for res in results:

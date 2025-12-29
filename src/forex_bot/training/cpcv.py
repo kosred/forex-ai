@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import multiprocessing
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -13,6 +14,118 @@ import pandas as pd
 from sklearn.model_selection import KFold
 
 logger = logging.getLogger(__name__)
+
+
+def _evaluate_split_task(
+    x: pd.DataFrame,
+    y: pd.Series,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    model_factory: Callable,
+    scoring_func: Callable,
+    sample_weights: pd.Series | None,
+    max_daily_loss_pct: float,
+    max_trades_per_day: int,
+    min_trading_days: int,
+) -> tuple[float, dict[str, Any]]:
+    """Picklable worker for ProcessPoolExecutor."""
+    if len(train_idx) == 0 or len(test_idx) == 0:
+        return 0.0, {}
+
+    x_train = x.iloc[train_idx] if hasattr(x, "iloc") else x[train_idx]
+    y_train = y.iloc[train_idx] if hasattr(y, "iloc") else y[train_idx]
+    x_test = x.iloc[test_idx] if hasattr(x, "iloc") else x[test_idx]
+    y_test = y.iloc[test_idx] if hasattr(y, "iloc") else y[test_idx]
+
+    if sample_weights is not None:
+        w_train = sample_weights.iloc[train_idx] if hasattr(sample_weights, "iloc") else sample_weights[train_idx]
+    else:
+        w_train = None
+
+    model = model_factory()
+
+    try:
+        if w_train is not None and hasattr(model, "fit") and "sample_weight" in model.fit.__code__.co_varnames:
+            model.fit(x_train, y_train, sample_weight=w_train)
+        else:
+            model.fit(x_train, y_train)
+    except Exception as e:
+        logger.error(f"Model training failed: {e}")
+        return 0.0, {}
+
+    try:
+        if hasattr(model, "predict_proba"):
+            y_pred_proba = model.predict_proba(x_test)
+            classes = getattr(model, "classes_", None)
+            if classes is not None and len(classes) == y_pred_proba.shape[1]:
+                y_pred = np.asarray(classes)[y_pred_proba.argmax(axis=1)]
+            else:
+                y_pred = y_pred_proba.argmax(axis=1)
+        else:
+            y_pred = model.predict(x_test)
+    except Exception as e:
+        logger.error(f"Model prediction failed: {e}")
+        return 0.0, {}
+
+    try:
+        score = scoring_func(y_test.values, y_pred)
+    except Exception as e:
+        logger.error(f"Scoring failed: {e}")
+        return 0.0, {}
+
+    from ..strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+
+    max_dd = 0.0
+    win_rate = 0.0
+    trades = 0
+
+    if hasattr(x_test, "index") and "close" in x_test.columns:
+        try:
+            close = x_test["close"].to_numpy(dtype=np.float64)
+            high = x_test["high"].to_numpy(dtype=np.float64)
+            low = x_test["low"].to_numpy(dtype=np.float64)
+
+            idx = x_test.index
+            month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
+            day_idx = (idx.year.astype(np.int32) * 10000 + idx.month.astype(np.int32) * 100 + idx.day.astype(np.int32)).to_numpy(dtype=np.int64)
+
+            symbol = x_test.attrs.get("symbol", "EURUSD")
+            pip_size, pip_val_lot = infer_pip_metrics(symbol)
+
+            # HPC Unified Backtest
+            arr = fast_evaluate_strategy(
+                close_prices=close,
+                high_prices=high,
+                low_prices=low,
+                signals=y_pred.astype(np.int8),
+                month_indices=month_idx,
+                day_indices=day_idx,
+                sl_pips=30.0,
+                tp_pips=60.0,
+                pip_value=pip_size,
+                pip_value_per_lot=pip_val_lot,
+                spread_pips=1.5,
+                commission_per_trade=7.0,
+            )
+
+            max_dd = float(arr[3])
+            win_rate = float(arr[4])
+            trades = int(arr[8])
+
+        except Exception as e:
+            logger.error(f"CPCV internal backtest failed: {e}")
+            max_dd = 1.0
+
+    metrics = {
+        "max_dd": max_dd,
+        "trades": trades,
+        "win_rate": win_rate,
+        "daily_loss_breach": max_dd > max_daily_loss_pct,
+        "trade_limit_violation": trades > max_trades_per_day,
+        "min_trading_days_ok": trades >= min_trading_days,
+    }
+
+    return float(score), metrics
 
 
 @dataclass(slots=True)
@@ -275,27 +388,37 @@ class CombinatorialPurgedCV:
         trade_limit_breaches = []
         min_days_ok_list = []
 
-        # CRITICAL FIX: Cap n_jobs to prevent worker explosion
-        # Cross-validation can be called with uncapped n_jobs parameter
-        n_jobs = max(1, min(n_jobs, 8))  # Never use more than 8 parallel CV folds
+        if n_jobs <= 0:
+            n_jobs = int(os.cpu_count() or 1)
+        n_jobs = max(1, n_jobs)
+        # Optional safety cap via env (unset means no cap)
+        try:
+            max_jobs_env = int(os.environ.get("FOREX_BOT_CPCV_MAX_JOBS", "0") or 0)
+        except Exception:
+            max_jobs_env = 0
+        if max_jobs_env > 0:
+            n_jobs = min(n_jobs, max_jobs_env)
+        # Avoid spawning more workers than folds
+        n_jobs = min(n_jobs, len(splits))
 
         if n_jobs > 1:
-            import os
-
-            if os.name == "nt":
-                logger.warning(
-                    "CPCV: Forcing n_jobs=1 on Windows to avoid spawn recursion. "
-                    "Set n_jobs=1 or wrap call in if __name__ == '__main__'."
-                )
-                n_jobs = 1
-
             # Use spawn context to avoid CUDA fork issues
             spawn_ctx = multiprocessing.get_context('spawn')
             with ProcessPoolExecutor(max_workers=n_jobs, mp_context=spawn_ctx) as executor:
                 futures = []
                 for train_idx, test_idx in splits:
                     future = executor.submit(
-                        self._evaluate_split, x, y, train_idx, test_idx, model_factory, scoring_func, sample_weights
+                        _evaluate_split_task,
+                        x,
+                        y,
+                        train_idx,
+                        test_idx,
+                        model_factory,
+                        scoring_func,
+                        sample_weights,
+                        max_daily_loss_pct,
+                        max_trades_per_day,
+                        min_trading_days,
                     )
                     futures.append(future)
 
@@ -321,7 +444,7 @@ class CombinatorialPurgedCV:
         else:
             for train_idx, test_idx in splits:
                 try:
-                    score, metrics = self._evaluate_split(
+                    score, metrics = _evaluate_split_task(
                         x,
                         y,
                         train_idx,
@@ -379,104 +502,18 @@ class CombinatorialPurgedCV:
         max_trades_per_day: int,
         min_trading_days: int,
     ) -> tuple[float, dict[str, Any]]:
-        """Evaluate a single train/test split"""
-        if len(train_idx) == 0 or len(test_idx) == 0:
-            return 0.0, {}
-
-        x_train = x.iloc[train_idx] if hasattr(x, "iloc") else x[train_idx]
-        y_train = y.iloc[train_idx] if hasattr(y, "iloc") else y[train_idx]
-        x_test = x.iloc[test_idx] if hasattr(x, "iloc") else x[test_idx]
-        y_test = y.iloc[test_idx] if hasattr(y, "iloc") else y[test_idx]
-
-        if sample_weights is not None:
-            w_train = sample_weights.iloc[train_idx] if hasattr(sample_weights, "iloc") else sample_weights[train_idx]
-        else:
-            w_train = None
-
-        model = model_factory()
-
-        try:
-            if w_train is not None and hasattr(model, "fit") and "sample_weight" in model.fit.__code__.co_varnames:
-                model.fit(x_train, y_train, sample_weight=w_train)
-            else:
-                model.fit(x_train, y_train)
-        except Exception as e:
-            logger.error(f"Model training failed: {e}")
-            return 0.0, {}
-
-        try:
-            if hasattr(model, "predict_proba"):
-                y_pred_proba = model.predict_proba(x_test)
-                classes = getattr(model, "classes_", None)
-                if classes is not None and len(classes) == y_pred_proba.shape[1]:
-                    y_pred = np.asarray(classes)[y_pred_proba.argmax(axis=1)]
-                else:
-                    y_pred = y_pred_proba.argmax(axis=1)
-            else:
-                y_pred = model.predict(x_test)
-        except Exception as e:
-            logger.error(f"Model prediction failed: {e}")
-            return 0.0, {}
-
-        try:
-            score = scoring_func(y_test.values, y_pred)
-        except Exception as e:
-            logger.error(f"Scoring failed: {e}")
-            return 0.0, {}
-
-        from ..strategy.fast_backtest import fast_evaluate_strategy, infer_pip_metrics
-        
-        max_dd = 0.0
-        win_rate = 0.0
-        trades = 0
-        
-        if hasattr(x_test, "index") and "close" in x_test.columns:
-            try:
-                close = x_test["close"].to_numpy(dtype=np.float64)
-                high = x_test["high"].to_numpy(dtype=np.float64)
-                low = x_test["low"].to_numpy(dtype=np.float64)
-                
-                idx = x_test.index
-                month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
-                day_idx = (idx.year.astype(np.int32) * 10000 + idx.month.astype(np.int32) * 100 + idx.day.astype(np.int32)).to_numpy(dtype=np.int64)
-                
-                symbol = x_test.attrs.get("symbol", "EURUSD")
-                pip_size, pip_val_lot = infer_pip_metrics(symbol)
-                
-                # HPC Unified Backtest
-                arr = fast_evaluate_strategy(
-                    close_prices=close,
-                    high_prices=high,
-                    low_prices=low,
-                    signals=y_pred.astype(np.int8),
-                    month_indices=month_idx,
-                    day_indices=day_idx,
-                    sl_pips=30.0,
-                    tp_pips=60.0,
-                    pip_value=pip_size,
-                    pip_value_per_lot=pip_val_lot,
-                    spread_pips=1.5,
-                    commission_per_trade=7.0
-                )
-                
-                max_dd = float(arr[3])
-                win_rate = float(arr[4])
-                trades = int(arr[8])
-                
-            except Exception as e:
-                logger.error(f"CPCV internal backtest failed: {e}")
-                max_dd = 1.0
-
-        metrics = {
-            "max_dd": max_dd,
-            "trades": trades,
-            "win_rate": win_rate,
-            "daily_loss_breach": max_dd > max_daily_loss_pct,
-            "trade_limit_violation": trades > max_trades_per_day,
-            "min_trading_days_ok": trades >= min_trading_days,
-        }
-
-        return float(score), metrics
+        return _evaluate_split_task(
+            x,
+            y,
+            train_idx,
+            test_idx,
+            model_factory,
+            scoring_func,
+            sample_weights,
+            max_daily_loss_pct,
+            max_trades_per_day,
+            min_trading_days,
+        )
 
 
 def cpcv_backtest(

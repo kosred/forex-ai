@@ -20,6 +20,7 @@ from .device import (
     tune_torch_backend,
     wrap_ddp,
 )
+from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
 
@@ -143,9 +144,10 @@ class TiDEExpert(ExpertModel):
             except Exception:
                 pass
 
-        num_workers = max(1, min(os.cpu_count() or 4, 8)) if is_cuda else 0
+        cpu_budget = resolve_cpu_budget()
         if world_size > 1:
-            num_workers = max(1, num_workers // world_size)
+            cpu_budget = max(1, cpu_budget // world_size)
+        num_workers = max(1, cpu_budget - 1) if is_cuda else 0
         sampler = torch.utils.data.distributed.DistributedSampler(dataset) if world_size > 1 else None
         loader_kwargs = {
             "batch_size": max(1, eff_batch // max(1, world_size)),  # Divide batch by GPU count

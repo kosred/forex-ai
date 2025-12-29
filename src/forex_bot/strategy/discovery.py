@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+import os
 
 import numpy as np
 import pandas as pd
@@ -79,8 +80,12 @@ class AutonomousDiscoveryEngine:
 
             # Portfolio Selection (Sequential Niching)
             if best_genes:
-                # 1. Generate signals for top 50 candidates to measure correlation
-                candidates = best_genes[:50]
+                # 1. Generate signals for top candidates to measure correlation
+                try:
+                    candidate_count = int(os.environ.get("FOREX_BOT_DISCOVERY_CANDIDATES", "200") or 200)
+                except Exception:
+                    candidate_count = 200
+                candidates = best_genes[: max(10, candidate_count)]
                 signals_map = {}
                 # Use bulk calc to speed up signal generation
                 cache = self.mixer.bulk_calculate_indicators(df, candidates)
@@ -90,7 +95,16 @@ class AutonomousDiscoveryEngine:
                     try:
                         sig = self.mixer.compute_signals(df, gene, cache=cache)
                         # Normalize signal for correlation (-1, 0, 1)
-                        if sig.abs().sum() > 10:  # Minimum activity check
+                        try:
+                            min_trades_per_day = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY", "1.0") or 1.0)
+                        except Exception:
+                            min_trades_per_day = 1.0
+                        if isinstance(sig.index, pd.DatetimeIndex):
+                            days = max(1, sig.index.normalize().nunique())
+                        else:
+                            days = max(1, len(sig) // 1440)
+                        min_trades = max(1, int(days * min_trades_per_day))
+                        if sig.abs().sum() >= min_trades:
                             signals_map[gene.strategy_id] = sig
                             valid_candidates.append(gene)
                     except Exception:
@@ -101,8 +115,11 @@ class AutonomousDiscoveryEngine:
                 # Sort by fitness (Sharpe)
                 valid_candidates.sort(key=lambda x: x.fitness, reverse=True)
 
-                # Increased portfolio size to 20 to avoid "blindness" in models
-                target_portfolio_size = 20 
+                # Increased portfolio size to diversify regimes
+                try:
+                    target_portfolio_size = int(os.environ.get("FOREX_BOT_DISCOVERY_PORTFOLIO_SIZE", "100") or 100)
+                except Exception:
+                    target_portfolio_size = 100
                 
                 while len(portfolio) < target_portfolio_size and valid_candidates:
                     # Pick best remaining

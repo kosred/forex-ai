@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -139,7 +140,15 @@ class NBeatsExpert(ExpertModel):
         import multiprocessing
         from contextlib import nullcontext
 
-        ctx = thread_limits(blas_threads=max(1, multiprocessing.cpu_count() - 1)) if is_cpu else nullcontext()
+        cpu_threads = 0
+        if is_cpu:
+            try:
+                cpu_threads = int(os.environ.get("FOREX_BOT_CPU_THREADS", "0") or 0)
+            except Exception:
+                cpu_threads = 0
+            if cpu_threads <= 0:
+                cpu_threads = max(1, multiprocessing.cpu_count() - 1)
+        ctx = thread_limits(blas_threads=cpu_threads) if is_cpu else nullcontext()
 
         with ctx:
             for epoch in range(100):

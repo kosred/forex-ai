@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -165,7 +166,13 @@ class TiDEExpert(ExpertModel):
 
         torch.backends.cudnn.benchmark = True
 
-        with thread_limits(blas_threads=max(1, multiprocessing.cpu_count() - 1)):
+        try:
+            cpu_threads = int(os.environ.get("FOREX_BOT_CPU_THREADS", "0") or 0)
+        except Exception:
+            cpu_threads = 0
+        if cpu_threads <= 0:
+            cpu_threads = max(1, multiprocessing.cpu_count() - 1)
+        with thread_limits(blas_threads=cpu_threads):
             for _epoch in range(self.max_epochs):
                 if time.time() - start > self.max_time_sec:
                     break

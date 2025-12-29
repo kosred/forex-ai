@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 from gymnasium import spaces
 
+from ..core.system import resolve_cpu_budget
+
 # Optional Stable Baselines 3
 try:
     from stable_baselines3 import PPO, SAC
@@ -445,7 +447,12 @@ class RLExpertPPO(ExpertModel):
 
         # Create environment with high-speed parallel execution
         import os
-        n_envs = min(int(os.environ.get("FOREX_BOT_RL_ENVS", "32")), (os.cpu_count() or 4) - 4)
+        cpu_budget = resolve_cpu_budget()
+        try:
+            requested = int(os.environ.get("FOREX_BOT_RL_ENVS", cpu_budget) or cpu_budget)
+        except Exception:
+            requested = cpu_budget
+        n_envs = max(1, min(requested, cpu_budget))
         
         def make_env():
             return PropFirmTradingEnv(meta_train, X_train.values)
@@ -561,7 +568,12 @@ class RLExpertSAC(RLExpertPPO):
 
         # Create environment with high-speed parallel execution
         import os
-        n_envs = min(int(os.environ.get("FOREX_BOT_RL_ENVS", "32")), (os.cpu_count() or 4) - 4)
+        cpu_budget = resolve_cpu_budget()
+        try:
+            requested = int(os.environ.get("FOREX_BOT_RL_ENVS", cpu_budget) or cpu_budget)
+        except Exception:
+            requested = cpu_budget
+        n_envs = max(1, min(requested, cpu_budget))
         
         def make_env():
             return PropFirmTradingEnv(meta_train, X_train.values)

@@ -136,6 +136,14 @@ models:
   evo_hidden_size: 64
   evo_population: 32
   evo_islands: 4
+  prop_search_enabled: false
+  prop_search_population: 200
+  prop_search_generations: 50
+  prop_search_max_hours: 1.0
+  prop_search_max_rows: 200000
+  prop_search_portfolio_size: 100
+  prop_search_checkpoint: models/strategy_evo_checkpoint.json
+  prop_search_device: cpu
   train_batch_size: 32
   inference_batch_size: 32
   enable_transformer_expert: true
