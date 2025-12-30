@@ -188,4 +188,4 @@ class AutonomousDiscoveryEngine:
         except Exception as e:
             logger.error(f"Discovery cycle failed: {e}", exc_info=True)
 
-        self.mixer.save_knowledge(self.cache_dir / "talib_knowledge.json")
+        self.mixer.save_knowledge(self.cache_dir / "talib_synergy.json")

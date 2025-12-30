@@ -282,15 +282,10 @@ class TALibStrategyMixer:
             b = cp.array([alpha], dtype=cp.float32)
             a = cp.array([1.0, -(1.0 - alpha)], dtype=cp.float32)
             return cpx_signal.lfilter(b, a, arr)
-        
-        # HPC FIX: Vectorized GPU EMA without Python loops
-        # Using scan-based approach if lfilter is unavailable
-        n = arr.size
-        if n == 0: return arr
-        out = cp.empty_like(arr)
-        # (This is still a bit complex for a simple replacement, 
-        # but let's assume we have lfilter since we are on a high-end setup)
-        return arr # Fallback if everything else fails
+
+        if arr.size == 0:
+            return arr
+        raise RuntimeError("cupyx.scipy.signal unavailable for EMA computation")
 
     def _wma_gpu(self, arr: "cp.ndarray", period: int) -> "cp.ndarray":
         if period <= 1:
@@ -331,9 +326,15 @@ class TALibStrategyMixer:
         try:
             if preloaded:
                 close = preloaded.get("close")
-                high = preloaded.get("high") or close
-                low = preloaded.get("low") or close
-                open_ = preloaded.get("open") or close
+                high = preloaded.get("high")
+                low = preloaded.get("low")
+                open_ = preloaded.get("open")
+                if high is None:
+                    high = close
+                if low is None:
+                    low = close
+                if open_ is None:
+                    open_ = close
                 vol = preloaded.get("volume") if self.use_volume_features else None
             else:
                 close = cp.asarray(df["close"].to_numpy(), dtype=cp.float32)
@@ -992,10 +993,44 @@ class TALibStrategyMixer:
 
             # Try cache first
             vals = None
-            if cache:
+            task_key = None
+            if cache is not None:
                 param_key = json.dumps(params, sort_keys=True)
                 task_key = f"{ind}_{param_key}"
                 vals = cache.get(task_key)
+
+            if vals is None:
+                if self.use_gpu:
+                    try:
+                        vals = self._calc_indicator_gpu(ind, params, df)
+                    except Exception:
+                        vals = None
+
+                if vals is None:
+                    try:
+                        func = abstract.Function(ind)
+                        res = func(df, **params)
+                        if isinstance(res, pd.DataFrame):
+                            res = res.iloc[:, 0]
+                        if isinstance(res, pd.Series):
+                            res = res.reindex(df.index).to_numpy()
+                        else:
+                            res = np.asarray(res)
+                        vals = np.nan_to_num(res, nan=0.0).astype(np.float32, copy=False)
+                    except Exception:
+                        vals = np.zeros(n_samples, dtype=np.float32)
+
+                if not isinstance(vals, np.ndarray):
+                    vals = np.zeros(n_samples, dtype=np.float32)
+                elif vals.shape[0] != n_samples:
+                    out = np.zeros(n_samples, dtype=np.float32)
+                    take = min(n_samples, vals.shape[0])
+                    if take > 0:
+                        out[-take:] = vals[-take:]
+                    vals = out
+
+                if cache is not None and task_key is not None:
+                    cache[task_key] = vals
 
             # HPC FIX: Semantic Scaling (Preserves Indicator Meaning)
             if vals is not None:
@@ -1087,6 +1122,27 @@ class TALibStrategyMixer:
 
         return pd.Series(final_signal, index=df.index)
 
+    def save_knowledge(self, path: Path) -> None:
+        data = {
+            "synergy_matrix": {f"{k[0]}_{k[1]}": v for k, v in self.indicator_synergy_matrix.items()},
+            "regime_performance": {reg: dict(perf) for reg, perf in self.regime_performance.items()},
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def load_knowledge(self, path: Path) -> None:
+        if not path.exists():
+            return
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for key, value in data.get("synergy_matrix", {}).items():
+            try:
+                ind1, ind2 = key.rsplit("_", 1)
+            except ValueError:
+                continue
+            self.indicator_synergy_matrix[tuple(sorted([ind1, ind2]))] = float(value)
+        for regime, perf in data.get("regime_performance", {}).items():
+            self.regime_performance[regime] = defaultdict(float, perf)
+
 
 if NUMBA_AVAILABLE:
 
@@ -1108,21 +1164,3 @@ if NUMBA_AVAILABLE:
 
 else:
     _combine_signals_numba = None
-
-    def save_knowledge(self, path: Path) -> None:
-        data = {
-            "synergy_matrix": {f"{k[0]}_{k[1]}": v for k, v in self.indicator_synergy_matrix.items()},
-            "regime_performance": {reg: dict(perf) for reg, perf in self.regime_performance.items()},
-        }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2))
-
-    def load_knowledge(self, path: Path) -> None:
-        if not path.exists():
-            return
-        data = json.loads(path.read_text())
-        for key, value in data.get("synergy_matrix", {}).items():
-            ind1, ind2 = key.split("_")
-            self.indicator_synergy_matrix[tuple(sorted([ind1, ind2]))] = value
-        for regime, perf in data.get("regime_performance", {}).items():
-            self.regime_performance[regime] = defaultdict(float, perf)

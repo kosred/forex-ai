@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..core.config import Settings
 from ..features.talib_mixer import ALL_INDICATORS, TALibStrategyMixer
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ class GeneticStrategyEvolution:
         population_size: int = 1000,
         mutation_rate: float = 0.20,
         mixer: TALibStrategyMixer | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self.population_size = population_size
         self.mutation_rate = mutation_rate
@@ -91,6 +93,7 @@ class GeneticStrategyEvolution:
         self.generation = 0
         self.best_gene: GeneticGene | None = None
         self.mixer = mixer
+        self.settings = settings or Settings()
 
     def _indicator_pool(self) -> list[str]:
         if self.mixer and self.mixer.available_indicators:
