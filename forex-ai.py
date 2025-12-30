@@ -42,7 +42,10 @@ def bootstrap():
         print("[INIT] TA-Lib missing. Installing pre-built binaries...")
         try:
             # In late 2025, TA-Lib has stable wheels for Python 3.13
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "TA-Lib", "--user", "--break-system-packages"])
+            pip_cmd = [sys.executable, "-m", "pip", "install", "TA-Lib", "--user"]
+            if platform.system().lower() == "linux":
+                pip_cmd.append("--break-system-packages")
+            subprocess.check_call(pip_cmd)
             print("[INIT] TA-Lib installed via wheel.")
         except Exception:
             print("[WARN] Wheel install failed. Falling back to source (this may take 5 mins)...")
@@ -58,7 +61,9 @@ def bootstrap():
         print("[INIT] Missing Python libraries. Syncing with Master HPC Stack...")
         req_file = Path(__file__).parent / "requirements-hpc.txt"
         
-        cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade", "--break-system-packages"]
+        cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade"]
+        if platform.system().lower() == "linux":
+            cmd.append("--break-system-packages")
         if req_file.exists():
             cmd += ["-r", str(req_file)]
         else:
