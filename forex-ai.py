@@ -54,22 +54,53 @@ def bootstrap():
     # 1.2 Python Dependencies
     try:
         import pandas
-        import torch
         import pydantic
-        import cupy
+        # GPU-specific deps are optional on Windows for local CPU testing
+        if platform.system().lower() != "windows":
+            import torch
+            import cupy
     except ImportError:
         print("[INIT] Missing Python libraries. Syncing with Master HPC Stack...")
-        req_file = Path(__file__).parent / "requirements-hpc.txt"
-        
+        base_dir = Path(__file__).parent
+        req_file = base_dir / "requirements-hpc.txt"
+        is_windows = platform.system().lower() == "windows"
+
         cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade"]
         if platform.system().lower() == "linux":
             cmd.append("--break-system-packages")
-        if req_file.exists():
+
+        if is_windows:
+            # Minimal, CPU-friendly stack to avoid Linux/CUDA-only wheels
+            win_req = base_dir / "requirements-win.txt"
+            if not win_req.exists():
+                win_req.write_text(
+                    "\n".join(
+                        [
+                            "numpy",
+                            "pandas",
+                            "scipy",
+                            "scikit-learn",
+                            "joblib",
+                            "pydantic",
+                            "pydantic-settings",
+                            "psutil",
+                            "requests",
+                            "PyYAML",
+                            "tqdm",
+                            "sqlalchemy",
+                            "numexpr",
+                            "colorama",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+            cmd += ["-r", str(win_req)]
+        elif req_file.exists():
             cmd += ["-r", str(req_file)]
         else:
             # Fallback to binary-safe core
             cmd += ["--only-binary", ":all:", "pandas", "numpy", "torch", "pydantic", "sqlalchemy", "cupy-cuda12x"]
-            
+
         try:
             subprocess.check_call(cmd)
             print("[INIT] Stack synchronized. Restarting engine...")
