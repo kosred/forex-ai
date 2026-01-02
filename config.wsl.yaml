@@ -1,0 +1,32 @@
+# WSL2-safe training profile (reduced data + memory caps for local debugging)
+# Use with: CONFIG_FILE=config.wsl.yaml python src/forex_bot/main.py --train
+
+system:
+  symbols: [EURUSD]
+  history_years: 2
+  max_training_rows_per_tf: 250000
+  discovery_auto_cap: true
+  discovery_max_rows: 200000
+  discovery_stream: true
+  cache_training_frames: false
+  training_cache_max_bytes: 500000000
+
+models:
+  # Keep discovery enabled but scaled down for local runs
+  prop_search_enabled: true
+  prop_search_population: 50
+  prop_search_generations: 10
+  prop_search_max_hours: 0.25
+  prop_search_max_rows: 200000
+  # Reduce HPO for local debugging
+  hpo_trials: 0
+  hpo_max_rows: 200000
+  # Global pooling caps
+  global_max_rows_per_symbol: 200000
+  # Smaller batch size to reduce memory spikes
+  train_batch_size: 16
+  inference_batch_size: 16
+
+news:
+  enable_news: false
+  news_backfill_days: 0

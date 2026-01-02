@@ -274,9 +274,22 @@ class FeatureEngineer:
         df = base.copy()
 
         # Optional row cap to prevent runaway memory on very long histories
+        def _parse_int_env(name: str) -> int | None:
+            raw = os.environ.get(name)
+            if raw is None:
+                return None
+            try:
+                return int(str(raw).strip())
+            except Exception:
+                return None
+
         full_data = str(os.environ.get("FOREX_BOT_FULL_DATA", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
         max_rows = 0 if full_data else int(getattr(self.settings.system, "max_training_rows_per_tf", 0) or 0)
+        env_max_rows = _parse_int_env("FOREX_BOT_MAX_TRAINING_ROWS")
+        if env_max_rows is not None:
+            max_rows = 0 if env_max_rows <= 0 else env_max_rows
         if max_rows > 0 and len(df) > max_rows:
+            logger.info(f"Capping {symbol or base_tf} rows from {len(df):,} -> {max_rows:,}")
             df = df.tail(max_rows)
 
         # Clean inf/NaN from raw OHLC data BEFORE any calculations (prevents RuntimeWarnings)
