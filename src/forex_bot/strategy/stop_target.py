@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 import numpy as np
@@ -26,6 +27,13 @@ def _rolling_var(values: np.ndarray, window: int) -> np.ndarray:
     if window <= 1:
         return np.zeros_like(values)
     return pd.Series(values).rolling(window, min_periods=window).var(ddof=1).to_numpy()
+
+
+def _vol_parkinson(high: np.ndarray, low: np.ndarray) -> np.ndarray:
+    high = np.asarray(high, dtype=np.float64)
+    low = np.asarray(low, dtype=np.float64)
+    hl = _safe_log(high) - _safe_log(low)
+    return (hl * hl) / (4.0 * np.log(2.0))
 
 
 def _vol_ewma(close: np.ndarray, *, window: int, lam: float) -> np.ndarray:
@@ -131,6 +139,18 @@ def _vol_rogers_satchell(open_: np.ndarray, high: np.ndarray, low: np.ndarray, c
     lo = _safe_log(low) - _safe_log(open_)
     lc = _safe_log(low) - _safe_log(close)
     return (ho * hc) + (lo * lc)
+
+
+def _vol_garman_klass(
+    open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray
+) -> np.ndarray:
+    h = _safe_log(high)
+    l = _safe_log(low)
+    o = _safe_log(open_)
+    c = _safe_log(close)
+    hl = h - l
+    co = c - o
+    return 0.5 * (hl * hl) - (2.0 * np.log(2.0) - 1.0) * (co * co)
 
 
 def _vol_yang_zhang(open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray, window: int) -> np.ndarray:

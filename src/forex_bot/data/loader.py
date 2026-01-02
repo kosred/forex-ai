@@ -64,6 +64,28 @@ def _guess_mt5_terminal_path() -> Path | None:
     return None
 
 
+def _parse_int_env(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return None
+
+
+def _parse_bool_env(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 class MT5Adapter:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -289,6 +311,12 @@ class DataLoader:
         # Optional in-memory cache for training frames; guarded by size limit to avoid OOM.
         self.cache_training_frames = bool(getattr(settings.system, "cache_training_frames", False))
         self.training_cache_max_bytes = int(getattr(settings.system, "training_cache_max_bytes", 2_000_000_000))
+        cache_env = _parse_bool_env("FOREX_BOT_CACHE_TRAINING_FRAMES")
+        if cache_env is not None:
+            self.cache_training_frames = cache_env
+        cache_max_env = _parse_int_env("FOREX_BOT_TRAINING_CACHE_MAX_BYTES")
+        if cache_max_env is not None and cache_max_env > 0:
+            self.training_cache_max_bytes = int(cache_max_env)
         self._training_frames_cache: dict[str, dict[str, pd.DataFrame]] = {}
 
     async def _mt5_call(self, func, *args, **kwargs):
@@ -795,7 +823,11 @@ class DataLoader:
                 
                 full_data = str(os.environ.get("FOREX_BOT_FULL_DATA", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
                 max_rows = 0 if full_data else int(getattr(self.settings.system, "max_training_rows_per_tf", 0))
+                env_max_rows = _parse_int_env("FOREX_BOT_MAX_TRAINING_ROWS")
+                if env_max_rows is not None:
+                    max_rows = 0 if env_max_rows <= 0 else env_max_rows
                 if max_rows and len(df) > max_rows:
+                    logger.info(f"Capping {symbol} {tf} rows from {len(df):,} -> {max_rows:,}")
                     df = df.tail(max_rows)
                 
                 return tf, df
