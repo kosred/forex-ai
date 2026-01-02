@@ -131,6 +131,17 @@ TALIB_INDICATORS = {
     "volume": ["AD", "ADOSC", "OBV", "MFI"],
     "price_transform": ["AVGPRICE", "MEDPRICE", "TYPPRICE", "WCLPRICE", "HT_TRENDLINE"],
 }
+
+# Add candlestick patterns from TA-Lib if available
+if TALIB_AVAILABLE:
+    try:
+        groups = talib.get_function_groups()
+        patterns = [p for p in groups.get("Pattern Recognition", []) if str(p).startswith("CDL")]
+        if patterns:
+            TALIB_INDICATORS.setdefault("candlestick", []).extend(patterns)
+    except Exception:
+        pass
+
 ALL_INDICATORS = list({ind for cat in TALIB_INDICATORS.values() for ind in cat})
 
 
@@ -208,6 +219,7 @@ class TALibStrategyMixer:
                 logger.warning("TA-Lib installed but no indicators found available via abstract API.")
         else:
             logger.warning("TA-Lib not installed; mixer will be inactive.")
+
 
         # Subset we can compute on GPU (expanded)
         self._gpu_supported = {
@@ -1038,6 +1050,8 @@ class TALibStrategyMixer:
                         vals = np.nan_to_num(res, nan=0.0).astype(np.float32, copy=False)
                     except Exception:
                         vals = np.zeros(n_samples, dtype=np.float32)
+                if vals is None:
+                    vals = np.zeros(n_samples, dtype=np.float32)
 
                 if not isinstance(vals, np.ndarray):
                     vals = np.zeros(n_samples, dtype=np.float32)

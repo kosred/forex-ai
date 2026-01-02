@@ -194,9 +194,18 @@ class ModelsConfig(BaseModel):
     prop_search_generations: int = 50
     prop_search_max_hours: float = 1.0
     prop_search_max_rows: int = 200_000
+    prop_search_max_rows_by_tf: dict[str, int] = Field(default_factory=dict)
     prop_search_portfolio_size: int = 100
     prop_search_checkpoint: str = "models/strategy_evo_checkpoint.json"
     prop_search_device: str = "cpu"
+    prop_search_train_years: int = 0
+    prop_search_val_years: int = 0
+    prop_search_val_candidates: int = 0
+    prop_search_val_min_positive_months: int = 0
+    prop_search_val_min_trades_per_month: int = 0
+    prop_search_val_min_monthly_profit_pct: float = 0.0
+    prop_search_val_log_trades: bool = False
+    prop_search_val_trade_log_max: int = 20
     train_batch_size: int = 32
     inference_batch_size: int = 32
     enable_transformer_expert: bool = True

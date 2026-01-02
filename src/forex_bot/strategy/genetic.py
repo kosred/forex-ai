@@ -176,13 +176,10 @@ class GeneticStrategyEvolution:
             else:
                 talib_gene = self.mixer.generate_random_strategy(regime=regime)
                 gene = GeneticGene(**asdict(talib_gene), generation=self.generation)
-            # Enforce a minimum of 4 confluences (indicators)
-            if len(gene.indicators) < 4:
-                missing = 4 - len(gene.indicators)
+            if not gene.indicators:
                 pool = self._indicator_pool()
-                available_inds = [ind for ind in pool if ind not in gene.indicators]
-                if available_inds:
-                    gene.indicators.extend(random.sample(available_inds, k=min(missing, len(available_inds))))
+                if pool:
+                    gene.indicators.append(random.choice(pool))
             self._sync_indicator_maps(gene)
 
             if gauntlet:

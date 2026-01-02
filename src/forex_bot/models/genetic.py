@@ -68,7 +68,20 @@ class GeneticStrategyExpert(ExpertModel):
             from pathlib import Path
 
             cache_dir = Path("cache")
+            symbol = ""
+            try:
+                if isinstance(metadata, pd.DataFrame):
+                    symbol = str(metadata.attrs.get("symbol", "") or "")
+            except Exception:
+                symbol = ""
+            if not symbol:
+                symbol = str(os.environ.get("FOREX_BOT_SYMBOL", "") or "")
             knowledge_path = cache_dir / "talib_knowledge.json"
+            if symbol:
+                sym_tag = "".join(c for c in symbol if c.isalnum() or c in ("-", "_"))
+                sym_path = cache_dir / f"talib_knowledge_{sym_tag}.json"
+                if sym_path.exists():
+                    knowledge_path = sym_path
 
             if knowledge_path.exists():
                 content = knowledge_path.read_text()

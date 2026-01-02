@@ -70,6 +70,25 @@ class TrainingService:
         except Exception as exc:
             logger.warning(f"Failed to persist incremental progress: {exc}")
 
+    def _get_prop_max_rows(self, tf: str | None = None) -> int:
+        try:
+            max_rows = int(getattr(self.settings.models, "prop_search_max_rows", 0) or 0)
+        except Exception:
+            max_rows = 0
+        try:
+            by_tf = getattr(self.settings.models, "prop_search_max_rows_by_tf", {}) or {}
+        except Exception:
+            by_tf = {}
+        if tf and isinstance(by_tf, dict):
+            tf_key = str(tf).upper()
+            for key, value in by_tf.items():
+                if str(key).upper() == tf_key:
+                    try:
+                        return int(value or 0)
+                    except Exception:
+                        return max_rows
+        return max_rows
+
     def _build_discovery_frames_for_tensor(
         self,
         frames: dict[str, pd.DataFrame],
@@ -490,10 +509,7 @@ class TrainingService:
                 base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
                 prop_df = frames.get(base_tf) or frames.get("M1")
                 if prop_df is not None and not prop_df.empty:
-                    try:
-                        max_rows = int(getattr(self.settings.models, "prop_search_max_rows", 0) or 0)
-                    except Exception:
-                        max_rows = 0
+                    max_rows = self._get_prop_max_rows(base_tf)
                     if max_rows > 0 and len(prop_df) > max_rows:
                         prop_df = prop_df.tail(max_rows)
 
@@ -1548,68 +1564,131 @@ class TrainingService:
             raw_frames, None, target_sym, base_dataset=target_ds
         )
 
-        prop_task = None
         if bool(getattr(self.settings.models, "prop_search_enabled", False)):
             try:
                 from ..strategy.evo_prop import run_evo_search
 
-                base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
-                prop_df = raw_frames.get(base_tf) or raw_frames.get("M1")
-                if prop_df is not None and not prop_df.empty:
-                    try:
-                        max_rows = int(getattr(self.settings.models, "prop_search_max_rows", 0) or 0)
-                    except Exception:
-                        max_rows = 0
-                    if max_rows > 0 and len(prop_df) > max_rows:
-                        prop_df = prop_df.tail(max_rows)
+                def _parse_tfs_env(name: str) -> list[str] | None:
+                    raw = os.environ.get(name)
+                    if not raw:
+                        return None
+                    parts = [p.strip().upper() for p in str(raw).split(",") if p.strip()]
+                    return parts or None
 
-                    prop_settings = self.settings.model_copy()
-                    prop_device = str(
-                        getattr(self.settings.models, "prop_search_device", "cpu") or "cpu"
-                    )
-                    prop_settings.system.device = prop_device
+                def _parse_syms_env(name: str) -> list[str] | None:
+                    raw = os.environ.get(name)
+                    if not raw:
+                        return None
+                    parts = [p.strip().upper() for p in str(raw).split(",") if p.strip()]
+                    return parts or None
 
-                    try:
-                        pop = int(getattr(self.settings.models, "prop_search_population", 64) or 64)
-                    except Exception:
-                        pop = 64
-                    try:
-                        gens = int(getattr(self.settings.models, "prop_search_generations", 50) or 50)
-                    except Exception:
-                        gens = 50
-                    try:
-                        max_hours = float(
-                            getattr(self.settings.models, "prop_search_max_hours", 1.0) or 1.0
-                        )
-                    except Exception:
-                        max_hours = 1.0
-                    checkpoint = str(
-                        getattr(
-                            self.settings.models,
-                            "prop_search_checkpoint",
-                            "models/strategy_evo_checkpoint.json",
-                        )
-                        or "models/strategy_evo_checkpoint.json"
-                    )
-                    try:
-                        actual_balance = float(
-                            getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0
-                        )
-                    except Exception:
-                        actual_balance = 100000.0
+                tfs_env = _parse_tfs_env("FOREX_BOT_PROP_SEARCH_TFS")
+                syms_env = _parse_syms_env("FOREX_BOT_PROP_SEARCH_SYMBOLS")
 
-                    loop = asyncio.get_running_loop()
-                    prop_task = loop.run_in_executor(
-                        None,
-                        run_evo_search,
-                        prop_df,
-                        prop_settings,
-                        pop,
-                        gens,
-                        checkpoint,
-                        max_hours,
-                        actual_balance,
-                    )
+                symbols_to_run = symbols
+                if syms_env:
+                    symbols_to_run = [s for s in syms_env if s in symbols]
+                if not symbols_to_run:
+                    logger.warning("[STRATEGY DISCOVERY] No symbols available, skipping")
+                else:
+                    logger.info(f"[STRATEGY DISCOVERY] Symbols: {symbols_to_run}")
+
+                for sym in symbols_to_run:
+                    logger.info(f"[STRATEGY DISCOVERY] Running prop-aware search on {sym} data...")
+                    await self.data_loader.ensure_history(sym)
+                    frames = await self.data_loader.get_training_data(sym)
+                    if not isinstance(frames, dict) or not frames:
+                        logger.warning(f"[STRATEGY DISCOVERY] No frames for {sym}, skipping")
+                        continue
+
+                    base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
+                    cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
+                    if not cfg_tfs:
+                        cfg_tfs = list(getattr(self.settings.system, "higher_timeframes", []) or [])
+                    tfs = [base_tf]
+                    for tf in cfg_tfs:
+                        if tf != base_tf:
+                            tfs.append(tf)
+                    for tf in frames.keys():
+                        if tf not in tfs:
+                            tfs.append(tf)
+                    if tfs_env:
+                        tfs = [tf for tf in tfs_env if tf in frames]
+
+                    if not tfs:
+                        logger.warning(f"[STRATEGY DISCOVERY] {sym}: No timeframes available, skipping")
+                        continue
+                    logger.info(f"[STRATEGY DISCOVERY] {sym}: Timeframes: {tfs}")
+
+                    for tf in tfs:
+                        prop_df = frames.get(tf)
+                        if prop_df is None or prop_df.empty:
+                            continue
+
+                        try:
+                            prop_df.attrs["timeframe"] = tf
+                            prop_df.attrs["tf"] = tf
+                            prop_df.attrs["symbol"] = sym
+                        except Exception:
+                            pass
+
+                        max_rows = self._get_prop_max_rows(tf)
+                        if max_rows > 0 and len(prop_df) > max_rows:
+                            prop_df = prop_df.tail(max_rows)
+
+                        try:
+                            pop = int(getattr(self.settings.models, "prop_search_population", 64) or 64)
+                        except Exception:
+                            pop = 64
+                        try:
+                            gens = int(getattr(self.settings.models, "prop_search_generations", 50) or 50)
+                        except Exception:
+                            gens = 50
+                        try:
+                            max_hours = float(
+                                getattr(self.settings.models, "prop_search_max_hours", 1.0) or 1.0
+                            )
+                        except Exception:
+                            max_hours = 1.0
+                        checkpoint = str(
+                            getattr(
+                                self.settings.models,
+                                "prop_search_checkpoint",
+                                "models/strategy_evo_checkpoint.json",
+                            )
+                            or "models/strategy_evo_checkpoint.json"
+                        )
+                        ckpt_path = Path(checkpoint)
+                        sym_tag = "".join(c for c in sym if c.isalnum() or c in ("-", "_"))
+                        tf_tag = "".join(c for c in tf if c.isalnum() or c in ("-", "_"))
+                        if len(symbols_to_run) > 1 or len(tfs) > 1:
+                            checkpoint = str(
+                                ckpt_path.with_name(f"{ckpt_path.stem}_{sym_tag}_{tf_tag}{ckpt_path.suffix}")
+                            )
+                        try:
+                            actual_balance = float(
+                                getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0
+                            )
+                        except Exception:
+                            actual_balance = 100000.0
+
+                        prop_settings = self.settings.model_copy()
+                        prop_device = str(
+                            getattr(self.settings.models, "prop_search_device", "cpu") or "cpu"
+                        )
+                        prop_settings.system.device = prop_device
+                        prop_settings.system.symbol = sym
+
+                        await asyncio.to_thread(
+                            run_evo_search,
+                            prop_df,
+                            prop_settings,
+                            pop,
+                            gens,
+                            checkpoint,
+                            max_hours,
+                            actual_balance,
+                        )
             except Exception as exc:
                 logger.warning(f"Failed to start prop-aware search: {exc}")
 
@@ -1618,26 +1697,9 @@ class TrainingService:
         discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
         # --- Final Global Training ---
-        exclude_models = ["genetic"] if prop_task is not None else None
         full_ds = await self._train_global_from_datasets(
-            datasets, symbols, optimize, stop_event, exclude_models=exclude_models
+            datasets, symbols, optimize, stop_event, exclude_models=None
         )
-
-        if prop_task is not None:
-            try:
-                await prop_task
-            except Exception as exc:
-                logger.warning(f"Prop-aware search failed: {exc}")
-
-            if full_ds is not None:
-                await asyncio.to_thread(
-                    self.trainer.train_all,
-                    full_ds,
-                    False,
-                    stop_event,
-                    ["genetic"],
-                    None,
-                )
 
     async def _train_global_sequential(
         self, symbols: list[str], optimize: bool, stop_event: asyncio.Event | None
@@ -1690,15 +1752,6 @@ class TrainingService:
             try:
                 from ..strategy.evo_prop import run_evo_search
 
-                # Use first symbol's data for discovery
-                first_sym, first_ds = datasets[0]
-                logger.info(f"[STRATEGY DISCOVERY] Running prop-aware search on {first_sym} data...")
-
-                # Get raw OHLC frames for discovery
-                self.settings.system.symbol = first_sym
-                frames = await self.data_loader.get_training_data(first_sym)
-                base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
-
                 def _parse_tfs_env(name: str) -> list[str] | None:
                     raw = os.environ.get(name)
                     if not raw:
@@ -1706,89 +1759,129 @@ class TrainingService:
                     parts = [p.strip().upper() for p in str(raw).split(",") if p.strip()]
                     return parts or None
 
+                def _parse_syms_env(name: str) -> list[str] | None:
+                    raw = os.environ.get(name)
+                    if not raw:
+                        return None
+                    parts = [p.strip().upper() for p in str(raw).split(",") if p.strip()]
+                    return parts or None
+
                 tfs_env = _parse_tfs_env("FOREX_BOT_PROP_SEARCH_TFS")
-                cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
-                if not cfg_tfs:
-                    cfg_tfs = list(getattr(self.settings.system, "higher_timeframes", []) or [])
-                # Default: search across all available frames (base + required + any extras)
-                tfs = [base_tf]
-                for tf in cfg_tfs:
-                    if tf != base_tf:
-                        tfs.append(tf)
-                for tf in frames.keys():
-                    if tf not in tfs:
-                        tfs.append(tf)
-                if tfs_env:
-                    tfs = [tf for tf in tfs_env if tf in frames]
+                syms_env = _parse_syms_env("FOREX_BOT_PROP_SEARCH_SYMBOLS")
 
-                if not tfs:
-                    logger.warning("[STRATEGY DISCOVERY] No timeframes available, skipping")
+                available_syms = [sym for sym, _ in datasets]
+                symbols_to_run = available_syms
+                if syms_env:
+                    symbols_to_run = [s for s in syms_env if s in available_syms]
+                if not symbols_to_run:
+                    logger.warning("[STRATEGY DISCOVERY] No symbols available, skipping")
                 else:
-                    logger.info(f"[STRATEGY DISCOVERY] Timeframes: {tfs}")
+                    logger.info(f"[STRATEGY DISCOVERY] Symbols: {symbols_to_run}")
 
-                for tf in tfs:
-                    prop_df = frames.get(tf)
-                    if prop_df is None or prop_df.empty:
+                for sym in symbols_to_run:
+                    logger.info(f"[STRATEGY DISCOVERY] Running prop-aware search on {sym} data...")
+
+                    # Get raw OHLC frames for discovery
+                    self.settings.system.symbol = sym
+                    frames = await self.data_loader.get_training_data(sym)
+                    if not isinstance(frames, dict) or not frames:
+                        logger.warning(f"[STRATEGY DISCOVERY] No frames for {sym}, skipping")
                         continue
 
-                    # Annotate timeframe for downstream volatility settings
-                    try:
-                        prop_df.attrs["timeframe"] = tf
-                        prop_df.attrs["tf"] = tf
-                    except Exception:
-                        pass
+                    base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
+                    cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
+                    if not cfg_tfs:
+                        cfg_tfs = list(getattr(self.settings.system, "higher_timeframes", []) or [])
+                    # Default: search across all available frames (base + required + any extras)
+                    tfs = [base_tf]
+                    for tf in cfg_tfs:
+                        if tf != base_tf:
+                            tfs.append(tf)
+                    for tf in frames.keys():
+                        if tf not in tfs:
+                            tfs.append(tf)
+                    if tfs_env:
+                        tfs = [tf for tf in tfs_env if tf in frames]
 
-                    try:
-                        max_rows = int(getattr(self.settings.models, "prop_search_max_rows", 0) or 0)
-                    except Exception:
-                        max_rows = 0
-                    if max_rows > 0 and len(prop_df) > max_rows:
-                        prop_df = prop_df.tail(max_rows)
+                    if not tfs:
+                        logger.warning(f"[STRATEGY DISCOVERY] {sym}: No timeframes available, skipping")
+                        continue
+                    logger.info(f"[STRATEGY DISCOVERY] {sym}: Timeframes: {tfs}")
+
+                    for tf in tfs:
+                        prop_df = frames.get(tf)
+                        if prop_df is None or prop_df.empty:
+                            continue
+
+                        # Annotate timeframe/symbol for downstream logic
+                        try:
+                            prop_df.attrs["timeframe"] = tf
+                            prop_df.attrs["tf"] = tf
+                            prop_df.attrs["symbol"] = sym
+                        except Exception:
+                            pass
+
+                        max_rows = self._get_prop_max_rows(tf)
+                        if max_rows > 0 and len(prop_df) > max_rows:
+                            prop_df = prop_df.tail(max_rows)
+                            logger.info(
+                                f"[STRATEGY DISCOVERY] {sym} {tf}: Using {len(prop_df):,} rows (capped from {len(frames.get(tf, prop_df)):,})"
+                            )
+
+                        try:
+                            pop = int(getattr(self.settings.models, "prop_search_population", 64) or 64)
+                        except Exception:
+                            pop = 64
+                        try:
+                            gens = int(getattr(self.settings.models, "prop_search_generations", 50) or 50)
+                        except Exception:
+                            gens = 50
+                        try:
+                            max_hours = float(getattr(self.settings.models, "prop_search_max_hours", 1.0) or 1.0)
+                        except Exception:
+                            max_hours = 1.0
+                        try:
+                            actual_balance = float(
+                                getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0
+                            )
+                        except Exception:
+                            actual_balance = 100000.0
+
+                        checkpoint = str(
+                            getattr(
+                                self.settings.models,
+                                "prop_search_checkpoint",
+                                "models/strategy_evo_checkpoint.json",
+                            )
+                            or "models/strategy_evo_checkpoint.json"
+                        )
+                        ckpt_path = Path(checkpoint)
+                        sym_tag = "".join(c for c in sym if c.isalnum() or c in ("-", "_"))
+                        tf_tag = "".join(c for c in tf if c.isalnum() or c in ("-", "_"))
+                        if len(symbols_to_run) > 1 or len(tfs) > 1:
+                            checkpoint = str(
+                                ckpt_path.with_name(f"{ckpt_path.stem}_{sym_tag}_{tf_tag}{ckpt_path.suffix}")
+                            )
+
                         logger.info(
-                            f"[STRATEGY DISCOVERY] {tf}: Using {len(prop_df):,} rows (capped from {len(frames.get(tf, prop_df)):,})"
+                            f"[STRATEGY DISCOVERY] {sym} {tf}: Config pop={pop}, gen={gens}, max_hours={max_hours:.1f}h, rows={len(prop_df):,}"
                         )
 
-                    try:
-                        pop = int(getattr(self.settings.models, "prop_search_population", 64) or 64)
-                    except Exception:
-                        pop = 64
-                    try:
-                        gens = int(getattr(self.settings.models, "prop_search_generations", 50) or 50)
-                    except Exception:
-                        gens = 50
-                    try:
-                        max_hours = float(getattr(self.settings.models, "prop_search_max_hours", 1.0) or 1.0)
-                    except Exception:
-                        max_hours = 1.0
-                    try:
-                        actual_balance = float(getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0)
-                    except Exception:
-                        actual_balance = 100000.0
+                        prop_settings = self.settings.model_copy()
+                        prop_settings.system.symbol = sym
 
-                    checkpoint = str(
-                        getattr(self.settings.models, "prop_search_checkpoint", "models/strategy_evo_checkpoint.json")
-                        or "models/strategy_evo_checkpoint.json"
-                    )
-                    if len(tfs) > 1:
-                        ckpt_path = Path(checkpoint)
-                        checkpoint = str(ckpt_path.with_name(f"{ckpt_path.stem}_{tf}{ckpt_path.suffix}"))
-
-                    logger.info(
-                        f"[STRATEGY DISCOVERY] {tf}: Config pop={pop}, gen={gens}, max_hours={max_hours:.1f}h, rows={len(prop_df):,}"
-                    )
-
-                    # Run discovery synchronously (blocking)
-                    await asyncio.to_thread(
-                        run_evo_search,
-                        prop_df,
-                        self.settings,
-                        pop,
-                        gens,
-                        checkpoint,
-                        max_hours,
-                        actual_balance,
-                    )
-                logger.info("[STRATEGY DISCOVERY] Completed! Strategies saved to talib_knowledge.json")
+                        # Run discovery synchronously (blocking)
+                        await asyncio.to_thread(
+                            run_evo_search,
+                            prop_df,
+                            prop_settings,
+                            pop,
+                            gens,
+                            checkpoint,
+                            max_hours,
+                            actual_balance,
+                        )
+                logger.info("[STRATEGY DISCOVERY] Completed!")
             except Exception as exc:
                 logger.warning(f"[STRATEGY DISCOVERY] Failed: {exc}", exc_info=True)
 

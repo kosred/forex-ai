@@ -144,6 +144,14 @@ models:
   prop_search_portfolio_size: 100  # Top strategies to save (diverse across sessions/regimes)
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: cpu
+  prop_search_train_years: 8
+  prop_search_val_years: 1
+  prop_search_val_candidates: 0
+  prop_search_val_min_positive_months: 0
+  prop_search_val_min_trades_per_month: 0
+  prop_search_val_min_monthly_profit_pct: 0.0
+  prop_search_val_log_trades: true
+  prop_search_val_trade_log_max: 50
   train_batch_size: 32
   inference_batch_size: 32
   enable_transformer_expert: true

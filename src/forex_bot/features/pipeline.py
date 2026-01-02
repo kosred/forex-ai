@@ -668,6 +668,11 @@ class FeatureEngineer:
             meta["volume"] = df["volume"]
         if "atr" in df.columns:
             meta["atr"] = df["atr"]
+        try:
+            if symbol:
+                meta.attrs["symbol"] = symbol
+        except Exception:
+            pass
 
         # Merged dataset finalized
         final_features = list(X.columns)
@@ -802,7 +807,7 @@ class FeatureEngineer:
             logger.warning(f"TA-Lib comprehensive dynamic injection failed: {e}")
         
         return df.fillna(0.0)
-            
+
 
             
 
@@ -1156,6 +1161,20 @@ class FeatureEngineer:
 
         # 2. Fallback to Old Evolution (talib_knowledge.json)
         knowledge_path = self.cache_dir / "talib_knowledge.json"
+        try:
+            sym = str(getattr(self.settings.system, "symbol", "") or "")
+        except Exception:
+            sym = ""
+        if not sym:
+            try:
+                sym = str(df.attrs.get("symbol", "") or "")
+            except Exception:
+                sym = ""
+        if sym:
+            sym_tag = "".join(c for c in sym if c.isalnum() or c in ("-", "_"))
+            sym_path = self.cache_dir / f"talib_knowledge_{sym_tag}.json"
+            if sym_path.exists():
+                knowledge_path = sym_path
         if knowledge_path.exists():
             try:
                 import json

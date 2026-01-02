@@ -112,12 +112,11 @@ class GenesisLibrary:
             for ind in list(getattr(gene, "weights", {}).keys()):
                 if ind in vol_inds:
                     gene.weights.pop(ind, None)
-            # Ensure minimum confluences
-            if len(gene.indicators) < 4:
+            # Ensure at least one indicator remains
+            if len(gene.indicators) < 1:
                 pool = [ind for ind in mixer.available_indicators if ind not in vol_inds]
-                missing = 4 - len(gene.indicators)
                 if pool:
-                    gene.indicators.extend(random.sample(pool, k=min(missing, len(pool))))
+                    gene.indicators.append(random.choice(pool))
             return gene
         pop = []
 

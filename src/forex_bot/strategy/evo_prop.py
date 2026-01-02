@@ -1,4 +1,5 @@
 import concurrent.futures
+import csv
 import json
 import logging
 import multiprocessing
@@ -15,7 +16,7 @@ import torch.distributed as dist
 from ..core.config import Settings
 from ..core.system import resolve_cpu_budget
 from ..features.talib_mixer import TALIB_AVAILABLE, TALibStrategyMixer
-from .fast_backtest import fast_evaluate_strategy, infer_pip_metrics
+from .fast_backtest import detailed_backtest, fast_evaluate_strategy, infer_pip_metrics
 from .stop_target import infer_stop_target_pips
 from .genetic import GeneticGene, GeneticStrategyEvolution
 
@@ -57,6 +58,10 @@ def _evaluate_gene_worker(
 
     try:
         signals = mixer.compute_signals(df, gene, cache=indicator_cache).to_numpy()
+        # Strict no-lookahead: act on next bar
+        if len(signals) > 0:
+            signals = np.roll(signals, 1)
+            signals[0] = 0
     except Exception as exc:
         logger.warning(f"Signal generation failed for {gene.strategy_id}: {exc}")
         return (gene.strategy_id, FitnessResult(-1e9, 0.0, 1.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
@@ -169,20 +174,13 @@ class PropAwareStrategySearch:
         actual_balance: float | None = None,
     ) -> None:
         self.settings = settings
-        self.df = df
-        self._month_indices = np.zeros(len(self.df), dtype=np.int64)
-        self._day_indices = np.zeros(len(self.df), dtype=np.int64)
-        try:
-            idx = getattr(self.df, "index", None)
-            if isinstance(idx, pd.DatetimeIndex) and len(idx) == len(self.df):
-                ts = idx.tz_convert("UTC") if idx.tz is not None else idx
-                raw = ts.year.to_numpy() * 12 + ts.month.to_numpy()
-                self._month_indices = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
-                day_raw = ts.year.to_numpy() * 10000 + ts.month.to_numpy() * 100 + ts.day.to_numpy()
-                self._day_indices = np.nan_to_num(day_raw, nan=0.0).astype(np.int64, copy=False)
-        except Exception:
-            self._month_indices = np.zeros(len(self.df), dtype=np.int64)
-            self._day_indices = np.zeros(len(self.df), dtype=np.int64)
+        self.df_full = df
+        self.df_val: pd.DataFrame | None = None
+        self._val_summary: dict[str, dict[str, Any]] = {}
+        self._val_monthly: dict[str, dict[str, Any]] = {}
+        self._val_month_labels: list[str] = []
+        self.df, self.df_val = self._split_train_val(df)
+        self._month_indices, self._day_indices = self._compute_month_day_indices(self.df)
         self.checkpoint_path = checkpoint_path
         self.max_time_hours = max_time_hours
         self.mixer = TALibStrategyMixer(
@@ -222,6 +220,418 @@ class PropAwareStrategySearch:
             )
         except Exception:
             self._prop_min_trades = 0
+
+    def _symbol_tag(self) -> str:
+        symbol = str(getattr(self, "symbol", "") or "")
+        if not symbol:
+            try:
+                symbol = str(self.df.attrs.get("symbol", "") or "")
+            except Exception:
+                symbol = ""
+        if not symbol:
+            try:
+                symbol = str(getattr(self.settings.system, "symbol", "") or "")
+            except Exception:
+                symbol = ""
+        if not symbol:
+            return ""
+        return "".join(c for c in symbol if c.isalnum() or c in ("-", "_"))
+
+    @staticmethod
+    def _compute_month_day_indices(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        month_indices = np.zeros(len(df), dtype=np.int64)
+        day_indices = np.zeros(len(df), dtype=np.int64)
+        try:
+            idx = getattr(df, "index", None)
+            if isinstance(idx, pd.DatetimeIndex) and len(idx) == len(df):
+                ts = idx.tz_convert("UTC") if idx.tz is not None else idx
+                raw = ts.year.to_numpy() * 12 + ts.month.to_numpy()
+                month_indices = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
+                day_raw = ts.year.to_numpy() * 10000 + ts.month.to_numpy() * 100 + ts.day.to_numpy()
+                day_indices = np.nan_to_num(day_raw, nan=0.0).astype(np.int64, copy=False)
+        except Exception:
+            month_indices = np.zeros(len(df), dtype=np.int64)
+            day_indices = np.zeros(len(df), dtype=np.int64)
+        return month_indices, day_indices
+
+    def _split_train_val(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+        try:
+            train_years = int(getattr(self.settings.models, "prop_search_train_years", 0) or 0)
+        except Exception:
+            train_years = 0
+        try:
+            val_years = int(getattr(self.settings.models, "prop_search_val_years", 0) or 0)
+        except Exception:
+            val_years = 0
+
+        if val_years <= 0:
+            return df, None
+
+        idx = getattr(df, "index", None)
+        if not isinstance(idx, pd.DatetimeIndex):
+            logger.warning("Prop search validation split requires DatetimeIndex; using full data.")
+            return df, None
+
+        if not idx.is_monotonic_increasing:
+            df = df.sort_index(kind="mergesort")
+            idx = df.index
+
+        idx_cmp = idx
+        if idx.tz is not None:
+            try:
+                idx_cmp = idx.tz_convert("UTC").tz_localize(None)
+            except Exception:
+                idx_cmp = idx.tz_localize(None)
+
+        end_ts = idx_cmp.max()
+        if end_ts is None or end_ts is pd.NaT:
+            return df, None
+
+        val_start = (end_ts - pd.DateOffset(years=val_years)).to_period("M").to_timestamp()
+        if train_years > 0:
+            train_start = (val_start - pd.DateOffset(years=train_years)).to_period("M").to_timestamp()
+            train_df = df[(idx_cmp >= train_start) & (idx_cmp < val_start)]
+        else:
+            train_df = df[idx_cmp < val_start]
+        val_df = df[idx_cmp >= val_start]
+        try:
+            train_df.attrs = dict(df.attrs)
+            val_df.attrs = dict(df.attrs)
+        except Exception:
+            pass
+
+        if train_df.empty or val_df.empty:
+            logger.warning(
+                "Prop search split produced empty train/val (train=%s, val=%s); using full data.",
+                len(train_df),
+                len(val_df),
+            )
+            return df, None
+
+        logger.info(
+            "Prop search split: train=%s→%s (%s rows), val=%s→%s (%s rows)",
+            train_df.index.min(),
+            train_df.index.max(),
+            f"{len(train_df):,}",
+            val_df.index.min(),
+            val_df.index.max(),
+            f"{len(val_df):,}",
+        )
+        return train_df, val_df
+
+    @staticmethod
+    def _build_month_slices(df: pd.DataFrame) -> tuple[list[str], list[tuple[int, int]]]:
+        if df.empty:
+            return [], []
+        idx = getattr(df, "index", None)
+        if not isinstance(idx, pd.DatetimeIndex):
+            return [], []
+        idx_cmp = idx
+        if idx.tz is not None:
+            try:
+                idx_cmp = idx.tz_convert("UTC").tz_localize(None)
+            except Exception:
+                idx_cmp = idx.tz_localize(None)
+        month_labels = idx_cmp.to_period("M").astype(str).to_numpy()
+        if len(month_labels) == 0:
+            return [], []
+        changes = np.nonzero(month_labels[1:] != month_labels[:-1])[0] + 1
+        starts = np.concatenate(([0], changes))
+        ends = np.concatenate((changes, [len(month_labels)]))
+        labels = [str(month_labels[s]) for s in starts]
+        slices = [(int(s), int(e)) for s, e in zip(starts, ends, strict=False)]
+        return labels, slices
+
+    def _validate_candidates_monthly(self) -> None:
+        if self.df_val is None or self.df_val.empty:
+            return
+        df_val = self.df_val
+        idx = getattr(df_val, "index", None)
+        if not isinstance(idx, pd.DatetimeIndex):
+            logger.warning("Monthly validation requires DatetimeIndex; skipping.")
+            return
+        if not idx.is_monotonic_increasing:
+            df_val = df_val.sort_index(kind="mergesort")
+
+        month_labels, month_slices = self._build_month_slices(df_val)
+        if not month_labels:
+            return
+
+        try:
+            candidates = int(getattr(self.settings.models, "prop_search_val_candidates", 0) or 0)
+        except Exception:
+            candidates = 0
+        if candidates <= 0:
+            candidates = self._prop_portfolio_size
+
+        sorted_pop = sorted(self.evolver.population, key=lambda g: g.fitness, reverse=True)
+        genes = sorted_pop[: max(0, min(candidates, len(sorted_pop)))]
+        if not genes:
+            return
+
+        try:
+            min_trades_month = int(
+                getattr(self.settings.models, "prop_search_val_min_trades_per_month", 0) or 0
+            )
+        except Exception:
+            min_trades_month = 0
+
+        try:
+            log_trades = bool(getattr(self.settings.models, "prop_search_val_log_trades", False))
+        except Exception:
+            log_trades = False
+        try:
+            log_trades_max = int(getattr(self.settings.models, "prop_search_val_trade_log_max", 0) or 0)
+        except Exception:
+            log_trades_max = 0
+        if log_trades_max <= 0:
+            log_trades_max = len(genes)
+
+        # Precompute indicator cache for validation
+        try:
+            val_cache = self.mixer.bulk_calculate_indicators(df_val, genes)
+        except Exception as exc:
+            logger.warning(f"Validation indicator cache failed; continuing without cache: {exc}")
+            val_cache = {}
+
+        close = df_val["close"].to_numpy()
+        high = df_val["high"].to_numpy()
+        low = df_val["low"].to_numpy()
+        timestamps = df_val.index.to_numpy()
+        month_indices, day_indices = self._compute_month_day_indices(df_val)
+        month_label_map: dict[int, str] = {}
+        for label, (start, _end) in zip(month_labels, month_slices, strict=False):
+            try:
+                month_label_map[int(month_indices[start])] = label
+            except Exception:
+                continue
+
+        self._val_month_labels = month_labels
+        self._val_summary = {}
+        self._val_monthly = {}
+
+        logger.info(
+            "Monthly validation: %s candidates over %s months (min trades/month=%s).",
+            len(genes),
+            len(month_labels),
+            min_trades_month,
+        )
+
+        for idx_gene, gene in enumerate(genes):
+            try:
+                signals = self.mixer.compute_signals(df_val, gene, cache=val_cache).to_numpy()
+                # Strict no-lookahead: act on next bar
+                if len(signals) > 0:
+                    signals = np.roll(signals, 1)
+                    signals[0] = 0
+            except Exception as exc:
+                logger.warning(f"Validation signal generation failed for {gene.strategy_id}: {exc}")
+                continue
+
+            tp_pips = float(getattr(gene, "tp_pips", 40.0))
+            sl_pips = float(getattr(gene, "sl_pips", 20.0))
+            spread = float(getattr(self.settings.risk, "backtest_spread_pips", 1.5))
+            commission = float(getattr(self.settings.risk, "commission_per_lot", 7.0))
+            max_hold = int(getattr(self.settings.risk, "triple_barrier_max_bars", 0) or 0)
+            trailing_enabled = bool(getattr(self.settings.risk, "trailing_enabled", False))
+            trailing_mult = float(getattr(self.settings.risk, "trailing_atr_multiplier", 1.0) or 1.0)
+            trailing_trigger_r = float(getattr(self.settings.risk, "trailing_be_trigger_r", 1.0) or 1.0)
+            pip_size, pip_value_per_lot = infer_pip_metrics(self.symbol)
+            mode = str(getattr(self.settings.risk, "stop_target_mode", "blend") or "blend").lower()
+            if mode not in {"fixed", "gene"}:
+                res = infer_stop_target_pips(df_val, settings=self.settings, pip_size=pip_size)
+                if res is not None:
+                    sl_pips, tp_pips, _rr = res
+
+            details = detailed_backtest(
+                close_prices=close,
+                high_prices=high,
+                low_prices=low,
+                signals=signals,
+                timestamps=timestamps,
+                month_indices=month_indices,
+                day_indices=day_indices,
+                sl_pips=sl_pips,
+                tp_pips=tp_pips,
+                max_hold_bars=max_hold,
+                trailing_enabled=trailing_enabled,
+                trailing_atr_multiplier=trailing_mult,
+                trailing_be_trigger_r=trailing_trigger_r,
+                spread_pips=spread,
+                commission_per_trade=commission,
+                pip_value=pip_size,
+                pip_value_per_lot=pip_value_per_lot,
+                month_label_map=month_label_map,
+                base_balance=self.actual_balance,
+            )
+
+            monthly_dict = details.get("monthly", {})
+            summary = details.get("summary", {})
+            monthly_profit_pct: list[float] = []
+            monthly_trades: list[int] = []
+            monthly_net_profit: list[float] = []
+            monthly_win_rate: list[float] = []
+            monthly_profit_factor: list[float] = []
+            monthly_max_dd: list[float] = []
+            monthly_avg_trade: list[float] = []
+            monthly_avg_hold: list[float] = []
+            monthly_exposure: list[float] = []
+            monthly_max_daily_dd: list[float] = []
+            monthly_gross_profit: list[float] = []
+            monthly_gross_loss: list[float] = []
+            monthly_return_pct: list[float] = []
+            monthly_start_equity: list[float] = []
+            monthly_end_equity: list[float] = []
+            monthly_sharpe: list[float] = []
+
+            for label in month_labels:
+                m = monthly_dict.get(label, {})
+                monthly_profit_pct.append(float(m.get("base_return_pct", 0.0) or 0.0))
+                monthly_return_pct.append(float(m.get("return_pct", 0.0) or 0.0))
+                monthly_trades.append(int(m.get("trades", 0) or 0))
+                monthly_net_profit.append(float(m.get("net_profit", 0.0) or 0.0))
+                monthly_win_rate.append(float(m.get("win_rate", 0.0) or 0.0))
+                monthly_profit_factor.append(float(m.get("profit_factor", 0.0) or 0.0))
+                monthly_max_dd.append(float(m.get("max_dd", 0.0) or 0.0))
+                monthly_avg_trade.append(float(m.get("avg_trade", 0.0) or 0.0))
+                monthly_avg_hold.append(float(m.get("avg_hold_bars", 0.0) or 0.0))
+                monthly_exposure.append(float(m.get("exposure_pct", 0.0) or 0.0))
+                monthly_max_daily_dd.append(float(m.get("max_daily_dd", 0.0) or 0.0))
+                monthly_gross_profit.append(float(m.get("gross_profit", 0.0) or 0.0))
+                monthly_gross_loss.append(float(m.get("gross_loss", 0.0) or 0.0))
+                monthly_start_equity.append(float(m.get("start_equity", 0.0) or 0.0))
+                monthly_end_equity.append(float(m.get("end_equity", 0.0) or 0.0))
+                monthly_sharpe.append(float(m.get("sharpe", 0.0) or 0.0))
+
+            active_mask = [
+                (t >= min_trades_month) if min_trades_month > 0 else True for t in monthly_trades
+            ]
+            active_months = int(sum(1 for a in active_mask if a))
+            positive_months = int(
+                sum(1 for a, p in zip(active_mask, monthly_profit_pct, strict=False) if a and p > 0.0)
+            )
+            active_profits = [
+                p for a, p in zip(active_mask, monthly_profit_pct, strict=False) if a
+            ]
+            avg_profit = float(np.mean(active_profits)) if active_profits else 0.0
+            min_profit = float(np.min(active_profits)) if active_profits else 0.0
+
+            self._val_summary[gene.strategy_id] = {
+                "positive_months": positive_months,
+                "active_months": active_months,
+                "total_months": len(month_labels),
+                "avg_monthly_profit_pct": avg_profit,
+                "min_monthly_profit_pct": min_profit,
+                "net_profit": float(summary.get("net_profit", 0.0) or 0.0),
+                "max_dd": float(summary.get("max_dd", 0.0) or 0.0),
+                "trades": int(summary.get("trades", 0) or 0),
+                "win_rate": float(summary.get("win_rate", 0.0) or 0.0),
+                "profit_factor": float(summary.get("profit_factor", 0.0) or 0.0),
+                "expectancy": float(summary.get("expectancy", 0.0) or 0.0),
+                "sharpe": float(summary.get("sharpe", 0.0) or 0.0),
+                "sortino": float(summary.get("sortino", 0.0) or 0.0),
+                "sqn": float(summary.get("sqn", 0.0) or 0.0),
+                "max_daily_dd": float(summary.get("max_daily_dd", 0.0) or 0.0),
+            }
+            payload: dict[str, Any] = {
+                "monthly_profit_pct": monthly_profit_pct,
+                "monthly_return_pct": monthly_return_pct,
+                "monthly_trades": monthly_trades,
+                "monthly_net_profit": monthly_net_profit,
+                "monthly_win_rate": monthly_win_rate,
+                "monthly_profit_factor": monthly_profit_factor,
+                "monthly_max_dd": monthly_max_dd,
+                "monthly_avg_trade": monthly_avg_trade,
+                "monthly_avg_hold_bars": monthly_avg_hold,
+                "monthly_exposure_pct": monthly_exposure,
+                "monthly_max_daily_dd": monthly_max_daily_dd,
+                "monthly_gross_profit": monthly_gross_profit,
+                "monthly_gross_loss": monthly_gross_loss,
+                "monthly_start_equity": monthly_start_equity,
+                "monthly_end_equity": monthly_end_equity,
+                "monthly_sharpe": monthly_sharpe,
+                "months": month_labels,
+                "summary": summary,
+            }
+            if log_trades and idx_gene < log_trades_max:
+                trade_log_path = self._persist_trade_log(gene.strategy_id, details.get("trades", []))
+                if trade_log_path:
+                    payload["trade_log"] = trade_log_path
+            self._val_monthly[gene.strategy_id] = payload
+
+        self._persist_monthly_validation()
+
+    def _persist_trade_log(self, strategy_id: str, trades: list[dict[str, Any]]) -> str:
+        if not trades:
+            return ""
+        try:
+            cache_dir = Path(getattr(self.settings.system, "cache_dir", "cache"))
+            trade_dir = cache_dir / "prop_validation_trades"
+            trade_dir.mkdir(parents=True, exist_ok=True)
+
+            symbol = self._symbol_tag()
+            safe_id = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in strategy_id)
+            if symbol:
+                safe_id = f"{symbol}_{safe_id}"
+            path = trade_dir / f"{safe_id}.csv"
+
+            def _fmt(value: Any) -> Any:
+                if isinstance(value, pd.Timestamp):
+                    return value.isoformat()
+                if isinstance(value, np.datetime64):
+                    try:
+                        return pd.Timestamp(value).isoformat()
+                    except Exception:
+                        return str(value)
+                return value
+
+            rows = []
+            for trade in trades:
+                rows.append({k: _fmt(v) for k, v in trade.items()})
+
+            if not rows:
+                return ""
+            fieldnames = list(rows[0].keys())
+            with path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            return str(path)
+        except Exception as exc:
+            logger.warning(f"Failed to persist trade log for {strategy_id}: {exc}")
+            return ""
+
+    def _persist_monthly_validation(self) -> None:
+        if not self._val_monthly:
+            return
+        try:
+            cache_dir = Path(getattr(self.settings.system, "cache_dir", "cache"))
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tf = ""
+            try:
+                tf = str(self.df_val.attrs.get("timeframe") or self.df_val.attrs.get("tf") or "")
+            except Exception:
+                tf = ""
+            symbol = self._symbol_tag()
+            payload = {
+                "timestamp": pd.Timestamp.now().isoformat(),
+                "symbol": self.symbol,
+                "timeframe": tf,
+                "months": self._val_month_labels,
+                "strategies": self._val_monthly,
+            }
+            base_name = cache_dir / "prop_validation_monthly.json"
+            if symbol:
+                symbol_path = cache_dir / f"prop_validation_monthly_{symbol}.json"
+                symbol_path.write_text(json.dumps(payload, indent=2))
+                logger.info("Monthly validation saved to %s.", symbol_path)
+                # Also keep a generic copy for backward compatibility.
+                base_name.write_text(json.dumps(payload, indent=2))
+            else:
+                base_name.write_text(json.dumps(payload, indent=2))
+                logger.info("Monthly validation saved to %s.", base_name)
+        except Exception as exc:
+            logger.warning(f"Failed to persist monthly validation: {exc}")
 
     def _load_checkpoint(self) -> None:
         if not self.checkpoint_path.exists():
@@ -330,6 +740,10 @@ class PropAwareStrategySearch:
 
         try:
             signals = self.mixer.compute_signals(self.df, gene, cache=self._indicator_cache).to_numpy()
+            # Strict no-lookahead: act on next bar
+            if len(signals) > 0:
+                signals = np.roll(signals, 1)
+                signals[0] = 0
         except Exception as exc:
             logger.warning(f"Signal generation failed for {gene.strategy_id}: {exc}")
             res = FitnessResult(-1e9, 0.0, 1.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -600,12 +1014,19 @@ class PropAwareStrategySearch:
             best_fit = self.fitness_cache.get(best_gene.strategy_id, FitnessResult(0, 0, 1, 0, 0, 0, 0, 0, 0, 0))
         return best_gene, best_fit
 
-    def _gene_payload(self, gene: GeneticGene, fit: FitnessResult | None) -> dict[str, Any]:
+    def _gene_payload(
+        self,
+        gene: GeneticGene,
+        fit: FitnessResult | None,
+        val_summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         tf = ""
         try:
             tf = str(self.df.attrs.get("timeframe") or self.df.attrs.get("tf") or "")
         except Exception:
             tf = ""
+        symbol = self._symbol_tag()
+        val_summary = val_summary or {}
         return {
             "indicators": list(getattr(gene, "indicators", []) or []),
             "params": dict(getattr(gene, "params", {}) or {}),
@@ -632,6 +1053,22 @@ class PropAwareStrategySearch:
             "sl_pips": float(getattr(gene, "sl_pips", 20.0)),
             "source": "propaware",
             "timeframe": tf,
+            "symbol": symbol,
+            "val_positive_months": int(val_summary.get("positive_months", 0) or 0),
+            "val_active_months": int(val_summary.get("active_months", 0) or 0),
+            "val_total_months": int(val_summary.get("total_months", 0) or 0),
+            "val_avg_monthly_profit_pct": float(val_summary.get("avg_monthly_profit_pct", 0.0) or 0.0),
+            "val_min_monthly_profit_pct": float(val_summary.get("min_monthly_profit_pct", 0.0) or 0.0),
+            "val_net_profit": float(val_summary.get("net_profit", 0.0) or 0.0),
+            "val_max_dd": float(val_summary.get("max_dd", 0.0) or 0.0),
+            "val_trades": int(val_summary.get("trades", 0) or 0),
+            "val_win_rate": float(val_summary.get("win_rate", 0.0) or 0.0),
+            "val_profit_factor": float(val_summary.get("profit_factor", 0.0) or 0.0),
+            "val_expectancy": float(val_summary.get("expectancy", 0.0) or 0.0),
+            "val_sharpe": float(val_summary.get("sharpe", 0.0) or 0.0),
+            "val_sortino": float(val_summary.get("sortino", 0.0) or 0.0),
+            "val_sqn": float(val_summary.get("sqn", 0.0) or 0.0),
+            "val_max_daily_dd": float(val_summary.get("max_daily_dd", 0.0) or 0.0),
         }
 
     def export_portfolio(self, cache_dir: Path, *, merge: bool = True, max_genes: int | None = None) -> int:
@@ -642,23 +1079,47 @@ class PropAwareStrategySearch:
         # Build payloads for top strategies
         sorted_pop = sorted(self.evolver.population, key=lambda g: g.fitness, reverse=True)
         payloads: list[dict[str, Any]] = []
+        try:
+            min_pos_months = int(
+                getattr(self.settings.models, "prop_search_val_min_positive_months", 0) or 0
+            )
+        except Exception:
+            min_pos_months = 0
+        try:
+            min_profit_pct = float(
+                getattr(self.settings.models, "prop_search_val_min_monthly_profit_pct", 0.0) or 0.0
+            )
+        except Exception:
+            min_profit_pct = 0.0
+
         for gene in sorted_pop:
             fit = self.fitness_cache.get(gene.strategy_id)
             if self._prop_min_trades > 0 and fit and fit.trades < self._prop_min_trades:
                 continue
-            payloads.append(self._gene_payload(gene, fit))
+            val_summary = self._val_summary.get(gene.strategy_id)
+            if min_pos_months > 0:
+                if not val_summary or int(val_summary.get("positive_months", 0) or 0) < min_pos_months:
+                    continue
+            if min_profit_pct > 0.0:
+                if not val_summary or float(val_summary.get("min_monthly_profit_pct", 0.0) or 0.0) < min_profit_pct:
+                    continue
+            payloads.append(self._gene_payload(gene, fit, val_summary))
             if len(payloads) >= max_genes:
                 break
 
         if not payloads:
             return 0
 
+        symbol = self._symbol_tag()
         knowledge_path = cache_dir / "talib_knowledge.json"
+        target_path = knowledge_path
+        if symbol:
+            target_path = cache_dir / f"talib_knowledge_{symbol}.json"
         combined = payloads
 
-        if merge and knowledge_path.exists():
+        if merge and target_path.exists():
             try:
-                existing = json.loads(knowledge_path.read_text())
+                existing = json.loads(target_path.read_text())
                 existing_genes = []
                 if isinstance(existing, dict):
                     if "best_genes" in existing:
@@ -703,9 +1164,12 @@ class PropAwareStrategySearch:
                 "merged_total": len(deduped),
             },
         }
-        knowledge_path.parent.mkdir(parents=True, exist_ok=True)
-        knowledge_path.write_text(json.dumps(payload, indent=2))
-        logger.info("Prop-aware portfolio merged into %s (%s strategies).", knowledge_path, len(deduped))
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(json.dumps(payload, indent=2))
+        logger.info("Prop-aware portfolio merged into %s (%s strategies).", target_path, len(deduped))
+        if symbol and target_path != knowledge_path:
+            # Keep a generic copy for backward compatibility.
+            knowledge_path.write_text(json.dumps(payload, indent=2))
         return len(deduped)
 
 
@@ -728,6 +1192,10 @@ def run_evo_search(
         actual_balance=actual_balance,
     )
     result = search.run(generations=generations)
+    try:
+        search._validate_candidates_monthly()
+    except Exception as exc:
+        logger.warning(f"Monthly validation failed: {exc}")
     try:
         cache_dir = Path(getattr(settings.system, "cache_dir", "cache"))
         search.export_portfolio(cache_dir, merge=True)

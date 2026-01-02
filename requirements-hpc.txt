@@ -43,6 +43,7 @@ joblib==1.4.2
 sqlalchemy==2.0.36
 pydantic==2.10.4
 pydantic-settings==2.7.0
+TA-Lib==0.4.32
 
 # --- 6. DISTRIBUTED & INFRA (FIXED FOR 3.13) ---
 # High version Ray to avoid NeuralForecast conflict

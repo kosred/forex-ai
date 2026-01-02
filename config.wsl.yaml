@@ -4,7 +4,7 @@
 system:
   symbols: [EURUSD]
   history_years: 2
-  max_training_rows_per_tf: 250000
+  max_training_rows_per_tf: 600000
   discovery_auto_cap: true
   discovery_max_rows: 200000
   discovery_stream: true
@@ -18,6 +18,14 @@ models:
   prop_search_generations: 10
   prop_search_max_hours: 0.25
   prop_search_max_rows: 200000
+  prop_search_max_rows_by_tf:
+    M1: 600000
+    M3: 600000
+    M5: 600000
+  prop_search_train_years: 8
+  prop_search_val_years: 1
+  prop_search_val_log_trades: true
+  prop_search_val_trade_log_max: 50
   # Reduce HPO for local debugging
   hpo_trials: 0
   hpo_max_rows: 200000
