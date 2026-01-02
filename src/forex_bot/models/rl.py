@@ -502,12 +502,22 @@ class RLExpertPPO(ExpertModel):
         else:
             self.env = DummyVecEnv([make_env])
 
+        env_is_subproc = SubprocVecEnv is not None and isinstance(self.env, SubprocVecEnv)
         eval_env = None
         if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
             # Use default arguments to capture closure variables (named function for pickling)
             def make_eval_env(m=meta_val, x=X_val.values):
                 return PropFirmTradingEnv(m, x)
-            eval_env = DummyVecEnv([make_eval_env])
+            if env_is_subproc:
+                try:
+                    eval_env = SubprocVecEnv([make_eval_env])
+                except (OSError, EOFError, BrokenPipeError, MemoryError, Exception) as e:
+                    logger.warning(
+                        f"SubprocVecEnv eval failed ({e.__class__.__name__}), using DummyVecEnv"
+                    )
+                    eval_env = DummyVecEnv([make_eval_env])
+            else:
+                eval_env = DummyVecEnv([make_eval_env])
 
         # Larger policy on GPU; smaller on CPU
         policy_kwargs = {}
@@ -644,12 +654,22 @@ class RLExpertSAC(RLExpertPPO):
         else:
             self.env = DummyVecEnv([make_env])
 
+        env_is_subproc = SubprocVecEnv is not None and isinstance(self.env, SubprocVecEnv)
         eval_env = None
         if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
             # Use default arguments to capture closure variables (named function for pickling)
             def make_eval_env(m=meta_val, x=X_val.values):
                 return PropFirmTradingEnv(m, x)
-            eval_env = DummyVecEnv([make_eval_env])
+            if env_is_subproc:
+                try:
+                    eval_env = SubprocVecEnv([make_eval_env])
+                except (OSError, EOFError, BrokenPipeError, MemoryError, Exception) as e:
+                    logger.warning(
+                        f"SubprocVecEnv eval failed ({e.__class__.__name__}), using DummyVecEnv"
+                    )
+                    eval_env = DummyVecEnv([make_eval_env])
+            else:
+                eval_env = DummyVecEnv([make_eval_env])
 
         # Larger policy on GPU; smaller on CPU
         policy_kwargs = {}

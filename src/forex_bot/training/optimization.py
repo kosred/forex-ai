@@ -1001,9 +1001,14 @@ class HyperparameterOptimizer:
 
                     # Tell: Report results back to Ax
                     # AxClient expects only the objective metric in raw_data
+                    try:
+                        noise_sd = float(os.environ.get("FOREX_BOT_AX_NOISE_SD", "0.01") or 0.01)
+                    except Exception:
+                        noise_sd = 0.01
+                    noise_sd = max(1e-6, abs(float(noise_sd)))
                     ax_client.complete_trial(
                         trial_index=trial_index,
-                        raw_data={"prop_score": (metrics["prop_score"], 0.0)}
+                        raw_data={"prop_score": (metrics["prop_score"], noise_sd)}
                     )
 
                     logger.info(f"  Trial {trial_idx + 1}/{self.n_trials}: prop_score={metrics.get('prop_score', 0):.4f}")
