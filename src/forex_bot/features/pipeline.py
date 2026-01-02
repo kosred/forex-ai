@@ -649,12 +649,18 @@ class FeatureEngineer:
         # Ensure symbol_hash columns are added last
         cols = [c for c in cols if not c.startswith("symbol_hash_")] + symbol_cols
 
+        # Base signals (ensure column exists before feature selection)
+        base_sigs = self._generate_base_signals(df, frames)
+        try:
+            df["base_signal"] = base_sigs.astype(np.int8, copy=False)
+        except Exception:
+            df["base_signal"] = base_sigs
+
         # Final Feature Matrix Construction
         valid_cols = [c for c in cols if c in df.columns]
         X = df[valid_cols].fillna(0.0)
         
         # Labels & Metadata (HPC: Vectorized Generation)
-        base_sigs = self._generate_base_signals(df, frames)
         labels = self._meta_label_outcomes(df, base_sigs)
         
         meta = df[["close", "high", "low", "open"]].copy()

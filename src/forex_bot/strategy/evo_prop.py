@@ -432,10 +432,13 @@ class PropAwareStrategySearch:
                         f"Progress: {i}/{len(remaining)} genes evaluated ({100*i/len(remaining):.1f}%)"
                     )
 
+        max_workers = max(1, int(self.max_workers or 1))
+
         # RAM check: On Windows with 'spawn', pickling huge DataFrames is too expensive
-        # If RAM is high, use sequential evaluation instead
+        # If RAM is high or the dataset is too large for parallel workers, use sequential evaluation instead.
         force_sequential = os.name == "nt"
         mem_percent: float | None = None
+        mem_reason: str | None = None
         try:
             import psutil
 
@@ -443,6 +446,38 @@ class PropAwareStrategySearch:
             mem_percent = float(mem.percent)
             if mem_percent > 70:
                 force_sequential = True
+                mem_reason = f"RAM={mem_percent:.1f}%"
+
+            # Optional guardrail: avoid parallelism when dataset copies would exceed RAM budget.
+            try:
+                df_bytes = int(self.df.memory_usage(deep=True).sum())
+            except Exception:
+                df_bytes = int(len(self.df) * max(1, self.df.shape[1]) * 4)
+
+            try:
+                max_rows_env = int(os.environ.get("FOREX_BOT_PROP_PARALLEL_MAX_ROWS", "0") or 0)
+            except Exception:
+                max_rows_env = 0
+            if max_rows_env > 0 and len(self.df) > max_rows_env:
+                force_sequential = True
+                mem_reason = mem_reason or f"rows>{max_rows_env:,}"
+
+            try:
+                mem_frac = float(os.environ.get("FOREX_BOT_PROP_PARALLEL_MEM_FRAC", "0.25") or 0.25)
+            except Exception:
+                mem_frac = 0.25
+            try:
+                overhead = float(os.environ.get("FOREX_BOT_PROP_PARALLEL_OVERHEAD", "3.0") or 3.0)
+            except Exception:
+                overhead = 3.0
+
+            mem_frac = float(min(0.80, max(0.05, mem_frac)))
+            overhead = float(min(10.0, max(1.0, overhead)))
+            projected = float(df_bytes) * float(max_workers) * float(overhead)
+            if projected > (float(mem.available) * mem_frac):
+                force_sequential = True
+                if mem_reason is None:
+                    mem_reason = "RAM budget"
         except Exception:
             # If psutil is missing, still force sequential on Windows for safety.
             mem_percent = None
@@ -451,15 +486,14 @@ class PropAwareStrategySearch:
             reason_parts = []
             if os.name == "nt":
                 reason_parts.append("Windows spawn overhead")
-            if mem_percent is not None and mem_percent > 70:
-                reason_parts.append(f"RAM={mem_percent:.1f}%")
+            if mem_reason:
+                reason_parts.append(mem_reason)
             reason = "Using SEQUENTIAL evaluation"
             if reason_parts:
                 reason += f" ({' or '.join(reason_parts)})"
             _evaluate_sequential(reason)
             return
 
-        max_workers = self.max_workers or 1
         ctx_name = str(os.environ.get("FOREX_BOT_PROP_MP_CONTEXT", "auto") or "auto").strip().lower()
         if ctx_name == "auto":
             # Prefer fork on Unix for copy-on-write to reduce RAM, unless GPU is used.
