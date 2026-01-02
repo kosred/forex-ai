@@ -601,6 +601,11 @@ class PropAwareStrategySearch:
         return best_gene, best_fit
 
     def _gene_payload(self, gene: GeneticGene, fit: FitnessResult | None) -> dict[str, Any]:
+        tf = ""
+        try:
+            tf = str(self.df.attrs.get("timeframe") or self.df.attrs.get("tf") or "")
+        except Exception:
+            tf = ""
         return {
             "indicators": list(getattr(gene, "indicators", []) or []),
             "params": dict(getattr(gene, "params", {}) or {}),
@@ -626,6 +631,7 @@ class PropAwareStrategySearch:
             "tp_pips": float(getattr(gene, "tp_pips", 40.0)),
             "sl_pips": float(getattr(gene, "sl_pips", 20.0)),
             "source": "propaware",
+            "timeframe": tf,
         }
 
     def export_portfolio(self, cache_dir: Path, *, merge: bool = True, max_genes: int | None = None) -> int:

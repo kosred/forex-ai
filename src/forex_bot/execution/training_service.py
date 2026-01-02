@@ -1698,18 +1698,55 @@ class TrainingService:
                 self.settings.system.symbol = first_sym
                 frames = await self.data_loader.get_training_data(first_sym)
                 base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
-                prop_df = frames.get(base_tf)
-                if prop_df is None:
-                    prop_df = frames.get("M1")
 
-                if prop_df is not None and not prop_df.empty:
+                def _parse_tfs_env(name: str) -> list[str] | None:
+                    raw = os.environ.get(name)
+                    if not raw:
+                        return None
+                    parts = [p.strip().upper() for p in str(raw).split(",") if p.strip()]
+                    return parts or None
+
+                tfs_env = _parse_tfs_env("FOREX_BOT_PROP_SEARCH_TFS")
+                cfg_tfs = list(getattr(self.settings.system, "required_timeframes", []) or [])
+                if not cfg_tfs:
+                    cfg_tfs = list(getattr(self.settings.system, "higher_timeframes", []) or [])
+                # Default: search across all available frames (base + required + any extras)
+                tfs = [base_tf]
+                for tf in cfg_tfs:
+                    if tf != base_tf:
+                        tfs.append(tf)
+                for tf in frames.keys():
+                    if tf not in tfs:
+                        tfs.append(tf)
+                if tfs_env:
+                    tfs = [tf for tf in tfs_env if tf in frames]
+
+                if not tfs:
+                    logger.warning("[STRATEGY DISCOVERY] No timeframes available, skipping")
+                else:
+                    logger.info(f"[STRATEGY DISCOVERY] Timeframes: {tfs}")
+
+                for tf in tfs:
+                    prop_df = frames.get(tf)
+                    if prop_df is None or prop_df.empty:
+                        continue
+
+                    # Annotate timeframe for downstream volatility settings
+                    try:
+                        prop_df.attrs["timeframe"] = tf
+                        prop_df.attrs["tf"] = tf
+                    except Exception:
+                        pass
+
                     try:
                         max_rows = int(getattr(self.settings.models, "prop_search_max_rows", 0) or 0)
                     except Exception:
                         max_rows = 0
                     if max_rows > 0 and len(prop_df) > max_rows:
                         prop_df = prop_df.tail(max_rows)
-                        logger.info(f"[STRATEGY DISCOVERY] Using {len(prop_df):,} rows (capped from {len(frames.get(base_tf, prop_df)):,})")
+                        logger.info(
+                            f"[STRATEGY DISCOVERY] {tf}: Using {len(prop_df):,} rows (capped from {len(frames.get(tf, prop_df)):,})"
+                        )
 
                     try:
                         pop = int(getattr(self.settings.models, "prop_search_population", 64) or 64)
@@ -1732,8 +1769,13 @@ class TrainingService:
                         getattr(self.settings.models, "prop_search_checkpoint", "models/strategy_evo_checkpoint.json")
                         or "models/strategy_evo_checkpoint.json"
                     )
+                    if len(tfs) > 1:
+                        ckpt_path = Path(checkpoint)
+                        checkpoint = str(ckpt_path.with_name(f"{ckpt_path.stem}_{tf}{ckpt_path.suffix}"))
 
-                    logger.info(f"[STRATEGY DISCOVERY] Config: pop={pop}, gen={gens}, max_hours={max_hours:.1f}h, rows={len(prop_df):,}")
+                    logger.info(
+                        f"[STRATEGY DISCOVERY] {tf}: Config pop={pop}, gen={gens}, max_hours={max_hours:.1f}h, rows={len(prop_df):,}"
+                    )
 
                     # Run discovery synchronously (blocking)
                     await asyncio.to_thread(
@@ -1746,9 +1788,7 @@ class TrainingService:
                         max_hours,
                         actual_balance,
                     )
-                    logger.info("[STRATEGY DISCOVERY] Completed! Strategies saved to talib_knowledge.json")
-                else:
-                    logger.warning("[STRATEGY DISCOVERY] No OHLC data available, skipping")
+                logger.info("[STRATEGY DISCOVERY] Completed! Strategies saved to talib_knowledge.json")
             except Exception as exc:
                 logger.warning(f"[STRATEGY DISCOVERY] Failed: {exc}", exc_info=True)
 

@@ -1168,11 +1168,33 @@ class FeatureEngineer:
                 if genes_data:
                     mixer = TALibStrategyMixer(use_volume_features=self.use_volume_features)
                     all_signals = []
-                    genes = [GeneFactory.from_dict(g) for g in genes_data]
-                    cache = mixer.bulk_calculate_indicators(df, genes)
-                    for gene in genes:
-                        sig = mixer.compute_signals(df, gene, cache=cache)
-                        all_signals.append(sig.to_numpy(dtype=np.float32))
+                    frames_local = frames or {}
+                    base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
+
+                    genes_by_tf: dict[str, list] = {}
+                    for g in genes_data:
+                        tf_name = str(g.get("timeframe") or base_tf or base_tf)
+                        genes_by_tf.setdefault(tf_name, []).append(GeneFactory.from_dict(g))
+
+                    for tf_name, genes in genes_by_tf.items():
+                        tf_df = frames_local.get(tf_name)
+                        if tf_df is None or tf_df.empty:
+                            tf_df = df
+                        else:
+                            tf_df = tf_df.copy()
+                            if "timestamp" in tf_df.columns:
+                                tf_df["timestamp"] = pd.to_datetime(tf_df["timestamp"], utc=True, errors="coerce")
+                                tf_df = tf_df.set_index("timestamp")
+                            elif not isinstance(tf_df.index, pd.DatetimeIndex):
+                                tf_df.index = pd.to_datetime(tf_df.index, utc=True, errors="coerce")
+                            tf_df = tf_df.sort_index()
+
+                        cache = mixer.bulk_calculate_indicators(tf_df, genes)
+                        for gene in genes:
+                            sig = mixer.compute_signals(tf_df, gene, cache=cache)
+                            if tf_df is not df:
+                                sig = sig.reindex(df.index).ffill().fillna(0.0)
+                            all_signals.append(sig.to_numpy(dtype=np.float32))
                     
                     if all_signals:
                         signal_matrix = np.vstack(all_signals)
