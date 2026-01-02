@@ -11,24 +11,87 @@ import platform
 import shutil
 from pathlib import Path
 
-# --- 0. HPC GLOBAL ENVIRONMENT (NO MANUAL EXPORTS NEEDED) ---
-# Respect user overrides, otherwise default to (cores - reserve).
-cpu_total = os.cpu_count() or 1
+# --- 0. HPC GLOBAL ENVIRONMENT (AUTO-DETECT HARDWARE) ---
+# Fully automatic hardware detection - NO hardcoding!
+#
+# To override auto-detection, set these environment variables BEFORE running:
+#   FOREX_BOT_CPU_THREADS=X    - Number of worker processes (default: logical_cores - 1)
+#   FOREX_BOT_CPU_RESERVE=X    - Cores to reserve for OS (default: 1)
+#   OMP_NUM_THREADS=X          - BLAS threads per operation (default: physical_cores - 1)
+#   FOREX_BOT_RL_ENVS=X        - RL parallel environments (default: auto, RAM-limited)
+#
+# Example: set OMP_NUM_THREADS=4 && python forex-ai.py train
+
+# Auto-detect actual physical cores (not hyperthreaded logical cores)
+try:
+    import psutil
+    physical_cores = psutil.cpu_count(logical=False) or 1
+    logical_cores = psutil.cpu_count(logical=True) or 1
+except Exception:
+    # Fallback: assume no hyperthreading
+    logical_cores = os.cpu_count() or 1
+    physical_cores = logical_cores
+
+# CPU budget for worker processes (uses logical cores)
 try:
     cpu_reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
 except Exception:
     cpu_reserve = 1
-cpu_budget = max(1, cpu_total - max(0, cpu_reserve))
+cpu_budget = max(1, logical_cores - max(0, cpu_reserve))
+
+# CRITICAL: When using ProcessPoolExecutor, each process spawns its own BLAS threads!
+# If we have 11 workers × 5 BLAS threads = 55 threads (over-subscription!)
+# Solution: Set BLAS to 1 thread when using multiprocessing
+# This way: 11 workers × 1 BLAS thread = 11 threads (optimal)
+blas_threads = 1  # Single-threaded BLAS when using multiprocessing
+
 os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
 os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(cpu_budget))
-os.environ.setdefault("NUMEXPR_MAX_THREADS", str(cpu_budget))
-os.environ.setdefault("OMP_NUM_THREADS", str(cpu_budget))
-os.environ.setdefault("MKL_NUM_THREADS", str(cpu_budget))
-os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cpu_budget))
+# BLAS libraries: Single-threaded to prevent N_workers × N_threads explosion
+os.environ.setdefault("NUMEXPR_MAX_THREADS", str(blas_threads))
+os.environ.setdefault("OMP_NUM_THREADS", str(blas_threads))
+os.environ.setdefault("MKL_NUM_THREADS", str(blas_threads))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(blas_threads))
+os.environ.setdefault("NUMBA_NUM_THREADS", str(blas_threads))
+os.environ.setdefault("NUMBA_DEFAULT_NUM_THREADS", str(blas_threads))
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(blas_threads))
+# Disable dynamic threading for predictable performance
+os.environ.setdefault("OMP_DYNAMIC", "FALSE")
+os.environ.setdefault("MKL_DYNAMIC", "FALSE")
+# PyTorch/TensorFlow thread limits (match BLAS: single-threaded)
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(blas_threads))
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+os.environ.setdefault("TORCH_NUM_THREADS", str(blas_threads))
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # NCCL optimizations for 8x A6000 P2P topology
 os.environ["NCCL_P2P_LEVEL"] = "5"
 os.environ["NCCL_IB_DISABLE"] = "1"
+
+# Print hardware auto-detection results (ONLY ONCE - not in worker processes)
+# Set flag to prevent worker processes from re-printing when they import this module
+if not os.environ.get("_FOREX_BOT_HW_DETECTED"):
+    os.environ["_FOREX_BOT_HW_DETECTED"] = "1"
+    print("=" * 70)
+    print(f"[HW AUTO-DETECT] Physical Cores: {physical_cores} | Logical Cores: {logical_cores}")
+    print(f"[HW AUTO-DETECT] Worker Processes: {cpu_budget} x BLAS Threads: {blas_threads} = ~{cpu_budget * blas_threads} compute threads")
+    print(f"[HW AUTO-DETECT] Thread Strategy: Single-threaded BLAS (prevents N_workers x N_threads explosion)")
+    try:
+        mem = psutil.virtual_memory()
+        print(f"[HW AUTO-DETECT] Total RAM: {mem.total/1024/1024/1024:.1f}GB | Available: {mem.available/1024/1024/1024:.1f}GB ({mem.percent:.1f}% used)")
+    except Exception:
+        pass
+    # Auto-detect GPU
+    gpu_info = "None detected"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown"
+            gpu_info = f"{gpu_count}x {gpu_name}"
+    except Exception:
+        pass
+    print(f"[HW AUTO-DETECT] GPU: {gpu_info}")
+    print("=" * 70)
 
 # --- 1. SELF-HEALING SYSTEM SETUP ---
 def bootstrap():

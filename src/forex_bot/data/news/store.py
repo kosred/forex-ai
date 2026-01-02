@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows doesn't have fcntl
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,14 +47,13 @@ class NewsDatabase:
     @contextlib.contextmanager
     def _get_lock(self):
         """High-performance cross-process file lock."""
-        import fcntl
         with open(self.lock_file, 'w') as f:
-            if sys.platform != "win32":
+            if sys.platform != "win32" and fcntl is not None:
                 fcntl.flock(f, fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                if sys.platform != "win32":
+                if sys.platform != "win32" and fcntl is not None:
                     fcntl.flock(f, fcntl.LOCK_UN)
 
     def _init_schema(self) -> None:

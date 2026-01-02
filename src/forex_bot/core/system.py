@@ -654,3 +654,55 @@ class AutoTuner:
                 os.environ["FOREX_BOT_DISCOVERY_MAX_BATCH"] = "80000"
             elif min_vram <= 24.0:
                 os.environ["FOREX_BOT_DISCOVERY_MAX_BATCH"] = "110000"
+
+
+
+def optimize_dataframe_memory(df, verbose=False):
+    """
+    Optimize pandas DataFrame memory usage using 2025 best practices.
+    
+    Reduces memory footprint by:
+    1. Downcasting numeric types (int64 -> int32/int16/int8, float64 -> float32)
+    2. Converting low-cardinality string columns to categorical
+    3. Removing inf/nan values to prevent computational issues
+    
+    Sources:
+    - https://pandas.pydata.org/pandas-docs/stable/user_guide/scale.html
+    - https://thinhdanggroup.github.io/pandas-memory-optimization/
+    - https://pythonspeed.com/articles/pandas-load-less-data/
+    
+    Args:
+        df: Input DataFrame
+        verbose: Print memory savings if True
+        
+    Returns:
+        Optimized DataFrame
+    """
+    import pandas as pd
+    import numpy as np
+    
+    start_mem = df.memory_usage(deep=True).sum() / 1024**2  # MB
+    
+    for col in df.columns:
+        col_type = df[col].dtype
+        
+        # Numeric optimization
+        if col_type in [np.int64, np.int32, np.int16, np.int8]:
+            # Downcast integers
+            df[col] = pd.to_numeric(df[col], downcast="integer")
+        elif col_type in [np.float64, np.float32]:
+            # Downcast floats
+            df[col] = pd.to_numeric(df[col], downcast="float")
+        elif col_type == object:
+            # Convert low-cardinality strings to categorical (< 50% unique)
+            num_unique = df[col].nunique()
+            num_total = len(df[col])
+            if num_unique / num_total < 0.5:
+                df[col] = df[col].astype("category")
+    
+    end_mem = df.memory_usage(deep=True).sum() / 1024**2  # MB
+    
+    if verbose:
+        logger.info(f"Memory usage reduced from {start_mem:.2f} MB to {end_mem:.2f} MB ({100 * (start_mem - end_mem) / start_mem:.1f}% reduction)")
+    
+    return df

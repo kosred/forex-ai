@@ -8,6 +8,7 @@ This module provides:
 """
 
 import abc
+import contextlib
 import logging
 import os
 from collections.abc import Callable
@@ -517,18 +518,29 @@ def _compute_psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> 
     expected_pct = expected_counts / (len(expected) + eps)
     actual_pct = actual_counts / (len(actual) + eps)
 
-    # Avoid division by zero
+    # Avoid division by zero and clean NaN/inf
     expected_pct = np.clip(expected_pct, eps, 1.0)
     actual_pct = np.clip(actual_pct, eps, 1.0)
+    expected_pct = np.nan_to_num(expected_pct, nan=eps, posinf=1.0, neginf=eps)
+    actual_pct = np.nan_to_num(actual_pct, nan=eps, posinf=1.0, neginf=eps)
 
     # Calculate PSI
-    psi = np.sum((actual_pct - expected_pct) * np.log(actual_pct / expected_pct))
+    diff = actual_pct - expected_pct
+    ratio = np.log(actual_pct / expected_pct)
+    # Clean any remaining NaN/inf from operations
+    diff = np.nan_to_num(diff, nan=0.0)
+    ratio = np.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
+    psi = np.sum(diff * ratio)
 
     return float(psi)
 
 
 def _compute_stats_drift(train_vals: np.ndarray, val_vals: np.ndarray) -> float:
     """Fallback drift metric based on mean/std shift."""
+    # Clean inputs
+    train_vals = np.nan_to_num(train_vals, nan=0.0, posinf=0.0, neginf=0.0)
+    val_vals = np.nan_to_num(val_vals, nan=0.0, posinf=0.0, neginf=0.0)
+
     train_mean, train_std = np.mean(train_vals), np.std(train_vals)
     val_mean, val_std = np.mean(val_vals), np.std(val_vals)
     eps = np.finfo(np.float64).eps
@@ -536,5 +548,7 @@ def _compute_stats_drift(train_vals: np.ndarray, val_vals: np.ndarray) -> float:
     if train_std > eps:
         mean_shift = abs(val_mean - train_mean) / max(train_std, eps)
         std_ratio = val_std / max(train_std, eps)
-        return float(mean_shift + abs(1.0 - std_ratio))
+        # Clean result
+        result = mean_shift + abs(1.0 - std_ratio)
+        return float(np.nan_to_num(result, nan=0.0))
     return 0.0

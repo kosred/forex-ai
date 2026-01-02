@@ -36,6 +36,119 @@ class FitnessResult:
     sqn: float
 
 
+# MODULE-LEVEL WORKER FUNCTION (must be picklable for ProcessPoolExecutor)
+def _evaluate_gene_worker(
+    gene: GeneticGene,
+    df: pd.DataFrame,
+    mixer: TALibStrategyMixer,
+    settings: Settings,
+    symbol: str,
+    month_indices: np.ndarray,
+    day_indices: np.ndarray,
+    indicator_cache: dict[str, np.ndarray],
+) -> tuple[str, FitnessResult]:
+    """
+    Worker function for parallel gene evaluation.
+    Returns (strategy_id, FitnessResult) tuple.
+    This must be a MODULE-LEVEL function (not instance method) for pickling.
+    """
+    if not TALIB_AVAILABLE:
+        return (gene.strategy_id, FitnessResult(0.0, 0.0, 1.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+    try:
+        signals = mixer.compute_signals(df, gene, cache=indicator_cache).to_numpy()
+    except Exception as exc:
+        logger.warning(f"Signal generation failed for {gene.strategy_id}: {exc}")
+        return (gene.strategy_id, FitnessResult(-1e9, 0.0, 1.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+    close = df["close"].to_numpy()
+    high = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    tp_pips = float(getattr(gene, "tp_pips", 40.0))
+    sl_pips = float(getattr(gene, "sl_pips", 20.0))
+    spread = float(getattr(settings.risk, "backtest_spread_pips", 1.5))
+    commission = float(getattr(settings.risk, "commission_per_lot", 7.0))
+    max_hold = int(getattr(settings.risk, "triple_barrier_max_bars", 0) or 0)
+    trailing_enabled = bool(getattr(settings.risk, "trailing_enabled", False))
+    trailing_mult = float(getattr(settings.risk, "trailing_atr_multiplier", 1.0) or 1.0)
+    trailing_trigger_r = float(getattr(settings.risk, "trailing_be_trigger_r", 1.0) or 1.0)
+    pip_size, pip_value_per_lot = infer_pip_metrics(symbol)
+    mode = str(getattr(settings.risk, "stop_target_mode", "blend") or "blend").lower()
+    if mode not in {"fixed", "gene"}:
+        res = infer_stop_target_pips(df, settings=settings, pip_size=pip_size)
+        if res is not None:
+            sl_pips, tp_pips, _rr = res
+    metrics = fast_evaluate_strategy(
+        close_prices=close,
+        high_prices=high,
+        low_prices=low,
+        signals=signals,
+        month_indices=month_indices,
+        day_indices=day_indices,
+        sl_pips=sl_pips,
+        tp_pips=tp_pips,
+        max_hold_bars=max_hold,
+        trailing_enabled=trailing_enabled,
+        trailing_atr_multiplier=trailing_mult,
+        trailing_be_trigger_r=trailing_trigger_r,
+        spread_pips=spread,
+        commission_per_trade=commission,
+        pip_value=pip_size,
+        pip_value_per_lot=pip_value_per_lot,
+    )
+
+    (
+        net_profit,
+        sharpe,
+        sortino,
+        max_dd,
+        win_rate,
+        profit_factor,
+        expectancy,
+        sqn,
+        trades,
+        _consistency,
+        daily_dd,
+    ) = metrics
+
+    # Calculate prop fitness (inline to avoid method dependency)
+    fitness = 0.0
+    dd_cap = float(getattr(settings.risk, "total_drawdown_limit", 0.07) or 0.07)
+    daily_dd_cap = float(getattr(settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
+    profit_target_pct = float(getattr(settings.risk, "profit_target_pct", 0.04) or 0.04)
+    actual_balance = 100000.0  # default
+
+    if trades < 10:
+        fitness -= 50.0
+    if max_dd >= dd_cap:
+        fitness -= 1000.0
+    if daily_dd >= daily_dd_cap:
+        fitness -= 500.0
+
+    monthly_profit_pct = float(net_profit) / float(actual_balance) if actual_balance > 0 else 0.0
+    if monthly_profit_pct >= profit_target_pct:
+        fitness += 100.0 * (monthly_profit_pct / profit_target_pct)
+    else:
+        fitness -= 50.0
+
+    fitness += 10.0 * float(sharpe)
+    fitness += 0.1 * (win_rate * 100.0)
+
+    res = FitnessResult(
+        fitness=float(fitness),
+        net_profit=float(net_profit),
+        max_dd=float(max_dd),
+        trades=int(trades),
+        win_rate=float(win_rate),
+        profit_factor=float(profit_factor),
+        expectancy=float(expectancy),
+        sharpe=float(sharpe),
+        sortino=float(sortino),
+        sqn=float(sqn),
+    )
+    return (gene.strategy_id, res)
+
+
 class PropAwareStrategySearch:
     """
     Long-running evolutionary search for prop-compliant strategies.
@@ -122,7 +235,25 @@ class PropAwareStrategySearch:
                 gene = GeneticGene.from_dict(g)
                 genes.append(gene)
                 if "fitness" in g:
-                    self.fitness_cache[gene.strategy_id] = FitnessResult(**g["fitness"])
+                    # Handle both old format (float) and new format (dict)
+                    fit_data = g["fitness"]
+                    if isinstance(fit_data, dict):
+                        # New format: full FitnessResult dict
+                        self.fitness_cache[gene.strategy_id] = FitnessResult(**fit_data)
+                    elif isinstance(fit_data, (int, float)):
+                        # Old format: just fitness score - create FitnessResult with defaults
+                        self.fitness_cache[gene.strategy_id] = FitnessResult(
+                            fitness=float(fit_data),
+                            net_profit=0.0,
+                            max_dd=0.0,
+                            trades=0,
+                            win_rate=0.0,
+                            profit_factor=0.0,
+                            expectancy=0.0,
+                            sharpe=0.0,
+                            sortino=0.0,
+                            sqn=0.0,
+                        )
             self.evolver.population = genes
             logger.info(f"Strategy evo checkpoint loaded (gen={self.evolver.generation}, pop={len(genes)})")
         except Exception as exc:
@@ -274,6 +405,7 @@ class PropAwareStrategySearch:
         """
         Evaluate a population in parallel.
         HPC FIX: Use ProcessPoolExecutor for TRUE GIL bypass.
+        WINDOWS FIX: Falls back to sequential if RAM is high (pickling 5M rows is too expensive).
         """
         # Shard by rank if running under torchrun
         if self.world_size > 1:
@@ -281,7 +413,52 @@ class PropAwareStrategySearch:
         genes_to_eval = [g for g in genes if g.strategy_id not in self.fitness_cache]
         if not genes_to_eval:
             return
-            
+
+        def _evaluate_sequential(reason: str | None = None) -> None:
+            remaining = [g for g in genes_to_eval if g.strategy_id not in self.fitness_cache]
+            if not remaining:
+                return
+            if reason:
+                logger.info(reason)
+            logger.info(
+                f"Evaluating {len(remaining)} genes sequentially (this will take a while)..."
+            )
+            for i, g in enumerate(remaining, 1):
+                res = self._evaluate_gene(g)
+                self.fitness_cache[g.strategy_id] = res
+                # Progress logging every 10 genes
+                if i % 10 == 0 or i == len(remaining):
+                    logger.info(
+                        f"Progress: {i}/{len(remaining)} genes evaluated ({100*i/len(remaining):.1f}%)"
+                    )
+
+        # RAM check: On Windows with 'spawn', pickling huge DataFrames is too expensive
+        # If RAM is high, use sequential evaluation instead
+        force_sequential = os.name == "nt"
+        mem_percent: float | None = None
+        try:
+            import psutil
+
+            mem = psutil.virtual_memory()
+            mem_percent = float(mem.percent)
+            if mem_percent > 70:
+                force_sequential = True
+        except Exception:
+            # If psutil is missing, still force sequential on Windows for safety.
+            mem_percent = None
+
+        if force_sequential:
+            reason_parts = []
+            if os.name == "nt":
+                reason_parts.append("Windows spawn overhead")
+            if mem_percent is not None and mem_percent > 70:
+                reason_parts.append(f"RAM={mem_percent:.1f}%")
+            reason = "Using SEQUENTIAL evaluation"
+            if reason_parts:
+                reason += f" ({' or '.join(reason_parts)})"
+            _evaluate_sequential(reason)
+            return
+
         max_workers = self.max_workers or 1
         ctx_name = str(os.environ.get("FOREX_BOT_PROP_MP_CONTEXT", "auto") or "auto").strip().lower()
         if ctx_name == "auto":
@@ -293,16 +470,46 @@ class PropAwareStrategySearch:
         spawn_ctx = multiprocessing.get_context(ctx_name)
         
         # HPC: True Multi-Process Evaluation
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as ex:
-            future_map = {ex.submit(self._evaluate_gene, g): g for g in genes_to_eval}
-            for fut in concurrent.futures.as_completed(future_map):
-                g = future_map[fut]
-                try:
-                    res = fut.result()
-                except Exception as exc:
-                    logger.warning(f"Parallel eval failed for {g.strategy_id}: {exc}")
-                    res = FitnessResult(-1e9, 0.0, 1.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-                self.fitness_cache[g.strategy_id] = res
+        # CRITICAL FIX: Use module-level worker function (not instance method) for pickling
+        try:
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_workers, mp_context=spawn_ctx
+            ) as ex:
+                future_map = {
+                    ex.submit(
+                        _evaluate_gene_worker,
+                        g,
+                        self.df,
+                        self.mixer,
+                        self.settings,
+                        self.symbol,
+                        self._month_indices,
+                        self._day_indices,
+                        self._indicator_cache,
+                    ): g
+                    for g in genes_to_eval
+                }
+                for fut in concurrent.futures.as_completed(future_map):
+                    g = future_map[fut]
+                    try:
+                        strategy_id, res = fut.result()  # Worker returns (strategy_id, FitnessResult)
+                    except MemoryError:
+                        logger.warning(
+                            "Parallel eval ran out of memory; falling back to sequential.",
+                            exc_info=True,
+                        )
+                        _evaluate_sequential("Falling back to sequential evaluation after MemoryError.")
+                        return
+                    except Exception as exc:
+                        logger.warning(f"Parallel eval failed for {g.strategy_id}: {exc}", exc_info=True)
+                        res = FitnessResult(-1e9, 0.0, 1.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    self.fitness_cache[g.strategy_id] = res
+        except Exception:
+            logger.warning(
+                "Parallel evaluation failed; falling back to sequential evaluation.",
+                exc_info=True,
+            )
+            _evaluate_sequential("Falling back to sequential evaluation after parallel failure.")
 
     def run(self, generations: int = 50) -> tuple[GeneticGene, FitnessResult]:
         if not TALIB_AVAILABLE:

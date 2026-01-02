@@ -1685,6 +1685,73 @@ class TrainingService:
                 logger.error(f"Failed to prepare {sym}: {e}", exc_info=True)
                 continue
 
+        # === STRATEGY DISCOVERY (MUST RUN BEFORE TRAINING!) ===
+        if datasets and bool(getattr(self.settings.models, "prop_search_enabled", False)):
+            try:
+                from ..strategy.evo_prop import run_evo_search
+
+                # Use first symbol's data for discovery
+                first_sym, first_ds = datasets[0]
+                logger.info(f"[STRATEGY DISCOVERY] Running prop-aware search on {first_sym} data...")
+
+                # Get raw OHLC frames for discovery
+                self.settings.system.symbol = first_sym
+                frames = await self.data_loader.get_training_data(first_sym)
+                base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
+                prop_df = frames.get(base_tf)
+                if prop_df is None:
+                    prop_df = frames.get("M1")
+
+                if prop_df is not None and not prop_df.empty:
+                    try:
+                        max_rows = int(getattr(self.settings.models, "prop_search_max_rows", 0) or 0)
+                    except Exception:
+                        max_rows = 0
+                    if max_rows > 0 and len(prop_df) > max_rows:
+                        prop_df = prop_df.tail(max_rows)
+                        logger.info(f"[STRATEGY DISCOVERY] Using {len(prop_df):,} rows (capped from {len(frames.get(base_tf, prop_df)):,})")
+
+                    try:
+                        pop = int(getattr(self.settings.models, "prop_search_population", 64) or 64)
+                    except Exception:
+                        pop = 64
+                    try:
+                        gens = int(getattr(self.settings.models, "prop_search_generations", 50) or 50)
+                    except Exception:
+                        gens = 50
+                    try:
+                        max_hours = float(getattr(self.settings.models, "prop_search_max_hours", 1.0) or 1.0)
+                    except Exception:
+                        max_hours = 1.0
+                    try:
+                        actual_balance = float(getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0)
+                    except Exception:
+                        actual_balance = 100000.0
+
+                    checkpoint = str(
+                        getattr(self.settings.models, "prop_search_checkpoint", "models/strategy_evo_checkpoint.json")
+                        or "models/strategy_evo_checkpoint.json"
+                    )
+
+                    logger.info(f"[STRATEGY DISCOVERY] Config: pop={pop}, gen={gens}, max_hours={max_hours:.1f}h, rows={len(prop_df):,}")
+
+                    # Run discovery synchronously (blocking)
+                    await asyncio.to_thread(
+                        run_evo_search,
+                        prop_df,
+                        self.settings,
+                        pop,
+                        gens,
+                        checkpoint,
+                        max_hours,
+                        actual_balance,
+                    )
+                    logger.info("[STRATEGY DISCOVERY] Completed! Strategies saved to talib_knowledge.json")
+                else:
+                    logger.warning("[STRATEGY DISCOVERY] No OHLC data available, skipping")
+            except Exception as exc:
+                logger.warning(f"[STRATEGY DISCOVERY] Failed: {exc}", exc_info=True)
+
         await self._train_global_from_datasets(datasets, symbols, optimize, stop_event)
 
     def _maybe_start_ray(self) -> None:

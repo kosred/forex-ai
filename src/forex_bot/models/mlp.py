@@ -118,16 +118,24 @@ class MLPExpert(ExpertModel):
 
         self.model.to(dev)
         if isinstance(self.model, nn.Module):
-            self.model = wrap_ddp(self.model, dev)
+            # wrap_ddp returns (model, device, ddp_active, rank, world_size)
+            self.model, dev, ddp_active, rank, world_size = wrap_ddp(self.model, dev)
             self._ddp = hasattr(self.model, "module")
 
+        # PyTorch 2.x fix: ensure arrays are writable to avoid VRAM spikes (2025 best practice)
+        # Source: https://github.com/invoke-ai/InvokeAI/pull/8329
+        x_train_writable = x_train_arr.copy() if not x_train_arr.flags.writeable else x_train_arr
+        y_train_writable = y_train_arr.astype(np.int64)
+        x_val_writable = x_val_arr.copy() if not x_val_arr.flags.writeable else x_val_arr
+        y_val_writable = y_val_arr.astype(np.int64)
+
         train_ds = TensorDataset(
-            torch.from_numpy(x_train_arr),
-            torch.from_numpy(y_train_arr.astype(np.int64)),
+            torch.from_numpy(x_train_writable),
+            torch.from_numpy(y_train_writable),
         )
         val_ds = TensorDataset(
-            torch.from_numpy(x_val_arr),
-            torch.from_numpy(y_val_arr.astype(np.int64)),
+            torch.from_numpy(x_val_writable),
+            torch.from_numpy(y_val_writable),
         )
 
         pin_mem = dev.type == "cuda"
@@ -157,7 +165,10 @@ class MLPExpert(ExpertModel):
         patience, min_delta = get_early_stop_params(15, 0.0)
         early = EarlyStopper(patience=patience, min_delta=min_delta)
 
-        scaler = torch.cuda.amp.GradScaler(enabled=(dev.type == "cuda"))
+        # PyTorch 2.4+ API: torch.cuda.amp.GradScaler deprecated
+        # Source: https://docs.pytorch.org/docs/stable/amp.html
+        device_type = "cuda" if dev.type == "cuda" else "cpu"
+        scaler = torch.amp.GradScaler(device_type, enabled=(dev.type == "cuda"))
         start = time.time()
         epoch = 0
         while time.time() - start < self.max_time_sec:
@@ -166,7 +177,8 @@ class MLPExpert(ExpertModel):
                 xb = xb.to(dev, non_blocking=True)
                 yb = yb.to(dev, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=(dev.type == "cuda")):
+                # PyTorch 2.4+ API: torch.cuda.amp.autocast deprecated
+                with torch.amp.autocast(device_type, enabled=(dev.type == "cuda")):
                     logits = self.model(xb)
                     loss = criterion(logits, yb)
                 scaler.scale(loss).backward()

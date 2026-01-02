@@ -235,6 +235,9 @@ class LightGBMExpert(ExpertModel):
                 x = x.iloc[order]
                 y = y.iloc[order]
 
+            # Clean inf values (replace with nan)
+            x = x.replace([np.inf, -np.inf], np.nan)
+
             params = self.params.copy()
 
             # Respect worker thread partitioning when set (prevents oversubscription on large CPUs).
@@ -719,6 +722,9 @@ class XGBoostExpert(ExpertModel):
                 x = x.iloc[order]
                 y = y.iloc[order]
 
+            # XGBoost can't handle inf values - replace with nan (which XGBoost handles natively)
+            x = x.replace([np.inf, -np.inf], np.nan)
+
             # XGBoost's sklearn wrapper expects multiclass labels to be contiguous: {0,1,2,...}.
             # Our project uses {-1,0,1} where -1=sell, 0=neutral, 1=buy.
             y_arr = np.asarray(y, dtype=int)
@@ -755,14 +761,17 @@ class XGBoostExpert(ExpertModel):
                 if cnt > 0:
                     sample_weight[y_train == cls] = len(y_train) / (len(uniq) * cnt)
 
-            self.model = xgb.XGBClassifier(**self.params)
+            # XGBoost 2.0+: early_stopping_rounds moved from fit() to constructor
+            params = self.params.copy()
             fit_kwargs = {}
             if eval_set:
                 es_pat, _ = get_early_stop_params(50, 0.0)
                 if es_pat > 0:
+                    params["early_stopping_rounds"] = es_pat
                     fit_kwargs["eval_set"] = eval_set
-                    fit_kwargs["early_stopping_rounds"] = es_pat
                     fit_kwargs["verbose"] = False
+
+            self.model = xgb.XGBClassifier(**params)
             self.model.fit(x_train, y_train, sample_weight=sample_weight, **fit_kwargs)
         except Exception as e:
             logger.error(f"XGBoost training failed: {e}")
@@ -851,6 +860,9 @@ class CatBoostExpert(ExpertModel):
                 order = np.argsort(x.index.view("int64"))
                 x = x.iloc[order]
                 y = y.iloc[order]
+
+            # Clean inf values (replace with nan)
+            x = x.replace([np.inf, -np.inf], np.nan)
 
             uniq, counts = np.unique(y, return_counts=True)
             class_weights = {

@@ -90,7 +90,10 @@ class ModelFactory:
             "catboost",
             "catboost_alt",
         }:
-            init_kwargs = {"params": params.copy()}
+            # Tree-based models don't support batch_size - filter it out
+            tree_params = params.copy()
+            tree_params.pop("batch_size", None)
+            init_kwargs = {"params": tree_params}
 
         # Inject Device if supported
         if prefer_gpu and self.available_gpus:

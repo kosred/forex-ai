@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -12,6 +13,13 @@ import joblib
 import numpy as np
 import pandas as pd
 from pandas import DataFrame, Series
+
+# Suppress pandas nanops RuntimeWarnings (invalid value in subtract/add/etc)
+# We clean data before calculations, but pandas internals may still emit warnings
+warnings.filterwarnings("ignore", message="invalid value encountered in subtract", category=RuntimeWarning)
+warnings.filterwarnings("ignore", message="invalid value encountered in add", category=RuntimeWarning)
+warnings.filterwarnings("ignore", message="invalid value encountered in multiply", category=RuntimeWarning)
+warnings.filterwarnings("ignore", message="invalid value encountered in divide", category=RuntimeWarning)
 
 from ..core.config import Settings
 from ..core.system import normalize_device_preference
@@ -270,6 +278,17 @@ class FeatureEngineer:
         max_rows = 0 if full_data else int(getattr(self.settings.system, "max_training_rows_per_tf", 0) or 0)
         if max_rows > 0 and len(df) > max_rows:
             df = df.tail(max_rows)
+
+        # Clean inf/NaN from raw OHLC data BEFORE any calculations (prevents RuntimeWarnings)
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+                # Forward-fill NaN for OHLC (missing ticks), but don't create new data
+                if col != "volume":
+                    df[col] = df[col].ffill().bfill()
+                else:
+                    # Volume NaN = 0 (no trading)
+                    df[col] = df[col].fillna(0.0)
 
         # Normalize timestamps
         try:

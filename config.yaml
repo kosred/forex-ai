@@ -135,13 +135,13 @@ models:
   evo_train_seconds: 36000
   evo_hidden_size: 64
   evo_population: 32
-  evo_islands: 4
-  prop_search_enabled: false
-  prop_search_population: 200
-  prop_search_generations: 50
-  prop_search_max_hours: 1.0
-  prop_search_max_rows: 200000
-  prop_search_portfolio_size: 100
+  evo_islands: 8  # MORE ISLANDS = MORE DIVERSITY (was 4, now 8)
+  prop_search_enabled: true  # CRITICAL: Enable strategy discovery!
+  prop_search_population: 200  # Per-island population (200 × 8 islands = 1600 total)
+  prop_search_generations: 50  # Evolution iterations
+  prop_search_max_hours: 4.0  # Increased time for full exploration (was 1.0)
+  prop_search_max_rows: 0  # 0 = USE FULL DATASET for strategy discovery (2.2M rows)
+  prop_search_portfolio_size: 100  # Top strategies to save (diverse across sessions/regimes)
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: cpu
   train_batch_size: 32
@@ -159,8 +159,8 @@ models:
   kan_train_seconds: 36000
   num_transformers: 2
   hpo_backend: ax
-  hpo_trials: 0  # 0 = use default trial count
-  hpo_max_rows: 0
+  hpo_trials: 5  # 5 trials with full data = comprehensive search
+  hpo_max_rows: 0  # 0 = USE FULL DATASET for HPO (2.2M rows)
   ray_tune_max_concurrency: 1
   export_onnx: true  # Export ONNX for fast CPU inference (one-time at startup if missing)
   phase5_filter_meta_blender: true

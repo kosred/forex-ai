@@ -560,6 +560,29 @@ class ModelTrainer:
             gpu_max_concurrent = 1
         cpu_max_concurrent = self._read_int_env("FOREX_BOT_CPU_MAX_CONCURRENT_MODELS", None)
 
+        # Smart RAM-aware concurrency calculation
+        if cpu_max_concurrent is None or cpu_max_concurrent <= 0:
+            try:
+                import psutil
+                from ..core.system import resolve_cpu_budget
+
+                available_gb = psutil.virtual_memory().available / 1e9
+                cpu_budget = resolve_cpu_budget()
+
+                # Estimate: each concurrent model needs ~3GB peak during training
+                ram_limited = max(1, int(available_gb / 3.0))
+                # CPU-limited: minimum 2 threads per model for efficiency
+                cpu_limited = max(1, cpu_budget // 2)
+
+                # Take the minimum to respect both constraints
+                cpu_max_concurrent = min(ram_limited, cpu_limited)
+                logger.info(f"Auto-calculated cpu_max_concurrent={cpu_max_concurrent} "
+                           f"(RAM-limited: {ram_limited}, CPU-limited: {cpu_limited}, "
+                           f"available: {available_gb:.1f}GB, cores: {cpu_budget})")
+            except Exception as e:
+                logger.debug(f"Failed to auto-calculate concurrency: {e}")
+                cpu_max_concurrent = 0  # Fall back to default
+
         procs: list[tuple[str, Path, subprocess.Popen, Any]] = []
         try:
             for idx, spec in enumerate(worker_specs):

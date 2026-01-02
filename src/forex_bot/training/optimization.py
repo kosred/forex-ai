@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import json
 import logging
@@ -17,9 +18,11 @@ except ImportError:
 
 try:
     from ax.service.ax_client import AxClient  # type: ignore
+    from ax.service.utils.instantiation import ObjectiveProperties  # type: ignore
     AX_CLIENT_AVAILABLE = True
 except Exception:
     AxClient = None
+    ObjectiveProperties = None
     AX_CLIENT_AVAILABLE = False
 
 try:
@@ -89,7 +92,9 @@ class HyperparameterOptimizer:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.ray_dir = Path(cache_dir) / "ray_tune"
         self.ray_dir.mkdir(parents=True, exist_ok=True)
-        self.available = RAY_AVAILABLE and AX_AVAILABLE
+        # FIX: Allow Ax standalone without Ray (Windows Python 3.13 compatibility)
+        self.available = AX_CLIENT_AVAILABLE or (RAY_AVAILABLE and AX_AVAILABLE)
+        self.use_ray = RAY_AVAILABLE and AX_AVAILABLE
         self.meta_df: pd.DataFrame | None = None
         self.ray_max_concurrency = max(
             1, int(getattr(self.settings.models, "ray_tune_max_concurrency", 1) or 1)
@@ -112,11 +117,14 @@ class HyperparameterOptimizer:
         self.stop_event: Any | None = None
         self._hpo_cpu_threads: int = 0
 
-        if not (RAY_AVAILABLE and AX_AVAILABLE):
-            logger.warning("Ray Tune/Ax not available. Skipping optimization.")
+        # Log HPO availability status
+        if not self.available:
+            logger.warning("Ax not available. HPO disabled. Install with: pip install ax-platform")
         elif self.hpo_backend != "none":
-            if AX_CLIENT_AVAILABLE:
-                logger.info("HPO backend: Ax/BoTorch via AxClient.")
+            if self.use_ray:
+                logger.info("HPO backend: Ray Tune + Ax (distributed Bayesian optimization)")
+            elif AX_CLIENT_AVAILABLE:
+                logger.info("HPO backend: Ax/BoTorch via AxClient (standalone, no Ray)")
             else:
                 logger.info("HPO backend: AxSearch (AxClient unavailable).")
 
@@ -938,6 +946,109 @@ class HyperparameterOptimizer:
         # Compatibility wrapper for sync callers
         return asyncio.run(self._optimize_all_ray_tune_async(*args, **kwargs))
 
+    def _optimize_all_ax_standalone(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        meta_val: pd.DataFrame | None,
+    ) -> dict[str, Any]:
+        """Standalone Ax optimization using AxClient (no Ray required)."""
+        if not AX_CLIENT_AVAILABLE:
+            logger.warning("AxClient not available, skipping HPO")
+            return {}
+
+        best_params = {}
+        models_to_optimize = [
+            "LightGBM", "XGBoost", "XGBoostRF", "XGBoostDART",
+            "CatBoost", "CatBoostAlt", "RandomForest", "ExtraTrees",
+            "TabNet", "N-BEATS", "TiDE", "KAN", "Transformer", "MLP"
+        ]
+
+        for model_name in models_to_optimize:
+            if self._should_stop():
+                logger.info(f"Stop requested, skipping {model_name} HPO")
+                break
+
+            search_space = self._ax_search_space(model_name, y_train)
+            if not search_space:
+                continue
+
+            logger.info(f"[Ax Standalone] Optimizing {model_name} ({self.n_trials} trials)...")
+
+            try:
+                # Create AxClient with minimize=False (maximize prop_score)
+                ax_client = AxClient(verbose_logging=False)
+                ax_client.create_experiment(
+                    name=f"{model_name}_hpo",
+                    parameters=search_space,
+                    objectives={"prop_score": ObjectiveProperties(minimize=False)},
+                )
+
+                # Ask-tell loop
+                for trial_idx in range(self.n_trials):
+                    if self._should_stop():
+                        break
+
+                    # Ask: Get next parameters to try
+                    parameters, trial_index = ax_client.get_next_trial()
+
+                    # Evaluate: Train model and get metrics
+                    metrics = self._evaluate_trial(
+                        model_name, parameters, X_train, y_train, X_val, y_val, meta_val
+                    )
+
+                    # Tell: Report results back to Ax
+                    # AxClient expects only the objective metric in raw_data
+                    ax_client.complete_trial(
+                        trial_index=trial_index,
+                        raw_data={"prop_score": (metrics["prop_score"], 0.0)}
+                    )
+
+                    logger.info(f"  Trial {trial_idx + 1}/{self.n_trials}: prop_score={metrics.get('prop_score', 0):.4f}")
+
+                # Get best parameters
+                best_parameters, best_values = ax_client.get_best_parameters()
+                best_params[model_name] = best_parameters
+                logger.info(f"[Ax Standalone] {model_name} best prop_score: {best_values[0]['prop_score']:.4f}")
+
+            except Exception as e:
+                logger.warning(f"Ax standalone optimization failed for {model_name}: {e}")
+                continue
+
+        self._save_params(best_params)
+        return best_params
+
+    def _evaluate_trial(
+        self,
+        model_name: str,
+        config: dict,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        meta_val: pd.DataFrame | None,
+    ) -> dict[str, float]:
+        """Evaluate a single trial configuration."""
+        device = self.default_device
+        model = self._ray_create_model(model_name, config, device, y_train)
+
+        if model is None:
+            return {"prop_score": -1e9, "drawdown": 1.0, "daily_dd": 1.0, "accuracy": 0.0, "trades": 0.0}
+
+        try:
+            fit_ok = model.fit(X_train, y_train)
+            if isinstance(fit_ok, bool) and not fit_ok:
+                return {"prop_score": -1e9, "drawdown": 1.0, "daily_dd": 1.0, "accuracy": 0.0, "trades": 0.0}
+
+            preds = model.predict_proba(X_val)
+            metrics = self._objective_metrics(y_val, preds, meta_val)
+            return metrics
+        except Exception as exc:
+            logger.warning(f"Trial evaluation failed for {model_name}: {exc}")
+            return {"prop_score": -1e9, "drawdown": 1.0, "daily_dd": 1.0, "accuracy": 0.0, "trades": 0.0}
+
     def optimize_all(
         self,
         X: pd.DataFrame,
@@ -949,8 +1060,8 @@ class HyperparameterOptimizer:
         if self.hpo_backend == "none":
             logger.info("HPO backend disabled; skipping hyperparameter optimization.")
             return {}
-        if not (RAY_AVAILABLE and AX_AVAILABLE):
-            logger.warning("Ray Tune/Ax not installed; hyperparameter optimization skipped.")
+        if not self.available:
+            logger.warning("Ax not installed; hyperparameter optimization skipped. Install with: pip install ax-platform")
             return {}
         self.stop_event = stop_event
         self.meta_df = meta_df
@@ -1030,9 +1141,17 @@ class HyperparameterOptimizer:
             logger.info("Stop requested before optimization; skipping all HPO studies.")
             return best_params
 
-        best_params = self._optimize_all_ray_tune(
-            X_train, y_train, X_val, y_val, meta_val
-        )
+        # Use Ray Tune if available, otherwise use standalone AxClient
+        if self.use_ray:
+            logger.info("Using Ray Tune + Ax for distributed hyperparameter optimization")
+            best_params = self._optimize_all_ray_tune(
+                X_train, y_train, X_val, y_val, meta_val
+            )
+        else:
+            logger.info("Using standalone Ax (AxClient) for hyperparameter optimization (Ray not available)")
+            best_params = self._optimize_all_ax_standalone(
+                X_train, y_train, X_val, y_val, meta_val
+            )
         return best_params
 
     def _save_params(self, params: dict[str, Any]) -> None:

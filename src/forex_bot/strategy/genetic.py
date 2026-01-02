@@ -515,7 +515,8 @@ class GeneticStrategyEvolution:
 
         elif mutation_type == "params" and gene.indicators:
             target_ind = random.choice(gene.indicators)
-            if target_ind in mutated_gene.params:
+            # Safety: check that params dict exists AND is not empty
+            if target_ind in mutated_gene.params and mutated_gene.params[target_ind]:
                 param_key = random.choice(list(mutated_gene.params[target_ind].keys()))
                 old_val = mutated_gene.params[target_ind][param_key]
                 if isinstance(old_val, int):

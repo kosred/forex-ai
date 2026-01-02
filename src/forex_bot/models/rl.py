@@ -6,6 +6,11 @@ import numpy as np
 import pandas as pd
 from gymnasium import spaces
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 from ..core.system import resolve_cpu_budget
 
 # Optional Stable Baselines 3
@@ -418,32 +423,49 @@ class RLExpertPPO(ExpertModel):
         metadata: pd.DataFrame,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
         try:
-            _, X_val, _, _ = time_series_train_val_split(
+            X_train, X_val, _, _ = time_series_train_val_split(
                 X, y, val_ratio=self.eval_ratio, min_train_samples=100, embargo_samples=0
             )
         except Exception:
             split = int(len(X) * (1.0 - self.eval_ratio))
+            X_train = X.iloc[:split]
             X_val = X.iloc[split:]
 
         meta_train = None
         meta_val = None
         if metadata is not None:
             try:
-                meta_train = metadata
+                # Align metadata with the split data using index
+                meta_train = metadata.loc[X_train.index] if len(X_train) else None
                 meta_val = metadata.loc[X_val.index] if len(X_val) else None
             except Exception:
-                meta_train = metadata
-                meta_val = (
-                    metadata.iloc[len(X) - len(X_val) : len(X)]
-                    if len(X_val)
-                    else None
-                )
-        return X, X_val, meta_train, meta_val
+                # Fallback: use iloc slicing if index alignment fails
+                split_idx = len(X_train)
+                meta_train = metadata.iloc[:split_idx] if len(X_train) else None
+                meta_val = metadata.iloc[split_idx:] if len(X_val) else None
+        return X_train, X_val, meta_train, meta_val
 
     def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs):
         if not SB3_AVAILABLE:
             logger.warning("StableBaselines3 not installed. RL skipped.")
             return
+
+        # Validate time-ordering to prevent look-ahead bias
+        validate_time_ordering(X, context="RLExpertPPO.fit")
+
+        metadata = kwargs.get("metadata")
+        if metadata is None:
+            logger.warning("RL Expert requires metadata (OHLC) for Prop Environment.")
+            return
+
+        X_train, X_val, meta_train, meta_val = self._split_env_data(X, y, metadata)
+        if meta_train is None or len(X_train) == 0:
+            logger.warning("RL Expert: training metadata unavailable or empty.")
+            return
+
+        if meta_val is not None and self.eval_max_rows > 0 and len(X_val) > self.eval_max_rows:
+            X_val = X_val.iloc[-self.eval_max_rows:]
+            meta_val = meta_val.iloc[-self.eval_max_rows:]
 
         # Create environment with high-speed parallel execution
         import os
@@ -453,18 +475,39 @@ class RLExpertPPO(ExpertModel):
         except Exception:
             requested = cpu_budget
         n_envs = max(1, min(requested, cpu_budget))
-        
-        def make_env():
-            return PropFirmTradingEnv(meta_train, X_train.values)
 
+        # Use default arguments to capture closure variables at function creation time
+        def make_env(m=meta_train, x=X_train.values):
+            return PropFirmTradingEnv(m, x)
+
+        # RAM-aware parallelization: Check if we have memory for parallel envs
+        if n_envs > 1 and psutil:
+            available_gb = psutil.virtual_memory().available / 1e9
+            data_size_gb = X_train.values.nbytes / 1e9
+            # Each SubprocVecEnv process needs a copy of data (2x safety margin)
+            affordable_envs = max(1, int(available_gb / (data_size_gb * 2.0)))
+            if n_envs > affordable_envs:
+                logger.info(f"RAM-limited: reducing RL envs from {n_envs} to {affordable_envs} "
+                           f"(available: {available_gb:.1f}GB, data: {data_size_gb:.1f}GB per env)")
+                n_envs = affordable_envs
+
+        # Python 3.13+ on Windows: SubprocVecEnv may fail with pickle errors
+        # Fallback to DummyVecEnv (single process) if multiprocessing fails
         if n_envs > 1:
-            self.env = SubprocVecEnv([make_env for _ in range(n_envs)])
+            try:
+                self.env = SubprocVecEnv([make_env for _ in range(n_envs)])
+            except (OSError, EOFError, BrokenPipeError, MemoryError, Exception) as e:
+                logger.warning(f"SubprocVecEnv failed ({e.__class__.__name__}), falling back to single-process DummyVecEnv")
+                self.env = DummyVecEnv([make_env])
         else:
             self.env = DummyVecEnv([make_env])
 
         eval_env = None
         if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
-            eval_env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_val, X_val.values)])
+            # Use default arguments to capture closure variables (named function for pickling)
+            def make_eval_env(m=meta_val, x=X_val.values):
+                return PropFirmTradingEnv(m, x)
+            eval_env = DummyVecEnv([make_eval_env])
 
         # Larger policy on GPU; smaller on CPU
         policy_kwargs = {}
@@ -574,18 +617,39 @@ class RLExpertSAC(RLExpertPPO):
         except Exception:
             requested = cpu_budget
         n_envs = max(1, min(requested, cpu_budget))
-        
-        def make_env():
-            return PropFirmTradingEnv(meta_train, X_train.values)
 
+        # Use default arguments to capture closure variables at function creation time
+        def make_env(m=meta_train, x=X_train.values):
+            return PropFirmTradingEnv(m, x)
+
+        # RAM-aware parallelization: Check if we have memory for parallel envs
+        if n_envs > 1 and psutil:
+            available_gb = psutil.virtual_memory().available / 1e9
+            data_size_gb = X_train.values.nbytes / 1e9
+            # Each SubprocVecEnv process needs a copy of data (2x safety margin)
+            affordable_envs = max(1, int(available_gb / (data_size_gb * 2.0)))
+            if n_envs > affordable_envs:
+                logger.info(f"RAM-limited: reducing RL envs from {n_envs} to {affordable_envs} "
+                           f"(available: {available_gb:.1f}GB, data: {data_size_gb:.1f}GB per env)")
+                n_envs = affordable_envs
+
+        # Python 3.13+ on Windows: SubprocVecEnv may fail with pickle errors
+        # Fallback to DummyVecEnv (single process) if multiprocessing fails
         if n_envs > 1:
-            self.env = SubprocVecEnv([make_env for _ in range(n_envs)])
+            try:
+                self.env = SubprocVecEnv([make_env for _ in range(n_envs)])
+            except (OSError, EOFError, BrokenPipeError, MemoryError, Exception) as e:
+                logger.warning(f"SubprocVecEnv failed ({e.__class__.__name__}), falling back to single-process DummyVecEnv")
+                self.env = DummyVecEnv([make_env])
         else:
             self.env = DummyVecEnv([make_env])
 
         eval_env = None
         if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
-            eval_env = DummyVecEnv([lambda: PropFirmTradingEnv(meta_val, X_val.values)])
+            # Use default arguments to capture closure variables (named function for pickling)
+            def make_eval_env(m=meta_val, x=X_val.values):
+                return PropFirmTradingEnv(m, x)
+            eval_env = DummyVecEnv([make_eval_env])
 
         # Larger policy on GPU; smaller on CPU
         policy_kwargs = {}

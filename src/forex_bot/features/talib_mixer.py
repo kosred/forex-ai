@@ -55,6 +55,12 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+
+def _make_float_defaultdict():
+    """Factory for nested defaultdict - must be module-level for pickling in multiprocessing."""
+    return defaultdict(float)
+
+
 TALIB_INDICATORS = {
     "trend": [
         "SMA",
@@ -159,10 +165,13 @@ class TALibStrategyMixer:
                     fast GPU path is used for a subset of indicators.
         """
         self.indicator_synergy_matrix: dict[tuple[str, str], float] = {}
-        self.regime_performance: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self.regime_performance: dict[str, dict[str, float]] = defaultdict(_make_float_defaultdict)
         self.available_indicators = []
         self.use_volume_features = use_volume_features
         self._volume_indicators = set(TALIB_INDICATORS.get("volume", [])) | {"VWAP"}
+
+        # Sticky sequential mode flag: once RAM forces sequential, stay sequential
+        self._force_sequential = False
 
         # GPU flag is explicit to avoid surprise memory usage and indicator drift.
         self.device = device.lower()
@@ -890,31 +899,40 @@ class TALibStrategyMixer:
 
         import psutil
 
-        # Dynamic worker limit based on RAM
-        mem = psutil.virtual_memory()
-        # Conservative: leave 20% headroom. Each indicator is roughly float32 * rows.
-        # 50k rows * 4 bytes = 200KB (negligible).
-        # 10M rows * 4 bytes = 40MB.
-        # Parallelism is fine for computation speed, bottleneck is usually GIL for light ops
-        # or pure CPU for heavy ops. Threading works for TA-Lib (C-ext).
-
-        env_workers = (
-            os.environ.get("FOREX_BOT_TALIB_WORKERS")
-            or os.environ.get("FOREX_BOT_CPU_BUDGET")
-            or os.environ.get("FOREX_BOT_CPU_THREADS")
-        )
-        cpu_budget = resolve_cpu_budget()
-        if env_workers:
-            try:
-                env_val = max(1, int(env_workers))
-            except Exception:
-                env_val = cpu_budget
-            max_workers = max(1, min(env_val, cpu_budget))
+        # STICKY SEQUENTIAL MODE: Once RAM forces sequential, never go back to parallel
+        # This prevents thrashing between parallel→sequential→parallel loops
+        if self._force_sequential:
+            max_workers = 1
+            logger.debug("Using sequential mode (sticky - RAM was high earlier)")
         else:
-            max_workers = max(1, cpu_budget)
-        if mem.percent > 85:
-            max_workers = max(1, max_workers // 2)
-            logger.warning(f"High RAM ({mem.percent}%), throttling indicator calc to {max_workers} workers.")
+            # Dynamic worker limit based on RAM
+            mem = psutil.virtual_memory()
+            # Conservative: leave 20% headroom. Each indicator is roughly float32 * rows.
+            # 50k rows * 4 bytes = 200KB (negligible).
+            # 10M rows * 4 bytes = 40MB.
+            # Parallelism is fine for computation speed, bottleneck is usually GIL for light ops
+            # or pure CPU for heavy ops. Threading works for TA-Lib (C-ext).
+
+            env_workers = (
+                os.environ.get("FOREX_BOT_TALIB_WORKERS")
+                or os.environ.get("FOREX_BOT_CPU_BUDGET")
+                or os.environ.get("FOREX_BOT_CPU_THREADS")
+            )
+            cpu_budget = resolve_cpu_budget()
+            if env_workers:
+                try:
+                    env_val = max(1, int(env_workers))
+                except Exception:
+                    env_val = cpu_budget
+                max_workers = max(1, min(env_val, cpu_budget))
+            else:
+                max_workers = max(1, cpu_budget)
+
+            # Initial RAM check: if high at start, go sequential immediately
+            if mem.percent > 85:
+                max_workers = 1
+                self._force_sequential = True  # Set sticky flag
+                logger.warning(f"High RAM ({mem.percent:.1f}%) at start - switching to SEQUENTIAL mode (sticky)")
 
         # If GPU batch mode enabled, try to pre-pull numpy columns to cupy once
         gpu_arrays = None
@@ -936,10 +954,11 @@ class TALibStrategyMixer:
         for i in range(0, total_tasks, chunk_size):
             chunk = task_list[i : i + chunk_size]
 
-            # Check RAM before dispatching next chunk
-            if psutil.virtual_memory().percent > 90:
-                logger.warning("Critical RAM usage (>90%). Switching to sequential processing for safety.")
+            # Check RAM before dispatching next chunk (STICKY: once sequential, always sequential)
+            if not self._force_sequential and psutil.virtual_memory().percent > 90:
+                self._force_sequential = True
                 max_workers = 1
+                logger.warning("Critical RAM usage (>90%). Switching to SEQUENTIAL mode (sticky - will NOT switch back)")
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
@@ -1141,7 +1160,10 @@ class TALibStrategyMixer:
                 continue
             self.indicator_synergy_matrix[tuple(sorted([ind1, ind2]))] = float(value)
         for regime, perf in data.get("regime_performance", {}).items():
-            self.regime_performance[regime] = defaultdict(float, perf)
+            # Use factory function for consistency and picklability
+            regime_dict = _make_float_defaultdict()
+            regime_dict.update(perf)
+            self.regime_performance[regime] = regime_dict
 
 
 if NUMBA_AVAILABLE:

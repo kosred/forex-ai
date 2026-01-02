@@ -327,8 +327,22 @@ class TransformerExpertTorch(ExpertModel):
 
         # Robust Normalization (Critical for Transformer Stability)
         x_vals = x.select_dtypes(include=np.number).to_numpy(dtype=np.float32)
-        self.mean_ = np.mean(x_vals, axis=0)
-        self.scale_ = np.maximum(np.std(x_vals, axis=0), 1e-3)
+
+        # Try full array normalization first (HPC mode), fallback to chunked if OOM
+        try:
+            self.mean_ = np.mean(x_vals, axis=0)
+            self.scale_ = np.maximum(np.std(x_vals, axis=0), 1e-3)
+        except (MemoryError, np.core._exceptions._ArrayMemoryError):
+            # Low RAM: Use chunked normalization
+            logger.warning("Low memory detected, using chunked normalization (may be slower)")
+            chunk_size = 500_000
+            means, stds = [], []
+            for i in range(0, len(x_vals), chunk_size):
+                chunk = x_vals[i:i+chunk_size]
+                means.append(np.mean(chunk, axis=0))
+                stds.append(np.std(chunk, axis=0))
+            self.mean_ = np.mean(means, axis=0)
+            self.scale_ = np.maximum(np.mean(stds, axis=0), 1e-3)
 
         # Create normalized DataFrame (preserving index/columns for layout parser)
         x_norm = x.copy()

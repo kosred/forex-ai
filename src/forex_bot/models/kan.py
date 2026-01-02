@@ -102,10 +102,15 @@ class KANExpert(ExpertModel):
         return KANNet(self.input_dim, self.hidden_dim).to(self.device)
 
     def fit(self, X: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
-        # Robust Normalization
+        # Robust Normalization with NaN/Inf handling (2025 best practice)
         x_np = dataframe_to_float32_numpy(X)
-        self.mean_ = np.mean(x_np, axis=0)
-        self.scale_ = np.maximum(np.std(x_np, axis=0), 1e-3)
+        # Replace inf with nan first, then use nanmean/nanstd which ignore NaN
+        x_np = np.where(np.isinf(x_np), np.nan, x_np)
+        self.mean_ = np.nanmean(x_np, axis=0, keepdims=True)
+        self.scale_ = np.maximum(np.nanstd(x_np, axis=0, keepdims=True), 1e-3)
+        # Replace any remaining NaN with column means before normalization
+        col_means = np.nanmean(x_np, axis=0, keepdims=True)
+        x_np = np.where(np.isnan(x_np), col_means, x_np)
         x_norm = (x_np - self.mean_) / self.scale_
 
         # Align device to local rank if distributed
@@ -228,8 +233,12 @@ class KANExpert(ExpertModel):
         self.model.eval()
 
         x_np = dataframe_to_float32_numpy(X)
-        # Apply normalization
+        # Apply normalization with NaN/Inf handling
         if hasattr(self, "mean_") and self.mean_ is not None:
+            # Handle NaN/Inf in inference data same as training
+            x_np = np.where(np.isinf(x_np), np.nan, x_np)
+            col_means = np.nanmean(x_np, axis=0, keepdims=True)
+            x_np = np.where(np.isnan(x_np), col_means, x_np)
             x_norm = (x_np - self.mean_) / self.scale_
         else:
             x_norm = x_np
