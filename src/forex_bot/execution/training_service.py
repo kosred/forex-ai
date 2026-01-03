@@ -92,12 +92,20 @@ class TrainingService:
 
     def _prop_search_async_enabled(self) -> bool:
         raw = os.environ.get("FOREX_BOT_PROP_SEARCH_ASYNC", "")
-        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+        if str(raw).strip() != "":
+            return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            return bool(getattr(self.settings.models, "prop_search_async", False))
+        except Exception:
+            return False
 
     def _prop_search_async_wait(self) -> bool:
         raw = os.environ.get("FOREX_BOT_PROP_SEARCH_ASYNC_WAIT")
         if raw is None or str(raw).strip() == "":
-            return True
+            try:
+                return bool(getattr(self.settings.models, "prop_search_async_wait", False))
+            except Exception:
+                return False
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
     def _prop_search_workers_override(self) -> int | None:

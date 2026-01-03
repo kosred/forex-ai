@@ -29,6 +29,8 @@ models:
   prop_search_val_min_trades_per_day: 1.0
   prop_search_val_log_trades: true
   prop_search_val_trade_log_max: 50
+  prop_search_async: false
+  prop_search_async_wait: false
   # Reduce HPO for local debugging
   hpo_trials: 0
   hpo_max_rows: 100000

@@ -142,6 +142,8 @@ models:
   prop_search_max_hours: 2.0  # Budget-safe time cap
   prop_search_max_rows: 0  # 0 = USE FULL DATASET for strategy discovery (2.2M rows)
   prop_search_portfolio_size: 3000  # Keep many strategies for downstream evaluation
+  prop_search_async: true
+  prop_search_async_wait: false
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: cpu
   prop_search_train_years: 8
