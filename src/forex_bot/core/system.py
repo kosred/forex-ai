@@ -414,17 +414,29 @@ class AutoTuner:
         is_hpc = False
 
         # Detect Cloud/HPC Beast (GPU or CPU-heavy).
+        disable_hpc = str(os.environ.get("FOREX_BOT_DISABLE_HPC", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         force_hpc = str(os.environ.get("FOREX_BOT_FORCE_HPC", "")).strip().lower() in {
             "1",
             "true",
             "yes",
             "on",
         }
+        if disable_hpc:
+            force_hpc = False
         min_hpc_cores = max(1, self._read_int_env("FOREX_BOT_HPC_MIN_CORES", 64) or 64)
         min_hpc_ram = max(1.0, self._read_float_env("FOREX_BOT_HPC_MIN_RAM_GB", 64.0) or 64.0)
         cpu_hpc = cpu_cores >= min_hpc_cores and ram_gb >= min_hpc_ram
 
-        if force_hpc or (enable_gpu and self.profile.num_gpus >= 4 and ram_gb > 64) or cpu_hpc:
+        if disable_hpc:
+            self.logger.info("HPC disabled via FOREX_BOT_DISABLE_HPC=1; using non-HPC tuning.")
+        if (not disable_hpc) and (
+            force_hpc or (enable_gpu and self.profile.num_gpus >= 4 and ram_gb > 64) or cpu_hpc
+        ):
             is_hpc = True
             # HPC BEAST: Saturate the machine (Leave reserve for OS)
             n_jobs = max(1, cpu_budget)

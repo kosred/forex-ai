@@ -1570,7 +1570,8 @@ class TrainingService:
             cpu_reserve = self._parse_int_env("FOREX_BOT_CPU_RESERVE")
             if cpu_reserve is None:
                 cpu_reserve = 1
-            cpu_budget_env = self._parse_int_env("FOREX_BOT_CPU_BUDGET")
+            feature_cpu_env = self._parse_int_env("FOREX_BOT_FEATURE_CPU_BUDGET")
+            cpu_budget_env = feature_cpu_env if feature_cpu_env is not None else self._parse_int_env("FOREX_BOT_CPU_BUDGET")
             if cpu_budget_env is not None and cpu_budget_env > 0:
                 cpu_budget = max(1, min(cpu_total, cpu_budget_env))
             else:
@@ -1612,6 +1613,20 @@ class TrainingService:
             else:
                 max_workers = max(1, min(cpu_budget, max_ram_workers))
 
+            # Cap runaway worker counts to avoid process storms on large boxes.
+            max_shards_per_symbol = self._parse_int_env("FOREX_BOT_HPC_SHARDS_PER_SYMBOL")
+            if max_shards_per_symbol is None or max_shards_per_symbol <= 0:
+                max_shards_per_symbol = 8
+            max_workers_cap = max(1, min(cpu_budget, len(symbols) * max_shards_per_symbol))
+            if max_workers > max_workers_cap:
+                logger.warning(
+                    "HPC: Capping feature workers to %s (symbols=%s, max_shards_per_symbol=%s).",
+                    max_workers_cap,
+                    len(symbols),
+                    max_shards_per_symbol,
+                )
+                max_workers = max_workers_cap
+
             feature_threads = self._parse_int_env("FOREX_BOT_FEATURE_WORKER_THREADS")
             if feature_threads is not None and feature_threads > 0:
                 max_workers = max(1, min(max_workers, max(1, cpu_budget // feature_threads)))
@@ -1644,6 +1659,11 @@ class TrainingService:
 
             all_tasks = []
             shards_by_symbol: dict[str, int] = {}
+            worker_mode = str(os.environ.get("FOREX_BOT_HPC_WORKER_MODE", "shard")).strip().lower()
+            if worker_mode not in {"shard", "symbol"}:
+                worker_mode = "shard"
+            if worker_mode == "symbol":
+                max_workers = max(1, min(max_workers, len(symbols)))
             for sym, frames in raw_frames_map.items():
                 base_df = frames.get(self.settings.system.base_timeframe)
                 if base_df is None or (isinstance(base_df, pd.DataFrame) and base_df.empty):
@@ -1651,10 +1671,16 @@ class TrainingService:
                 if base_df is None or (isinstance(base_df, pd.DataFrame) and base_df.empty):
                     continue
                 
-                # Shard each symbol into 32 time-slices
-                n_shards = max(1, max_workers // len(symbols))
+                # Shard each symbol into time-slices (or run single shard per symbol)
+                if worker_mode == "symbol":
+                    n_shards = 1
+                else:
+                    n_shards = max(1, max_workers // len(symbols))
                 shards_by_symbol[sym] = n_shards
-                chunk_indices = np.array_split(np.arange(len(base_df)), n_shards)
+                if n_shards == 1:
+                    chunk_indices = [np.arange(len(base_df))]
+                else:
+                    chunk_indices = np.array_split(np.arange(len(base_df)), n_shards)
                 
                 for i, idx_range in enumerate(chunk_indices):
                     if len(idx_range) == 0: continue
@@ -1668,9 +1694,26 @@ class TrainingService:
                         "gpu": assigned_gpu
                     })
 
-            logger.info(f"HPC: Dispatching {len(all_tasks)} zero-copy tasks...")
+            logger.info("HPC: Dispatching %s zero-copy tasks (mode=%s).", len(all_tasks), worker_mode)
+            if all_tasks and max_workers > len(all_tasks):
+                max_workers = len(all_tasks)
+                logger.info("HPC: Reducing worker pool to %s (task count bound).", max_workers)
             datasets_parts = []
-            spawn_ctx = multiprocessing.get_context("spawn")
+            ctx_name = "spawn"
+            if force_cpu:
+                try:
+                    import sys
+
+                    if sys.platform != "win32":
+                        ctx_name = "fork"
+                except Exception:
+                    pass
+            spawn_ctx = multiprocessing.get_context(ctx_name)
+            logger.info(
+                "HPC: Using %s start method for feature workers (force_cpu=%s).",
+                ctx_name,
+                force_cpu,
+            )
             
             # Use a smaller chunksize to prevent the 'Pickle Stalling'
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn_ctx) as executor:
@@ -1690,13 +1733,34 @@ class TrainingService:
                         res = fut.result()
                         if res: datasets_parts.append(res)
                     except Exception as e:
-                        logger.error(f"Shard failed: {e}")
+                        task = futures.get(fut, {})
+                        logger.error(
+                            "HPC shard failed (symbol=%s, shard=%s): %s",
+                            task.get("sym"),
+                            task.get("shard_id"),
+                            e,
+                            exc_info=True,
+                        )
 
             # HPC FIX: Fault-Tolerant Re-assembly (Resilience against worker crashes)
             logger.info("HPC: Consolidating successful data shards...")
             for sym in symbols:
                 # Filter shards for this symbol that returned valid data
-                sym_parts = [p for p in datasets_parts if (getattr(p, "symbol", "") == sym or (isinstance(p, dict) and p.get("symbol") == sym)) and p.X is not None]
+                sym_parts: list[PreparedDataset] = []
+                for p in datasets_parts:
+                    ds = None
+                    p_sym = ""
+                    if isinstance(p, dict):
+                        p_sym = str(p.get("symbol") or "")
+                        ds = p.get("dataset")
+                    elif isinstance(p, (tuple, list)) and len(p) >= 2:
+                        p_sym = str(p[0] or "")
+                        ds = p[1]
+                    else:
+                        p_sym = str(getattr(p, "symbol", "") or "")
+                        ds = p
+                    if p_sym == sym and ds is not None and getattr(ds, "X", None) is not None:
+                        sym_parts.append(ds)
                 
                 if not sym_parts: 
                     logger.error(f"HPC FAILURE: All shards for {sym} failed! Skipping symbol.")
@@ -1738,6 +1802,8 @@ class TrainingService:
 
         if not datasets:
             logger.error("HPC FATAL: No datasets were successfully prepared. Cannot proceed with training.")
+            logger.warning("HPC fallback: switching to sequential global training.")
+            await self._train_global_sequential(symbols, optimize, stop_event)
             return
 
         # --- Launch Discovery (Uses internal 8-GPU ThreadPool) ---
@@ -1900,6 +1966,8 @@ def _hpc_feature_worker(settings, frames, sym, news_features=None, assigned_gpu=
         os.environ["MKL_NUM_THREADS"] = str(threads)
         os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
         os.environ["NUMEXPR_MAX_THREADS"] = str(threads)
+        os.environ["FOREX_BOT_CPU_BUDGET"] = str(threads)
+        os.environ["FOREX_BOT_CPU_THREADS"] = str(threads)
 
         # Optionally force CPU-only feature engineering to avoid GPU OOM in workers.
         force_cpu = str(os.environ.get("FOREX_BOT_FEATURE_CPU_ONLY", "1")).strip().lower() in {
@@ -1925,7 +1993,8 @@ def _hpc_feature_worker(settings, frames, sym, news_features=None, assigned_gpu=
         from forex_bot.features.pipeline import FeatureEngineer
 
         fe = FeatureEngineer(settings)
-        return fe.prepare(frames, news_features=news_features, symbol=sym)
+        ds = fe.prepare(frames, news_features=news_features, symbol=sym)
+        return {"symbol": sym, "dataset": ds}
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"Worker failed for {sym}: {e}", exc_info=True)

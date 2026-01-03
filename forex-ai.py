@@ -11,6 +11,43 @@ import platform
 import shutil
 from pathlib import Path
 
+# --- 0.5 VENV BOOTSTRAP (PREFER PROJECT VENV IF PRESENT) ---
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+def _in_venv() -> bool:
+    return getattr(sys, "base_prefix", sys.prefix) != sys.prefix or hasattr(sys, "real_prefix")
+
+def _venv_python() -> Path:
+    if os.name == "nt":
+        return SCRIPT_DIR / ".venv" / "Scripts" / "python.exe"
+    return SCRIPT_DIR / ".venv" / "bin" / "python"
+
+_venv_py = _venv_python()
+if _venv_py.exists() and not _in_venv():
+    os.execv(str(_venv_py), [str(_venv_py)] + sys.argv)
+
+def _pip_cmd(args: list[str] | None = None, *, upgrade: bool = False) -> list[str]:
+    cmd = [sys.executable, "-m", "pip", "install"]
+    if upgrade:
+        cmd.append("--upgrade")
+    if not _in_venv():
+        cmd.append("--user")
+        if platform.system().lower() == "linux":
+            cmd.append("--break-system-packages")
+    if args:
+        cmd.extend(args)
+    return cmd
+
+def _pip_install(cmd: list[str]) -> None:
+    try:
+        subprocess.check_call(cmd)
+    except Exception:
+        if "--break-system-packages" in cmd:
+            cmd = [c for c in cmd if c != "--break-system-packages"]
+            subprocess.check_call(cmd)
+        else:
+            raise
+
 # --- 0. HPC GLOBAL ENVIRONMENT (AUTO-DETECT HARDWARE) ---
 # Fully automatic hardware detection - NO hardcoding!
 #
@@ -105,10 +142,8 @@ def bootstrap():
         print("[INIT] TA-Lib missing. Installing pre-built binaries...")
         try:
             # In late 2025, TA-Lib has stable wheels for Python 3.13
-            pip_cmd = [sys.executable, "-m", "pip", "install", "TA-Lib", "--user"]
-            if platform.system().lower() == "linux":
-                pip_cmd.append("--break-system-packages")
-            subprocess.check_call(pip_cmd)
+            pip_cmd = _pip_cmd(["TA-Lib"])
+            _pip_install(pip_cmd)
             print("[INIT] TA-Lib installed via wheel.")
         except Exception:
             print("[WARN] Wheel install failed. Falling back to source (this may take 5 mins)...")
@@ -128,9 +163,7 @@ def bootstrap():
         req_file = base_dir / "requirements-hpc.txt"
         is_windows = platform.system().lower() == "windows"
 
-        cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade"]
-        if platform.system().lower() == "linux":
-            cmd.append("--break-system-packages")
+        cmd = _pip_cmd(upgrade=True)
 
         if is_windows:
             # Minimal, CPU-friendly stack to avoid Linux/CUDA-only wheels
@@ -165,7 +198,7 @@ def bootstrap():
             cmd += ["--only-binary", ":all:", "pandas", "numpy", "torch", "pydantic", "sqlalchemy", "cupy-cuda12x"]
 
         try:
-            subprocess.check_call(cmd)
+            _pip_install(cmd)
             print("[INIT] Stack synchronized. Restarting engine...")
             os.execv(sys.executable, [sys.executable] + sys.argv)
         except Exception as e:
@@ -173,7 +206,6 @@ def bootstrap():
             sys.exit(1)
 
 # --- 2. ENGINE PATHS ---
-SCRIPT_DIR = Path(__file__).resolve().parent
 SRC_DIR = SCRIPT_DIR / "src"
 sys.path.insert(0, str(SRC_DIR))
 os.environ["PYTHONPATH"] = str(SRC_DIR)

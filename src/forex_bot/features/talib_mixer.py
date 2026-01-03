@@ -48,10 +48,12 @@ try:
     from talib import abstract
 
     TALIB_AVAILABLE = True
-except ImportError:  # pragma: no cover
+except Exception as exc:  # pragma: no cover
+    # Treat any TA-Lib import issue (missing lib or binary mismatch) as unavailable.
     talib = None
     abstract = None
     TALIB_AVAILABLE = False
+    logging.getLogger(__name__).warning("TA-Lib unavailable; falling back to non-TA-Lib indicators: %s", exc)
 
 logger = logging.getLogger(__name__)
 

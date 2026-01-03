@@ -183,8 +183,14 @@ class PropAwareStrategySearch:
         self._month_indices, self._day_indices = self._compute_month_day_indices(self.df)
         self.checkpoint_path = checkpoint_path
         self.max_time_hours = max_time_hours
+        try:
+            model_cfg = getattr(settings, "models", None)
+            prop_device = getattr(model_cfg, "prop_search_device", None)
+        except Exception:
+            prop_device = None
+        mixer_device = prop_device or getattr(settings.system, "device", "cpu")
         self.mixer = TALibStrategyMixer(
-            device=getattr(settings.system, "device", "cpu"),
+            device=mixer_device,
             use_volume_features=bool(getattr(settings.system, "use_volume_features", False)),
         )
         self.evolver = GeneticStrategyEvolution(
