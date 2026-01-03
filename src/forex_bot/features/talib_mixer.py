@@ -55,6 +55,16 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SMC_GATE_WEIGHTS = {
+    "ob": 0.7,
+    "fvg": 0.8,
+    "liq_sweep": 0.6,
+    "mtf": 0.9,
+    "premium_discount": 0.5,
+    "inducement": 0.6,
+}
+DEFAULT_SMC_GATE_THRESHOLD = 1.7
+
 
 def _make_float_defaultdict():
     """Factory for nested defaultdict - must be module-level for pickling in multiprocessing."""
@@ -158,12 +168,12 @@ class TALibStrategyGene:
     sharpe_ratio: float = 0.0
     win_rate: float = 0.0
     strategy_id: str = ""
-    use_ob: bool = False  # Require Order Block for entry
-    use_fvg: bool = False  # Require Fair Value Gap for entry
-    use_liq_sweep: bool = False  # Require Liquidity Sweep for entry
-    mtf_confirmation: bool = False  # Require HTF Trend Confirmation
-    use_premium_discount: bool = False  # Require Discount for Buy, Premium for Sell
-    use_inducement: bool = False  # Require Inducement near entry
+    use_ob: bool = True  # Require Order Block for entry
+    use_fvg: bool = True  # Require Fair Value Gap for entry
+    use_liq_sweep: bool = True  # Require Liquidity Sweep for entry
+    mtf_confirmation: bool = True  # Require HTF Trend Confirmation
+    use_premium_discount: bool = True  # Require Discount for Buy, Premium for Sell
+    use_inducement: bool = True  # Require Inducement near entry
     tp_pips: float = 40.0
     sl_pips: float = 20.0
 
@@ -219,6 +229,26 @@ class TALibStrategyMixer:
                 logger.warning("TA-Lib installed but no indicators found available via abstract API.")
         else:
             logger.warning("TA-Lib not installed; mixer will be inactive.")
+
+        # Soft SMC gating defaults (override via env for quick tuning).
+        self._smc_gate_weights = DEFAULT_SMC_GATE_WEIGHTS.copy()
+        self._smc_gate_threshold = DEFAULT_SMC_GATE_THRESHOLD
+        env_weights = os.environ.get("FOREX_BOT_SMC_GATE_WEIGHTS")
+        if env_weights:
+            try:
+                parsed = json.loads(env_weights)
+                if isinstance(parsed, dict):
+                    for key, val in parsed.items():
+                        if key in self._smc_gate_weights:
+                            self._smc_gate_weights[key] = float(val)
+            except Exception:
+                logger.warning("Invalid FOREX_BOT_SMC_GATE_WEIGHTS; using defaults.", exc_info=True)
+        env_threshold = os.environ.get("FOREX_BOT_SMC_GATE_THRESHOLD")
+        if env_threshold:
+            try:
+                self._smc_gate_threshold = float(env_threshold)
+            except Exception:
+                logger.warning("Invalid FOREX_BOT_SMC_GATE_THRESHOLD; using default.", exc_info=True)
 
 
         # Subset we can compute on GPU (expanded)
@@ -843,12 +873,12 @@ class TALibStrategyMixer:
             weights=weights,
             preferred_regime=regime,
             strategy_id=f"gene_{random.randint(0, 1_000_000)}",
-            use_ob=random.choice([True, False]),
-            use_fvg=random.choice([True, False]),
-            use_liq_sweep=random.choice([True, False]),
-            mtf_confirmation=random.choice([True, False]),
-            use_premium_discount=random.choice([True, False]),
-            use_inducement=random.choice([True, False]),
+            use_ob=True,
+            use_fvg=True,
+            use_liq_sweep=True,
+            mtf_confirmation=True,
+            use_premium_discount=True,
+            use_inducement=True,
             tp_pips=random.uniform(10.0, 100.0),  # Randomize TP
             sl_pips=random.uniform(5.0, 50.0),  # Randomize SL
         )
@@ -1105,29 +1135,29 @@ class TALibStrategyMixer:
             final_signal[combined >= strategy.long_threshold] = 1
             final_signal[combined <= strategy.short_threshold] = -1
 
-        # ... (SMC Logic remains the same)
+        # Soft SMC gating: weighted confluence score (any combo can pass).
         cols = set(df.columns)
+        smc_score = np.zeros(n_samples, dtype=np.float32)
+        active_weight_sum = 0.0
+        direction = final_signal
 
         if strategy.use_ob and "order_block" in cols:
             ob = df["order_block"].values
-            mask_long = (final_signal == 1) & (ob != 1)
-            mask_short = (final_signal == -1) & (ob != -1)
-            final_signal[mask_long] = 0
-            final_signal[mask_short] = 0
+            aligned = (direction != 0) & (ob == direction)
+            smc_score[aligned] += float(self._smc_gate_weights.get("ob", 0.0))
+            active_weight_sum += float(self._smc_gate_weights.get("ob", 0.0))
 
         if strategy.use_fvg and "fvg_direction" in cols:
             fvg = df["fvg_direction"].values
-            mask_long = (final_signal == 1) & (fvg != 1)
-            mask_short = (final_signal == -1) & (fvg != -1)
-            final_signal[mask_long] = 0
-            final_signal[mask_short] = 0
+            aligned = (direction != 0) & (fvg == direction)
+            smc_score[aligned] += float(self._smc_gate_weights.get("fvg", 0.0))
+            active_weight_sum += float(self._smc_gate_weights.get("fvg", 0.0))
 
         if strategy.use_liq_sweep and "liquidity_sweep" in cols:
             sweep = df["liquidity_sweep"].values
-            mask_long = (final_signal == 1) & (sweep != 1)
-            mask_short = (final_signal == -1) & (sweep != -1)
-            final_signal[mask_long] = 0
-            final_signal[mask_short] = 0
+            aligned = (direction != 0) & (sweep == direction)
+            smc_score[aligned] += float(self._smc_gate_weights.get("liq_sweep", 0.0))
+            active_weight_sum += float(self._smc_gate_weights.get("liq_sweep", 0.0))
 
         if strategy.mtf_confirmation:
             # HPC FIX: Dynamic MTF Confirmation
@@ -1136,22 +1166,26 @@ class TALibStrategyMixer:
             if trend_cols:
                 htf_col = trend_cols[0]
                 htf = df[htf_col].values
-                mask_long = (final_signal == 1) & (htf != 1)
-                mask_short = (final_signal == -1) & (htf != -1)
-                final_signal[mask_long] = 0
-                final_signal[mask_short] = 0
+                aligned = (direction != 0) & (htf == direction)
+                smc_score[aligned] += float(self._smc_gate_weights.get("mtf", 0.0))
+                active_weight_sum += float(self._smc_gate_weights.get("mtf", 0.0))
 
         if strategy.use_premium_discount and "premium_discount" in cols:
             pd_zone = df["premium_discount"].values
-            mask_long = (final_signal == 1) & (pd_zone != 1)
-            mask_short = (final_signal == -1) & (pd_zone != -1)
-            final_signal[mask_long] = 0
-            final_signal[mask_short] = 0
+            aligned = (direction != 0) & (pd_zone == direction)
+            smc_score[aligned] += float(self._smc_gate_weights.get("premium_discount", 0.0))
+            active_weight_sum += float(self._smc_gate_weights.get("premium_discount", 0.0))
 
         if strategy.use_inducement and "inducement" in cols:
             ind = df["inducement"].values
-            mask_entry = (final_signal != 0) & (ind != 1)
-            final_signal[mask_entry] = 0
+            aligned = (direction != 0) & (ind == 1)
+            smc_score[aligned] += float(self._smc_gate_weights.get("inducement", 0.0))
+            active_weight_sum += float(self._smc_gate_weights.get("inducement", 0.0))
+
+        if active_weight_sum > 0.0:
+            threshold = min(float(self._smc_gate_threshold), float(active_weight_sum))
+            mask_fail = (direction != 0) & (smc_score < threshold)
+            final_signal[mask_fail] = 0
 
         return pd.Series(final_signal, index=df.index)
 

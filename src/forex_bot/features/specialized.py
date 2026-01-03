@@ -22,9 +22,10 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 if NUMBA_AVAILABLE:
-    from numba import njit
+    from numba import njit, prange
 else:
     njit = None
+    prange = range
 
 if NUMBA_AVAILABLE:
 
@@ -55,8 +56,13 @@ if NUMBA_AVAILABLE:
         
         # 1. Identify Day Start/End Indices
         day_changes = np.where(day_ids[1:] != day_ids[:-1])[0] + 1
-        day_starts = np.concatenate([[0], day_changes])
-        day_ends = np.concatenate([day_changes, [n]])
+        day_changes = day_changes.astype(np.int64)
+        day_starts = np.empty(len(day_changes) + 1, dtype=np.int64)
+        day_ends = np.empty(len(day_changes) + 1, dtype=np.int64)
+        day_starts[0] = 0
+        day_starts[1:] = day_changes
+        day_ends[:-1] = day_changes
+        day_ends[-1] = n
         
         # 2. Parallel Profile Calculation
         for d in prange(len(day_starts)):

@@ -25,6 +25,34 @@ class ModelFactory:
         self.available_gpus = get_available_gpus() if pref != "cpu" else []
         self.prefer_gpu = bool(self.available_gpus) and pref in {"auto", "gpu"}
 
+    @staticmethod
+    def _normalize_model_key(name: str) -> str:
+        key = str(name or "").strip().lower()
+        key = key.replace(" ", "")
+        key = key.replace("-", "_")
+        aliases = {
+            "xgboostrf": "xgboost_rf",
+            "xgboostdart": "xgboost_dart",
+            "catboostalt": "catboost_alt",
+            "randomforest": "random_forest",
+            "extratrees": "extra_trees",
+            "n_beats": "nbeats",
+        }
+        return aliases.get(key, key)
+
+    def _epoch_cap_for(self, name: str) -> int:
+        try:
+            overrides = dict(getattr(self.settings.models, "max_epochs_by_model", {}) or {})
+        except Exception:
+            overrides = {}
+        if not overrides:
+            return 0
+        key = self._normalize_model_key(name)
+        try:
+            return max(0, int(overrides.get(key, 0) or 0))
+        except Exception:
+            return 0
+
     def create_model(self, model_name: str, best_params: dict, idx: int) -> ExpertModel:
         """Create and configure a model instance."""
         prefer_gpu = self.prefer_gpu and bool(self.available_gpus)
@@ -143,15 +171,16 @@ class ModelFactory:
         if hasattr(model, "max_time_sec"):
             budget_key = {
                 "transformer": "transformer_train_seconds",
-                "tabnet": "tabnet_train_seconds",
-                "nbeats": "nbeats_train_seconds",
-                "tide": "tide_train_seconds",
-                "kan": "kan_train_seconds",
-                "evolution": "evo_train_seconds",
-                "rl_ppo": "rl_train_seconds",
-                "rl_sac": "rl_train_seconds",
-                "rllib_ppo": "rl_train_seconds",
-                "rllib_sac": "rl_train_seconds",
+            "tabnet": "tabnet_train_seconds",
+            "nbeats": "nbeats_train_seconds",
+            "tide": "tide_train_seconds",
+            "kan": "kan_train_seconds",
+            "mlp": "mlp_train_seconds",
+            "evolution": "evo_train_seconds",
+            "rl_ppo": "rl_train_seconds",
+            "rl_sac": "rl_train_seconds",
+            "rllib_ppo": "rl_train_seconds",
+            "rllib_sac": "rl_train_seconds",
             }.get(name)
             
             model.max_time_sec = HARD_CAP_SEC # Default to hard cap
@@ -163,14 +192,16 @@ class ModelFactory:
                 except Exception:
                     pass
 
-        # EPOCH CAPS FOR DEEP MODELS (Speed boost for 10h total run)
+        # Optional epoch caps for models that expose epoch-based training.
         if name in {"transformer", "tabnet", "kan", "mlp", "nbeats", "tide"}:
-            if hasattr(model, "max_epochs"):
-                model.max_epochs = 15 # Optimized for speed
-            if hasattr(model, "epochs"):
-                model.epochs = 15
-            if hasattr(model, "num_epochs"):
-                model.num_epochs = 15
+            cap = self._epoch_cap_for(name)
+            if cap > 0:
+                if hasattr(model, "max_epochs"):
+                    model.max_epochs = cap
+                if hasattr(model, "epochs"):
+                    model.epochs = cap
+                if hasattr(model, "num_epochs"):
+                    model.num_epochs = cap
 
         # Special handling
         if name == "evolution":

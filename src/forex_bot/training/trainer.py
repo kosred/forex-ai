@@ -453,26 +453,34 @@ class ModelTrainer:
             gpu_models = [m for m in gpu_models if m not in require_meta]
             cpu_models = [m for m in cpu_models if m not in require_meta]
 
+        visible_gpu_ids: list[int] = []
+        if num_gpus > 0 and gpu_models:
+            visible_gpu_ids = self._visible_gpu_ids(num_gpus)
+            if not visible_gpu_ids:
+                logger.warning("Parallel: GPUs requested but none are visible; falling back to CPU workers.")
+                cpu_models = list(cpu_models) + list(gpu_models)
+                gpu_models = []
+
         gpu_workers = self._resolve_gpu_worker_count(len(gpu_models)) if gpu_models else 0
+        if gpu_workers > 0 and visible_gpu_ids:
+            gpu_workers = min(gpu_workers, len(visible_gpu_ids))
         cpu_workers = self._resolve_cpu_worker_count(len(cpu_models), cpu_budget) if cpu_models else 0
 
         if gpu_workers <= 0 and cpu_workers <= 0:
             raise RuntimeError("Parallel training requested but no workers available")
 
-        worker_specs: list[dict[str, Any]] = []
+        gpu_specs: list[dict[str, Any]] = []
+        cpu_specs: list[dict[str, Any]] = []
+
         if gpu_workers > 0 and gpu_models:
-            buckets = self._schedule_models(gpu_models, gpu_workers)
-            gpu_ids = self._visible_gpu_ids(num_gpus)
-            for wid, models in enumerate(buckets):
-                if not models:
-                    continue
-                gpu_id = gpu_ids[wid % len(gpu_ids)] if gpu_ids else None
-                worker_specs.append(
+            # Dynamic queue: one model per spec; GPUs pull next when free.
+            for idx, model in enumerate(gpu_models):
+                gpu_specs.append(
                     {
                         "kind": "gpu",
-                        "label": f"gpu_{wid}",
-                        "gpu_id": gpu_id,
-                        "models": models,
+                        "label": f"gpu_{idx}_{model}",
+                        "gpu_id": None,
+                        "models": [model],
                     }
                 )
 
@@ -481,7 +489,7 @@ class ModelTrainer:
             for wid, models in enumerate(buckets):
                 if not models:
                     continue
-                worker_specs.append(
+                cpu_specs.append(
                     {
                         "kind": "cpu",
                         "label": f"cpu_{wid}",
@@ -490,14 +498,13 @@ class ModelTrainer:
                     }
                 )
 
-        total_workers = len(worker_specs)
-        if total_workers <= 0:
+        total_concurrent = (gpu_workers if gpu_specs else 0) + (cpu_workers if cpu_specs else 0)
+        if total_concurrent <= 0:
             raise RuntimeError("Parallel training requested but no workers were scheduled")
 
-        base_threads = max(1, cpu_budget // total_workers)
-        extra = max(0, cpu_budget % total_workers)
-        for idx, spec in enumerate(worker_specs):
-            spec["threads"] = base_threads + (1 if idx < extra else 0)
+        threads_per_worker = max(1, cpu_budget // max(1, total_concurrent))
+        for spec in gpu_specs + cpu_specs:
+            spec["threads"] = threads_per_worker
 
         cache_root = Path(getattr(self.settings.system, "cache_dir", "cache")) / "parallel_training"
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -511,13 +518,11 @@ class ModelTrainer:
         workers_root.mkdir(parents=True, exist_ok=True)
 
         logger.info(
-            "Parallel model training enabled: gpu_workers=%s cpu_workers=%s cpu_budget=%s "
-            "threads/worker=%s+%s",
+            "Parallel model training enabled: gpu_workers=%s cpu_workers=%s cpu_budget=%s threads/worker=%s",
             gpu_workers,
             cpu_workers,
             cpu_budget,
-            base_threads,
-            extra,
+            threads_per_worker,
         )
 
         self._write_tuned_config(cfg_path)
@@ -555,9 +560,6 @@ class ModelTrainer:
 
         entry = _find_entrypoint_script()
 
-        gpu_max_concurrent = self._read_int_env("FOREX_BOT_GPU_MAX_CONCURRENT_MODELS", 1)
-        if gpu_max_concurrent is None or gpu_max_concurrent <= 0:
-            gpu_max_concurrent = 1
         cpu_max_concurrent = self._read_int_env("FOREX_BOT_CPU_MAX_CONCURRENT_MODELS", None)
 
         # Smart RAM-aware concurrency calculation
@@ -584,98 +586,134 @@ class ModelTrainer:
                 cpu_max_concurrent = 0  # Fall back to default
 
         procs: list[tuple[str, Path, subprocess.Popen, Any]] = []
-        try:
-            for idx, spec in enumerate(worker_specs):
-                models = spec.get("models") or []
-                if not models:
-                    continue
-                label = str(spec.get("label") or idx)
-                out_dir = workers_root / f"worker_{label}"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                log_path = logs_dir / f"worker_{label}.log"
+        failed: list[tuple[str, int]] = []
+        running: list[dict[str, Any]] = []
 
-                env = os.environ.copy()
-                env["PYTHONUNBUFFERED"] = "1"
-                env["FOREX_BOT_TRAIN_WORKER"] = "1"
-                if cfg_exists:
-                    env["CONFIG_FILE"] = str(cfg_path)
+        pending_gpu = list(gpu_specs)
+        pending_cpu = list(cpu_specs)
+        available_gpu_ids = list(visible_gpu_ids[:gpu_workers]) if gpu_workers > 0 else []
 
-                if spec.get("kind") == "gpu" and spec.get("gpu_id") is not None:
-                    env["CUDA_VISIBLE_DEVICES"] = str(spec.get("gpu_id"))
+        def _launch_worker(spec: dict[str, Any], gpu_id: int | None = None) -> None:
+            models = spec.get("models") or []
+            if not models:
+                return
+            label = str(spec.get("label") or len(procs))
+            out_dir = workers_root / f"worker_{label}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            log_path = logs_dir / f"worker_{label}.log"
+
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            env["FOREX_BOT_TRAIN_WORKER"] = "1"
+            if cfg_exists:
+                env["CONFIG_FILE"] = str(cfg_path)
+
+            if spec.get("kind") == "gpu":
+                env["CUDA_VISIBLE_DEVICES"] = "" if gpu_id is None else str(gpu_id)
+            else:
+                env["CUDA_VISIBLE_DEVICES"] = ""
+
+            worker_threads = int(spec.get("threads") or threads_per_worker)
+            worker_threads = max(1, worker_threads)
+            env["FOREX_BOT_CPU_BUDGET"] = str(worker_threads)
+            env["FOREX_BOT_CPU_THREADS"] = str(worker_threads)
+            for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                env[k] = str(worker_threads)
+
+            if spec.get("kind") == "gpu":
+                max_concurrent = 1
+            else:
+                if cpu_max_concurrent is not None and cpu_max_concurrent > 0:
+                    max_concurrent = min(len(models), int(cpu_max_concurrent))
                 else:
-                    env["CUDA_VISIBLE_DEVICES"] = ""
+                    max_concurrent = 0
 
-                worker_threads = int(spec.get("threads") or base_threads)
-                worker_threads = max(1, worker_threads)
-                env["FOREX_BOT_CPU_BUDGET"] = str(worker_threads)
-                env["FOREX_BOT_CPU_THREADS"] = str(worker_threads)
-                for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-                    env[k] = str(worker_threads)
+            cmd = [
+                sys.executable,
+                str(entry),
+                "--_worker",
+                "--dataset-dir",
+                str(dataset_dir),
+                "--models",
+                ",".join(models),
+                "--out-dir",
+                str(out_dir),
+                "--cpu-threads",
+                str(worker_threads),
+                "--max-concurrent-models",
+                str(max_concurrent),
+            ]
+            if metadata_path is not None and metadata_path.exists():
+                cmd += ["--metadata-path", str(metadata_path)]
 
-                if spec.get("kind") == "gpu":
-                    max_concurrent = min(len(models), int(gpu_max_concurrent))
-                else:
-                    if cpu_max_concurrent is not None and cpu_max_concurrent > 0:
-                        max_concurrent = min(len(models), int(cpu_max_concurrent))
-                    else:
-                        max_concurrent = 0
-
-                cmd = [
-                    sys.executable,
-                    str(entry),
-                    "--_worker",
-                    "--dataset-dir",
-                    str(dataset_dir),
-                    "--models",
-                    ",".join(models),
-                    "--out-dir",
-                    str(out_dir),
-                    "--cpu-threads",
-                    str(worker_threads),
-                    "--max-concurrent-models",
-                    str(max_concurrent),
-                ]
-                if metadata_path is not None and metadata_path.exists():
-                    cmd += ["--metadata-path", str(metadata_path)]
-
-                log_f = open(log_path, "w", encoding="utf-8")
-                try:
-                    proc = subprocess.Popen(
-                        cmd,
-                        cwd=str(entry.parent),
-                        env=env,
-                        stdout=log_f,
-                        stderr=subprocess.STDOUT,
-                    )
-                except Exception:
-                    try:
-                        log_f.close()
-                    except Exception:
-                        pass
-                    raise
-                procs.append((label, out_dir, proc, log_f))
-                logger.info(
-                    "Worker %s (%s): models=%s threads=%s log=%s",
-                    label,
-                    spec.get("kind"),
-                    models,
-                    worker_threads,
-                    log_path,
+            log_f = open(log_path, "w", encoding="utf-8")
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(entry.parent),
+                    env=env,
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
                 )
+            except Exception:
+                try:
+                    log_f.close()
+                except Exception:
+                    pass
+                raise
 
-            # Wait for completion / cancellation.
-            while True:
+            procs.append((label, out_dir, proc, log_f))
+            running.append(
+                {
+                    "label": label,
+                    "out_dir": out_dir,
+                    "proc": proc,
+                    "log_f": log_f,
+                    "kind": spec.get("kind"),
+                    "gpu_id": gpu_id,
+                }
+            )
+            logger.info(
+                "Worker %s (%s): models=%s threads=%s log=%s",
+                label,
+                spec.get("kind"),
+                models,
+                worker_threads,
+                log_path,
+            )
+
+        try:
+            for spec in pending_cpu:
+                _launch_worker(spec)
+            pending_cpu = []
+
+            while pending_gpu and available_gpu_ids:
+                _launch_worker(pending_gpu.pop(0), available_gpu_ids.pop(0))
+
+            while running or pending_gpu:
                 if stop_event and stop_event.is_set():
                     raise KeyboardInterrupt("Stop requested")
-                if all(p.poll() is not None for _, _, p, _ in procs):
-                    break
-                time.sleep(5)
 
-            failed = [
-                (wid, int(p.returncode))
-                for wid, _, p, _ in procs
-                if (p.poll() is not None and p.returncode != 0)
-            ]
+                for entry in list(running):
+                    proc = entry.get("proc")
+                    if proc is None or proc.poll() is None:
+                        continue
+                    running.remove(entry)
+                    if entry.get("kind") == "gpu" and entry.get("gpu_id") is not None:
+                        available_gpu_ids.append(int(entry.get("gpu_id")))
+                    try:
+                        if proc.returncode not in (None, 0):
+                            failed.append((str(entry.get("label")), int(proc.returncode)))
+                    except Exception:
+                        failed.append((str(entry.get("label")), 1))
+
+                while pending_gpu and available_gpu_ids:
+                    _launch_worker(pending_gpu.pop(0), available_gpu_ids.pop(0))
+
+                if not pending_gpu and not running:
+                    break
+                time.sleep(2)
+
             if failed:
                 logger.error(f"Parallel workers failed: {failed}. See logs under {logs_dir}")
                 raise RuntimeError(f"Parallel workers failed: {failed}")

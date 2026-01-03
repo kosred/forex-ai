@@ -116,6 +116,7 @@ class HyperparameterOptimizer:
         self.default_device = select_device("cpu" if dev_pref == "cpu" else "auto")
         self.stop_event: Any | None = None
         self._hpo_cpu_threads: int = 0
+        self.hpo_trials_by_model = self._load_hpo_trials_by_model()
 
         # Log HPO availability status
         if not self.available:
@@ -134,15 +135,55 @@ class HyperparameterOptimizer:
         except Exception:
             return False
 
-    def _ray_trials_for_model(self, name: str) -> int:
+    @staticmethod
+    def _normalize_model_key(name: str) -> str:
+        key = str(name or "").strip().lower()
+        key = key.replace(" ", "")
+        key = key.replace("-", "_")
+        aliases = {
+            "xgboostrf": "xgboost_rf",
+            "xgboostdart": "xgboost_dart",
+            "catboostalt": "catboost_alt",
+            "randomforest": "random_forest",
+            "extratrees": "extra_trees",
+            "n_beats": "nbeats",
+        }
+        return aliases.get(key, key)
+
+    def _load_hpo_trials_by_model(self) -> dict[str, int]:
+        raw = {}
+        try:
+            raw = dict(getattr(self.settings.models, "hpo_trials_by_model", {}) or {})
+        except Exception:
+            raw = {}
+        trials: dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                iv = int(v)
+            except Exception:
+                continue
+            if iv > 0:
+                trials[self._normalize_model_key(k)] = iv
+        return trials
+
+    def _trials_for_model(self, name: str, *, apply_heuristics: bool = False) -> int:
+        key = self._normalize_model_key(name)
+        override = self.hpo_trials_by_model.get(key)
+        if override:
+            return max(1, int(override))
+
         trials = int(self.n_trials)
-        if name in {"TabNet", "N-BEATS", "TiDE", "KAN"}:
-            trials = max(5, trials // 2)
-        if name == "Transformer":
-            trials = max(3, trials // 3)
-        if (str(self.default_device) == "cpu" and not self.device_pool) and name in {"TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"}:
-            trials = min(trials, 3)
+        if apply_heuristics:
+            if key in {"tabnet", "nbeats", "tide", "kan"}:
+                trials = max(5, trials // 2)
+            if key == "transformer":
+                trials = max(3, trials // 3)
+            if (str(self.default_device) == "cpu" and not self.device_pool) and key in {"tabnet", "nbeats", "tide", "kan", "transformer"}:
+                trials = min(trials, 3)
         return max(1, int(trials))
+
+    def _ray_trials_for_model(self, name: str) -> int:
+        return self._trials_for_model(name, apply_heuristics=True)
 
     def _ax_search_space(self, name: str, y_train: pd.Series) -> list[dict[str, Any]]:
         if name == "LightGBM":
@@ -821,7 +862,14 @@ class HyperparameterOptimizer:
             logger.debug(f"AxSearch set_search_properties failed: {exc}")
         max_concurrent = self.ray_max_concurrency
         if name in {"TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"} and self.device_pool:
-            max_concurrent = 1
+            try:
+                gpu_override = int(os.environ.get("FOREX_BOT_RAY_TUNE_MAX_CONCURRENCY_GPU", "0") or 0)
+            except Exception:
+                gpu_override = 0
+            if gpu_override > 0:
+                max_concurrent = gpu_override
+            else:
+                max_concurrent = max(1, min(self.ray_max_concurrency, len(self.device_pool)))
         if ConcurrencyLimiter is not None:
             ax_search = ConcurrencyLimiter(ax_search, max_concurrent=max_concurrent)
 
@@ -975,7 +1023,8 @@ class HyperparameterOptimizer:
             if not search_space:
                 continue
 
-            logger.info(f"[Ax Standalone] Optimizing {model_name} ({self.n_trials} trials)...")
+            trials = self._trials_for_model(model_name, apply_heuristics=True)
+            logger.info(f"[Ax Standalone] Optimizing {model_name} ({trials} trials)...")
 
             try:
                 # Create AxClient with minimize=False (maximize prop_score)
@@ -987,7 +1036,7 @@ class HyperparameterOptimizer:
                 )
 
                 # Ask-tell loop
-                for trial_idx in range(self.n_trials):
+                for trial_idx in range(trials):
                     if self._should_stop():
                         break
 

@@ -35,12 +35,12 @@ class GeneticGene:
     generation: int = 0
     parent_ids: list[str] = field(default_factory=list)
     strategy_id: str = ""
-    use_ob: bool = False
-    use_fvg: bool = False
-    use_liq_sweep: bool = False
-    mtf_confirmation: bool = False
-    use_premium_discount: bool = False
-    use_inducement: bool = False
+    use_ob: bool = True
+    use_fvg: bool = True
+    use_liq_sweep: bool = True
+    mtf_confirmation: bool = True
+    use_premium_discount: bool = True
+    use_inducement: bool = True
     tp_pips: float = 40.0
     sl_pips: float = 20.0
     doctor_params: dict[str, float] = field(default_factory=dict)

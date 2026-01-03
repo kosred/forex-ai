@@ -362,6 +362,7 @@ class AutoTuner:
             "tide_train_seconds",
             "kan_train_seconds",
             "tabnet_train_seconds",
+            "mlp_train_seconds",
             "rl_train_seconds",
             "evo_train_seconds",
         ):

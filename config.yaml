@@ -3,7 +3,7 @@ system:
   symbols: [EURUSD]
   data_dir: data
   base_timeframe: M1  # 1-minute base for multi-timeframe analysis
-  use_volume_features: false
+  use_volume_features: true
   higher_timeframes: [M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
   history_years: 10
   trading_session_start: "00:05"
@@ -122,7 +122,7 @@ risk:
   hurst_range: 0.45
 
 models:
-  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, random_forest, mlp]
+  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, mlp]
   use_rl_agent: true
   use_sac_agent: true
   use_neuroevolution: true
@@ -131,8 +131,8 @@ models:
   rl_eval_episodes: 15
   rl_network_arch: [256, 256]
   rl_parallel_envs: 1
-  rl_train_seconds: 36000
-  evo_train_seconds: 36000
+  rl_train_seconds: 3600
+  evo_train_seconds: 3600
   evo_hidden_size: 64
   evo_population: 32
   evo_islands: 8  # MORE ISLANDS = MORE DIVERSITY (was 4, now 8)
@@ -148,10 +148,16 @@ models:
   prop_search_val_years: 1
   prop_search_val_candidates: 0
   prop_search_val_min_positive_months: 0
-  prop_search_val_min_trades_per_month: 0
+  prop_search_val_min_trades_per_month: 30
+  prop_search_val_min_trades_per_day: 1.0
   prop_search_val_min_monthly_profit_pct: 0.0
   prop_search_val_log_trades: true
   prop_search_val_trade_log_max: 50
+  prop_search_opportunistic_enabled: true
+  prop_search_opportunistic_min_positive_months: 3
+  prop_search_opportunistic_min_trades_per_month: 10
+  prop_search_opportunistic_min_trade_return_pct: 4.0
+  prop_search_opportunistic_max_dd: 0.025
   train_batch_size: 32
   inference_batch_size: 32
   enable_transformer_expert: true
@@ -160,16 +166,33 @@ models:
   transformer_hidden_dim: 256
   transformer_dropout: 0.10
   transformer_seq_len: 64
-  transformer_train_seconds: 36000
-  nbeats_train_seconds: 36000
-  tide_train_seconds: 36000
-  tabnet_train_seconds: 36000
-  kan_train_seconds: 36000
+  transformer_train_seconds: 3600
+  nbeats_train_seconds: 3600
+  tide_train_seconds: 3600
+  tabnet_train_seconds: 3600
+  kan_train_seconds: 3600
+  mlp_train_seconds: 1800
   num_transformers: 2
   hpo_backend: ax
-  hpo_trials: 5  # 5 trials with full data = comprehensive search
-  hpo_max_rows: 0  # 0 = USE FULL DATASET for HPO (2.2M rows)
-  ray_tune_max_concurrency: 1
+  hpo_trials: 12
+  hpo_trials_by_model:
+    lightgbm: 12
+    xgboost: 12
+    xgboost_rf: 10
+    xgboost_dart: 8
+    catboost: 12
+    catboost_alt: 10
+    mlp: 10
+    tabnet: 8
+    nbeats: 8
+    tide: 8
+    kan: 8
+    transformer: 6
+  hpo_max_rows: 1000000
+  max_epochs_by_model:
+    tabnet: 200
+    tide: 200
+  ray_tune_max_concurrency: 8
   export_onnx: true  # Export ONNX for fast CPU inference (one-time at startup if missing)
   phase5_filter_meta_blender: true
   phase5_core_models: [transformer, nbeats, tide, tabnet, kan]

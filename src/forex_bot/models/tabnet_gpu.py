@@ -88,6 +88,8 @@ class TabNetExpert(ExpertModel):
         lambda_sparse: float = 1e-4,
         lr: float = 2e-2,
         batch_size: int = 4096,
+        max_epochs: int = 2000,
+        patience: int = 50,
         max_time_sec: int = 3600,
         device: str = "cuda",
         **kwargs: Any,
@@ -103,6 +105,8 @@ class TabNetExpert(ExpertModel):
             "mask_type": "entmax",  # More rigorous than sparsemax
         }
         self.batch_size = batch_size
+        self.max_epochs = int(max_epochs)
+        self.patience = int(patience)
         self.max_time_sec = max_time_sec
         self.device = select_device(device)
         self.input_dim = 0
@@ -135,12 +139,21 @@ class TabNetExpert(ExpertModel):
         x_train, y_train = x[:split], y_arr[:split]
         x_val, y_val = x[split:], y_arr[split:]
 
-        # Increase patience and epochs for deeper training
-        max_epochs = 2000
+        # Training length + early stopping controls
         try:
-            patience = int(os.environ.get("FOREX_BOT_EARLY_STOP_PATIENCE", "50") or 50)
+            max_epochs = int(getattr(self, "max_epochs", 2000) or 2000)
+        except Exception:
+            max_epochs = 2000
+        try:
+            patience = int(getattr(self, "patience", 50) or 50)
         except Exception:
             patience = 50
+        try:
+            env_pat = os.environ.get("FOREX_BOT_EARLY_STOP_PATIENCE")
+            if env_pat:
+                patience = int(env_pat)
+        except Exception:
+            pass
 
         import time
         

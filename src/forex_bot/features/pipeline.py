@@ -1182,8 +1182,27 @@ class FeatureEngineer:
                 from ..features.talib_mixer import TALibStrategyMixer
                 
                 data = json.loads(knowledge_path.read_text())
-                genes_data = data.get("best_genes", [])
-                
+                genes_data = list(data.get("best_genes", []) or [])
+
+                try:
+                    use_opp = bool(getattr(self.settings.models, "prop_search_use_opportunistic", True))
+                except Exception:
+                    use_opp = True
+                if use_opp:
+                    opp_path = self.cache_dir / "talib_knowledge_opportunistic.json"
+                    if sym:
+                        opp_sym_path = self.cache_dir / f"talib_knowledge_opportunistic_{sym_tag}.json"
+                        if opp_sym_path.exists():
+                            opp_path = opp_sym_path
+                    if opp_path.exists():
+                        try:
+                            opp_data = json.loads(opp_path.read_text())
+                            opp_genes = list(opp_data.get("best_genes", []) or [])
+                            if opp_genes:
+                                genes_data.extend(opp_genes)
+                        except Exception as exc:
+                            logger.warning(f"Failed to load opportunistic knowledge: {exc}")
+
                 if genes_data:
                     mixer = TALibStrategyMixer(use_volume_features=self.use_volume_features)
                     all_signals = []

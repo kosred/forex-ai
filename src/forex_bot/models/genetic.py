@@ -89,11 +89,32 @@ class GeneticStrategyExpert(ExpertModel):
                     data = json.loads(content)
 
                     # Support both new Portfolio format and old Single format
-                    genes_data = []
+                    genes_data: list[dict] = []
                     if "best_genes" in data:
-                        genes_data = data["best_genes"]
+                        genes_data = list(data["best_genes"] or [])
                     elif "best_gene" in data:
                         genes_data = [data["best_gene"]]
+
+                    use_opp = str(os.environ.get("FOREX_BOT_USE_OPPORTUNISTIC", "1")).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }
+                    if use_opp:
+                        opp_path = cache_dir / "talib_knowledge_opportunistic.json"
+                        if symbol:
+                            opp_sym_path = cache_dir / f"talib_knowledge_opportunistic_{sym_tag}.json"
+                            if opp_sym_path.exists():
+                                opp_path = opp_sym_path
+                        if opp_path.exists():
+                            try:
+                                opp_data = json.loads(opp_path.read_text())
+                                opp_genes = list(opp_data.get("best_genes", []) or [])
+                                if opp_genes:
+                                    genes_data.extend(opp_genes)
+                            except Exception as exc:
+                                logger.warning(f"Failed to load opportunistic knowledge: {exc}")
 
                     for bg_data in genes_data:
                         try:

@@ -23,7 +23,7 @@ class SystemConfig(BaseModel):
     mt5_dxy_symbol: str = "USDX"
     mt5_eur_symbol: str = "EXY"
     base_timeframe: str = "M1"
-    use_volume_features: bool = False
+    use_volume_features: bool = True
     higher_timeframes: list[str] = Field(default_factory=lambda: ["M1","M3","M5","M15","M30","H1","H2","H4","D1","W1","MN1"])
     required_timeframes: list[str] = Field(default_factory=lambda: ["M1","M3","M5","M15","M30","H1","H2","H4","D1","W1","MN1"])
     enable_level2: bool = False
@@ -172,7 +172,7 @@ class RiskConfig(BaseModel):
         return max(0.1, v)
 
 class ModelsConfig(BaseModel):
-    ml_models: list[str] = Field(default_factory=lambda: ["lightgbm","xgboost","xgboost_rf","xgboost_dart","catboost","catboost_alt","random_forest","mlp"])
+    ml_models: list[str] = Field(default_factory=lambda: ["lightgbm","xgboost","xgboost_rf","xgboost_dart","catboost","catboost_alt","mlp"])
     use_rl_agent: bool = True
     use_sac_agent: bool = True
     use_rllib_agent: bool = False
@@ -203,9 +203,16 @@ class ModelsConfig(BaseModel):
     prop_search_val_candidates: int = 0
     prop_search_val_min_positive_months: int = 0
     prop_search_val_min_trades_per_month: int = 0
+    prop_search_val_min_trades_per_day: float = 0.0
     prop_search_val_min_monthly_profit_pct: float = 0.0
     prop_search_val_log_trades: bool = False
     prop_search_val_trade_log_max: int = 20
+    prop_search_opportunistic_enabled: bool = True
+    prop_search_opportunistic_min_positive_months: int = 3
+    prop_search_opportunistic_min_trades_per_month: int = 10
+    prop_search_opportunistic_min_trade_return_pct: float = 4.0
+    prop_search_opportunistic_max_dd: float = 0.025
+    prop_search_use_opportunistic: bool = True
     train_batch_size: int = 32
     inference_batch_size: int = 32
     enable_transformer_expert: bool = True
@@ -219,10 +226,13 @@ class ModelsConfig(BaseModel):
     tide_train_seconds: int = 36000
     tabnet_train_seconds: int = 36000
     kan_train_seconds: int = 36000
+    mlp_train_seconds: int = 36000
     num_transformers: int = 2
     hpo_backend: str = "ax"
     hpo_trials: int = 0
+    hpo_trials_by_model: dict[str, int] = Field(default_factory=dict)
     hpo_max_rows: int = 500_000
+    max_epochs_by_model: dict[str, int] = Field(default_factory=dict)
     ray_tune_max_concurrency: int = 1
     export_onnx: bool = False
     filter_to_base_signal: bool = True

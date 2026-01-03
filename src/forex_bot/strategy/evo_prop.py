@@ -375,6 +375,18 @@ class PropAwareStrategySearch:
             )
         except Exception:
             min_trades_month = 0
+        try:
+            opp_min_trades_month = int(
+                getattr(self.settings.models, "prop_search_opportunistic_min_trades_per_month", 0) or 0
+            )
+        except Exception:
+            opp_min_trades_month = 0
+        try:
+            min_trades_per_day = float(
+                getattr(self.settings.models, "prop_search_val_min_trades_per_day", 0.0) or 0.0
+            )
+        except Exception:
+            min_trades_per_day = 0.0
 
         try:
             log_trades = bool(getattr(self.settings.models, "prop_search_val_log_trades", False))
@@ -411,11 +423,52 @@ class PropAwareStrategySearch:
         self._val_monthly = {}
 
         logger.info(
-            "Monthly validation: %s candidates over %s months (min trades/month=%s).",
+            "Monthly validation: %s candidates over %s months (min trades/month=%s, min trades/day=%s).",
             len(genes),
             len(month_labels),
             min_trades_month,
+            min_trades_per_day,
         )
+
+        # Precompute day counts per month for trades/day requirement
+        monthly_days: list[int] = []
+        monthly_min_trades: list[int] = []
+        total_days = 0
+        try:
+            all_days = [int(d) for d in np.unique(day_indices) if int(d) > 0]
+        except Exception:
+            all_days = []
+        total_days = len(all_days)
+        for (label, (start, end)) in zip(month_labels, month_slices, strict=False):
+            try:
+                days_in_month = int(np.unique(day_indices[start:end]).size)
+            except Exception:
+                days_in_month = 0
+            if days_in_month <= 0:
+                days_in_month = 1
+            req = min_trades_month
+            if min_trades_per_day > 0.0:
+                req = max(req, int(np.ceil(min_trades_per_day * days_in_month)))
+            monthly_days.append(days_in_month)
+            monthly_min_trades.append(req)
+
+        def _trade_day_id(value: Any) -> int | None:
+            try:
+                if isinstance(value, (np.datetime64, pd.Timestamp)):
+                    ts = pd.Timestamp(value)
+                elif isinstance(value, (int, np.integer)):
+                    idx_val = int(value)
+                    if 0 <= idx_val < len(df_val):
+                        ts = df_val.index[idx_val]
+                    else:
+                        return None
+                else:
+                    ts = pd.Timestamp(value)
+                if ts.tzinfo is not None:
+                    ts = ts.tz_convert("UTC")
+                return int(ts.year * 10000 + ts.month * 100 + ts.day)
+            except Exception:
+                return None
 
         for idx_gene, gene in enumerate(genes):
             try:
@@ -465,6 +518,26 @@ class PropAwareStrategySearch:
                 base_balance=self.actual_balance,
             )
 
+            # Build per-day trade counts (entry day)
+            day_trade_counts: dict[int, int] = {}
+            for trade in details.get("trades", []) or []:
+                day_id = _trade_day_id(trade.get("entry_time"))
+                if day_id is None or day_id <= 0:
+                    continue
+                day_trade_counts[day_id] = day_trade_counts.get(day_id, 0) + 1
+            max_trade_return_pct = 0.0
+            if self.actual_balance > 0:
+                for trade in details.get("trades", []) or []:
+                    try:
+                        pnl = float(trade.get("pnl", 0.0) or 0.0)
+                    except Exception:
+                        pnl = 0.0
+                    if pnl <= 0:
+                        continue
+                    trade_pct = (pnl / float(self.actual_balance)) * 100.0
+                    if trade_pct > max_trade_return_pct:
+                        max_trade_return_pct = trade_pct
+
             monthly_dict = details.get("monthly", {})
             summary = details.get("summary", {})
             monthly_profit_pct: list[float] = []
@@ -483,6 +556,8 @@ class PropAwareStrategySearch:
             monthly_start_equity: list[float] = []
             monthly_end_equity: list[float] = []
             monthly_sharpe: list[float] = []
+            monthly_day_trades: list[list[int]] = []
+            monthly_day_failures: list[int] = []
 
             for label in month_labels:
                 m = monthly_dict.get(label, {})
@@ -503,10 +578,44 @@ class PropAwareStrategySearch:
                 monthly_end_equity.append(float(m.get("end_equity", 0.0) or 0.0))
                 monthly_sharpe.append(float(m.get("sharpe", 0.0) or 0.0))
 
-            active_mask = [
-                (t >= min_trades_month) if min_trades_month > 0 else True for t in monthly_trades
-            ]
+            # Compute per-day enforcement for each month
+            for (start, end) in month_slices:
+                try:
+                    days_in_month = [int(d) for d in np.unique(day_indices[start:end]) if int(d) > 0]
+                except Exception:
+                    days_in_month = []
+                day_counts = [int(day_trade_counts.get(d, 0)) for d in days_in_month]
+                monthly_day_trades.append(day_counts)
+                if min_trades_per_day > 0.0:
+                    monthly_day_failures.append(int(sum(1 for c in day_counts if c < min_trades_per_day)))
+                else:
+                    monthly_day_failures.append(0)
+
+            opp_months_meeting_min_trades = 0
+            opp_positive_months = 0
+            if opp_min_trades_month > 0:
+                for t, p in zip(monthly_trades, monthly_profit_pct, strict=False):
+                    if t >= opp_min_trades_month:
+                        opp_months_meeting_min_trades += 1
+                        if p > 0.0:
+                            opp_positive_months += 1
+            else:
+                for t, p in zip(monthly_trades, monthly_profit_pct, strict=False):
+                    if t > 0:
+                        opp_months_meeting_min_trades += 1
+                        if p > 0.0:
+                            opp_positive_months += 1
+
+            active_mask = []
+            for t, req, failures in zip(monthly_trades, monthly_min_trades, monthly_day_failures, strict=False):
+                ok = True
+                if req > 0 and t < req:
+                    ok = False
+                if min_trades_per_day > 0.0 and failures > 0:
+                    ok = False
+                active_mask.append(ok)
             active_months = int(sum(1 for a in active_mask if a))
+            months_below_min_trades = int(sum(1 for a in active_mask if not a))
             positive_months = int(
                 sum(1 for a, p in zip(active_mask, monthly_profit_pct, strict=False) if a and p > 0.0)
             )
@@ -515,6 +624,16 @@ class PropAwareStrategySearch:
             ]
             avg_profit = float(np.mean(active_profits)) if active_profits else 0.0
             min_profit = float(np.min(active_profits)) if active_profits else 0.0
+            total_trades = int(summary.get("trades", 0) or 0)
+            avg_trades_per_day = (
+                float(total_trades) / float(total_days) if total_days > 0 else 0.0
+            )
+            days_below_min = 0
+            if min_trades_per_day > 0.0:
+                for day_id in all_days:
+                    if day_trade_counts.get(day_id, 0) < min_trades_per_day:
+                        days_below_min += 1
+            days_meeting_min = int(total_days - days_below_min) if total_days > 0 else 0
 
             self._val_summary[gene.strategy_id] = {
                 "positive_months": positive_months,
@@ -522,9 +641,10 @@ class PropAwareStrategySearch:
                 "total_months": len(month_labels),
                 "avg_monthly_profit_pct": avg_profit,
                 "min_monthly_profit_pct": min_profit,
+                "months_below_min_trades": months_below_min_trades,
                 "net_profit": float(summary.get("net_profit", 0.0) or 0.0),
                 "max_dd": float(summary.get("max_dd", 0.0) or 0.0),
-                "trades": int(summary.get("trades", 0) or 0),
+                "trades": total_trades,
                 "win_rate": float(summary.get("win_rate", 0.0) or 0.0),
                 "profit_factor": float(summary.get("profit_factor", 0.0) or 0.0),
                 "expectancy": float(summary.get("expectancy", 0.0) or 0.0),
@@ -532,11 +652,23 @@ class PropAwareStrategySearch:
                 "sortino": float(summary.get("sortino", 0.0) or 0.0),
                 "sqn": float(summary.get("sqn", 0.0) or 0.0),
                 "max_daily_dd": float(summary.get("max_daily_dd", 0.0) or 0.0),
+                "total_days": total_days,
+                "avg_trades_per_day": avg_trades_per_day,
+                "min_trades_per_day": min_trades_per_day,
+                "days_meeting_min_trades_per_day": days_meeting_min,
+                "days_below_min_trades_per_day": days_below_min,
+                "max_trade_return_pct": max_trade_return_pct,
+                "opp_active_months": opp_months_meeting_min_trades,
+                "opp_positive_months": opp_positive_months,
             }
             payload: dict[str, Any] = {
                 "monthly_profit_pct": monthly_profit_pct,
                 "monthly_return_pct": monthly_return_pct,
                 "monthly_trades": monthly_trades,
+                "monthly_days": monthly_days,
+                "monthly_min_trades": monthly_min_trades,
+                "monthly_day_trades": monthly_day_trades,
+                "monthly_day_failures": monthly_day_failures,
                 "monthly_net_profit": monthly_net_profit,
                 "monthly_win_rate": monthly_win_rate,
                 "monthly_profit_factor": monthly_profit_factor,
@@ -1059,6 +1191,7 @@ class PropAwareStrategySearch:
             "val_total_months": int(val_summary.get("total_months", 0) or 0),
             "val_avg_monthly_profit_pct": float(val_summary.get("avg_monthly_profit_pct", 0.0) or 0.0),
             "val_min_monthly_profit_pct": float(val_summary.get("min_monthly_profit_pct", 0.0) or 0.0),
+            "val_months_below_min_trades": int(val_summary.get("months_below_min_trades", 0) or 0),
             "val_net_profit": float(val_summary.get("net_profit", 0.0) or 0.0),
             "val_max_dd": float(val_summary.get("max_dd", 0.0) or 0.0),
             "val_trades": int(val_summary.get("trades", 0) or 0),
@@ -1069,6 +1202,14 @@ class PropAwareStrategySearch:
             "val_sortino": float(val_summary.get("sortino", 0.0) or 0.0),
             "val_sqn": float(val_summary.get("sqn", 0.0) or 0.0),
             "val_max_daily_dd": float(val_summary.get("max_daily_dd", 0.0) or 0.0),
+            "val_total_days": int(val_summary.get("total_days", 0) or 0),
+            "val_avg_trades_per_day": float(val_summary.get("avg_trades_per_day", 0.0) or 0.0),
+            "val_min_trades_per_day": float(val_summary.get("min_trades_per_day", 0.0) or 0.0),
+            "val_days_meeting_min_trades_per_day": int(val_summary.get("days_meeting_min_trades_per_day", 0) or 0),
+            "val_days_below_min_trades_per_day": int(val_summary.get("days_below_min_trades_per_day", 0) or 0),
+            "val_max_trade_return_pct": float(val_summary.get("max_trade_return_pct", 0.0) or 0.0),
+            "val_opp_active_months": int(val_summary.get("opp_active_months", 0) or 0),
+            "val_opp_positive_months": int(val_summary.get("opp_positive_months", 0) or 0),
         }
 
     def export_portfolio(self, cache_dir: Path, *, merge: bool = True, max_genes: int | None = None) -> int:
@@ -1078,7 +1219,7 @@ class PropAwareStrategySearch:
 
         # Build payloads for top strategies
         sorted_pop = sorted(self.evolver.population, key=lambda g: g.fitness, reverse=True)
-        payloads: list[dict[str, Any]] = []
+        core_payloads: list[dict[str, Any]] = []
         try:
             min_pos_months = int(
                 getattr(self.settings.models, "prop_search_val_min_positive_months", 0) or 0
@@ -1091,6 +1232,18 @@ class PropAwareStrategySearch:
             )
         except Exception:
             min_profit_pct = 0.0
+        try:
+            min_trades_per_day = float(
+                getattr(self.settings.models, "prop_search_val_min_trades_per_day", 0.0) or 0.0
+            )
+        except Exception:
+            min_trades_per_day = 0.0
+        try:
+            min_trades_month = int(
+                getattr(self.settings.models, "prop_search_val_min_trades_per_month", 0) or 0
+            )
+        except Exception:
+            min_trades_month = 0
 
         for gene in sorted_pop:
             fit = self.fitness_cache.get(gene.strategy_id)
@@ -1103,74 +1256,161 @@ class PropAwareStrategySearch:
             if min_profit_pct > 0.0:
                 if not val_summary or float(val_summary.get("min_monthly_profit_pct", 0.0) or 0.0) < min_profit_pct:
                     continue
-            payloads.append(self._gene_payload(gene, fit, val_summary))
-            if len(payloads) >= max_genes:
+            if min_trades_month > 0 or min_trades_per_day > 0.0:
+                months_below = int(val_summary.get("months_below_min_trades", 0) or 0) if val_summary else 0
+                if months_below > 0:
+                    continue
+            core_payloads.append(self._gene_payload(gene, fit, val_summary))
+            if len(core_payloads) >= max_genes:
                 break
 
-        if not payloads:
+        opp_payloads: list[dict[str, Any]] = []
+        try:
+            opp_enabled = bool(
+                getattr(self.settings.models, "prop_search_opportunistic_enabled", True)
+            )
+        except Exception:
+            opp_enabled = True
+        if opp_enabled:
+            try:
+                opp_min_pos_months = int(
+                    getattr(self.settings.models, "prop_search_opportunistic_min_positive_months", 0) or 0
+                )
+            except Exception:
+                opp_min_pos_months = 0
+            try:
+                opp_min_trades_month = int(
+                    getattr(self.settings.models, "prop_search_opportunistic_min_trades_per_month", 0) or 0
+                )
+            except Exception:
+                opp_min_trades_month = 0
+            try:
+                opp_min_trade_return_pct = float(
+                    getattr(self.settings.models, "prop_search_opportunistic_min_trade_return_pct", 0.0) or 0.0
+                )
+            except Exception:
+                opp_min_trade_return_pct = 0.0
+            try:
+                opp_max_dd = float(
+                    getattr(self.settings.models, "prop_search_opportunistic_max_dd", 1.0) or 1.0
+                )
+            except Exception:
+                opp_max_dd = 1.0
+
+            for gene in sorted_pop:
+                fit = self.fitness_cache.get(gene.strategy_id)
+                val_summary = self._val_summary.get(gene.strategy_id)
+                if not val_summary:
+                    continue
+                opp_pos_months = int(val_summary.get("opp_positive_months", 0) or 0)
+                max_trade_return_pct = float(val_summary.get("max_trade_return_pct", 0.0) or 0.0)
+                max_dd = float(val_summary.get("max_dd", 1.0) or 1.0)
+
+                keep = False
+                # 1) Always keep "big trade" strategies (>= threshold in a single trade).
+                if opp_min_trade_return_pct > 0.0 and max_trade_return_pct >= opp_min_trade_return_pct:
+                    keep = True
+                # 2) Otherwise keep if they have enough positive months (non-consecutive allowed).
+                if not keep and opp_min_pos_months > 0 and opp_pos_months >= opp_min_pos_months:
+                    keep = True
+                if not keep and opp_min_pos_months <= 0 and opp_pos_months > 0:
+                    keep = True
+                if not keep:
+                    continue
+                opp_payloads.append(self._gene_payload(gene, fit, val_summary))
+                if len(opp_payloads) >= max_genes:
+                    break
+
+        if not core_payloads and not opp_payloads:
             return 0
 
         symbol = self._symbol_tag()
         knowledge_path = cache_dir / "talib_knowledge.json"
-        target_path = knowledge_path
+        total_written = 0
+
+        def _write_portfolio(
+            payloads: list[dict[str, Any]],
+            target_path: Path,
+            generic_path: Path | None,
+            source_tag: str,
+        ) -> int:
+            if not payloads:
+                return 0
+            combined = payloads
+
+            if merge and target_path.exists():
+                try:
+                    existing = json.loads(target_path.read_text())
+                    existing_genes = []
+                    if isinstance(existing, dict):
+                        if "best_genes" in existing:
+                            existing_genes = list(existing.get("best_genes") or [])
+                        elif "best_gene" in existing:
+                            existing_genes = [existing.get("best_gene")]
+                    if existing_genes:
+                        combined = existing_genes + payloads
+                except Exception as exc:
+                    logger.warning(f"Failed to read existing knowledge for merge: {exc}")
+
+            seen: set[str] = set()
+            deduped: list[dict[str, Any]] = []
+            for gene in combined:
+                if not isinstance(gene, dict):
+                    continue
+                key = str(gene.get("strategy_id") or "")
+                if not key:
+                    key = json.dumps(
+                        {
+                            "indicators": gene.get("indicators", []),
+                            "params": gene.get("params", {}),
+                            "long_threshold": gene.get("long_threshold", 0.0),
+                            "short_threshold": gene.get("short_threshold", 0.0),
+                            "weights": gene.get("weights", {}),
+                        },
+                        sort_keys=True,
+                    )
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(gene)
+
+            deduped.sort(key=lambda g: float(g.get("fitness", 0.0) or 0.0), reverse=True)
+            deduped = deduped[:max_genes]
+
+            payload = {
+                "best_genes": deduped,
+                "timestamp": pd.Timestamp.now().isoformat(),
+                "sources": {
+                    source_tag: len(payloads),
+                    "merged_total": len(deduped),
+                },
+            }
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(json.dumps(payload, indent=2))
+            logger.info("Prop-aware portfolio merged into %s (%s strategies).", target_path, len(deduped))
+            if generic_path and target_path != generic_path:
+                generic_path.write_text(json.dumps(payload, indent=2))
+            return len(deduped)
+
+        core_target = knowledge_path
         if symbol:
-            target_path = cache_dir / f"talib_knowledge_{symbol}.json"
-        combined = payloads
+            core_target = cache_dir / f"talib_knowledge_{symbol}.json"
+        total_written = max(
+            total_written,
+            _write_portfolio(core_payloads, core_target, knowledge_path, "propaware"),
+        )
 
-        if merge and target_path.exists():
-            try:
-                existing = json.loads(target_path.read_text())
-                existing_genes = []
-                if isinstance(existing, dict):
-                    if "best_genes" in existing:
-                        existing_genes = list(existing.get("best_genes") or [])
-                    elif "best_gene" in existing:
-                        existing_genes = [existing.get("best_gene")]
-                if existing_genes:
-                    combined = existing_genes + payloads
-            except Exception as exc:
-                logger.warning(f"Failed to read existing knowledge for merge: {exc}")
+        if opp_payloads:
+            opp_base = cache_dir / "talib_knowledge_opportunistic.json"
+            opp_target = opp_base
+            if symbol:
+                opp_target = cache_dir / f"talib_knowledge_opportunistic_{symbol}.json"
+            total_written = max(
+                total_written,
+                _write_portfolio(opp_payloads, opp_target, opp_base, "opportunistic"),
+            )
 
-        seen: set[str] = set()
-        deduped: list[dict[str, Any]] = []
-        for gene in combined:
-            if not isinstance(gene, dict):
-                continue
-            key = str(gene.get("strategy_id") or "")
-            if not key:
-                key = json.dumps(
-                    {
-                        "indicators": gene.get("indicators", []),
-                        "params": gene.get("params", {}),
-                        "long_threshold": gene.get("long_threshold", 0.0),
-                        "short_threshold": gene.get("short_threshold", 0.0),
-                        "weights": gene.get("weights", {}),
-                    },
-                    sort_keys=True,
-                )
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(gene)
-
-        deduped.sort(key=lambda g: float(g.get("fitness", 0.0) or 0.0), reverse=True)
-        deduped = deduped[:max_genes]
-
-        payload = {
-            "best_genes": deduped,
-            "timestamp": pd.Timestamp.now().isoformat(),
-            "sources": {
-                "propaware": len(payloads),
-                "merged_total": len(deduped),
-            },
-        }
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(json.dumps(payload, indent=2))
-        logger.info("Prop-aware portfolio merged into %s (%s strategies).", target_path, len(deduped))
-        if symbol and target_path != knowledge_path:
-            # Keep a generic copy for backward compatibility.
-            knowledge_path.write_text(json.dumps(payload, indent=2))
-        return len(deduped)
+        return total_written
 
 
 def run_evo_search(
@@ -1181,6 +1421,7 @@ def run_evo_search(
     checkpoint: str = "models/strategy_evo_checkpoint.json",
     max_time_hours: float = 120.0,
     actual_balance: float | None = None,
+    max_workers: int | None = None,
 ) -> tuple[GeneticGene, FitnessResult]:
     settings = settings or Settings()
     search = PropAwareStrategySearch(
@@ -1190,6 +1431,7 @@ def run_evo_search(
         checkpoint_path=Path(checkpoint),
         max_time_hours=max_time_hours,
         actual_balance=actual_balance,
+        max_workers=max_workers,
     )
     result = search.run(generations=generations)
     try:
