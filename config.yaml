@@ -144,6 +144,7 @@ models:
   prop_search_portfolio_size: 3000  # Keep many strategies for downstream evaluation
   prop_search_async: true
   prop_search_async_wait: false
+  tree_device_preference: gpu
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: cpu
   prop_search_train_years: 8

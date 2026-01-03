@@ -209,6 +209,7 @@ class ModelsConfig(BaseModel):
     prop_search_val_trade_log_max: int = 20
     prop_search_async: bool = False
     prop_search_async_wait: bool = False
+    tree_device_preference: str = "auto"
     prop_search_opportunistic_enabled: bool = True
     prop_search_opportunistic_min_positive_months: int = 3
     prop_search_opportunistic_min_trades_per_month: int = 10

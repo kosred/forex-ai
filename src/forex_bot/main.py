@@ -520,6 +520,10 @@ async def main_async():
         os.environ["FOREX_BOT_TREE_DEVICE"] = str(args.tree_device)
     if getattr(args, "features_device", None):
         os.environ["FOREX_BOT_FEATURES_DEVICE"] = str(args.features_device)
+    if "FOREX_BOT_TREE_DEVICE" not in os.environ:
+        pref = str(getattr(base_settings.models, "tree_device_preference", "")).strip().lower()
+        if pref in {"cpu", "gpu", "auto"}:
+            os.environ["FOREX_BOT_TREE_DEVICE"] = pref
 
     # Hardware auto-tune (single source of truth).
     try:
