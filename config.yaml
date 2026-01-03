@@ -137,11 +137,11 @@ models:
   evo_population: 32
   evo_islands: 8  # MORE ISLANDS = MORE DIVERSITY (was 4, now 8)
   prop_search_enabled: true  # CRITICAL: Enable strategy discovery!
-  prop_search_population: 200  # Per-island population (200 × 8 islands = 1600 total)
-  prop_search_generations: 50  # Evolution iterations
-  prop_search_max_hours: 4.0  # Increased time for full exploration (was 1.0)
+  prop_search_population: 100  # Per-island population (100 × 8 islands = 800 total)
+  prop_search_generations: 20  # Evolution iterations (budget-safe default)
+  prop_search_max_hours: 2.0  # Budget-safe time cap
   prop_search_max_rows: 0  # 0 = USE FULL DATASET for strategy discovery (2.2M rows)
-  prop_search_portfolio_size: 100  # Top strategies to save (diverse across sessions/regimes)
+  prop_search_portfolio_size: 3000  # Keep many strategies for downstream evaluation
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: cpu
   prop_search_train_years: 8
@@ -171,22 +171,22 @@ models:
   tide_train_seconds: 3600
   tabnet_train_seconds: 3600
   kan_train_seconds: 3600
-  mlp_train_seconds: 1800
+  mlp_train_seconds: 3600
   num_transformers: 2
   hpo_backend: ax
-  hpo_trials: 12
+  hpo_trials: 8
   hpo_trials_by_model:
-    lightgbm: 12
-    xgboost: 12
-    xgboost_rf: 10
-    xgboost_dart: 8
-    catboost: 12
-    catboost_alt: 10
-    mlp: 10
-    tabnet: 8
-    nbeats: 8
-    tide: 8
-    kan: 8
+    lightgbm: 8
+    xgboost: 8
+    xgboost_rf: 6
+    xgboost_dart: 6
+    catboost: 8
+    catboost_alt: 6
+    mlp: 6
+    tabnet: 6
+    nbeats: 6
+    tide: 6
+    kan: 6
     transformer: 6
   hpo_max_rows: 1000000
   max_epochs_by_model:

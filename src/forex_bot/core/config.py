@@ -184,18 +184,18 @@ class ModelsConfig(BaseModel):
     rl_eval_episodes: int = 15
     rl_network_arch: list[int] = Field(default_factory=lambda: [4096, 4096, 4096, 2048, 1024])
     rl_parallel_envs: int = 1
-    rl_train_seconds: int = 36000
-    evo_train_seconds: int = 36000
+    rl_train_seconds: int = 3600
+    evo_train_seconds: int = 3600
     evo_hidden_size: int = 64
     evo_population: int = 32
     evo_islands: int = 4
     prop_search_enabled: bool = False
-    prop_search_population: int = 200
-    prop_search_generations: int = 50
-    prop_search_max_hours: float = 1.0
-    prop_search_max_rows: int = 200_000
+    prop_search_population: int = 100
+    prop_search_generations: int = 20
+    prop_search_max_hours: float = 2.0
+    prop_search_max_rows: int = 0
     prop_search_max_rows_by_tf: dict[str, int] = Field(default_factory=dict)
-    prop_search_portfolio_size: int = 100
+    prop_search_portfolio_size: int = 3000
     prop_search_checkpoint: str = "models/strategy_evo_checkpoint.json"
     prop_search_device: str = "cpu"
     prop_search_train_years: int = 0
@@ -221,17 +221,32 @@ class ModelsConfig(BaseModel):
     transformer_hidden_dim: int = 1200
     transformer_dropout: float = 0.20
     transformer_seq_len: int = 64
-    transformer_train_seconds: int = 36000
-    nbeats_train_seconds: int = 36000
-    tide_train_seconds: int = 36000
-    tabnet_train_seconds: int = 36000
-    kan_train_seconds: int = 36000
-    mlp_train_seconds: int = 36000
+    transformer_train_seconds: int = 3600
+    nbeats_train_seconds: int = 3600
+    tide_train_seconds: int = 3600
+    tabnet_train_seconds: int = 3600
+    kan_train_seconds: int = 3600
+    mlp_train_seconds: int = 3600
     num_transformers: int = 2
     hpo_backend: str = "ax"
-    hpo_trials: int = 0
-    hpo_trials_by_model: dict[str, int] = Field(default_factory=dict)
-    hpo_max_rows: int = 500_000
+    hpo_trials: int = 8
+    hpo_trials_by_model: dict[str, int] = Field(
+        default_factory=lambda: {
+            "lightgbm": 8,
+            "xgboost": 8,
+            "xgboost_rf": 6,
+            "xgboost_dart": 6,
+            "catboost": 8,
+            "catboost_alt": 6,
+            "mlp": 6,
+            "tabnet": 6,
+            "nbeats": 6,
+            "tide": 6,
+            "kan": 6,
+            "transformer": 6,
+        }
+    )
+    hpo_max_rows: int = 1_000_000
     max_epochs_by_model: dict[str, int] = Field(default_factory=dict)
     ray_tune_max_concurrency: int = 1
     export_onnx: bool = False
