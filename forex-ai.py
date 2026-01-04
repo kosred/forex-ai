@@ -80,7 +80,27 @@ cpu_budget = max(1, logical_cores - max(0, cpu_reserve))
 # If we have 11 workers × 5 BLAS threads = 55 threads (over-subscription!)
 # Solution: Set BLAS to 1 thread when using multiprocessing
 # This way: 11 workers × 1 BLAS thread = 11 threads (optimal)
-blas_threads = 1  # Single-threaded BLAS when using multiprocessing
+def _read_int_env(*keys: str) -> int | None:
+    for key in keys:
+        val = os.environ.get(key)
+        if val:
+            try:
+                return max(1, int(val))
+            except Exception:
+                continue
+    return None
+
+# Respect explicit user overrides for BLAS/OMP threads; default to 1 otherwise.
+blas_threads = _read_int_env(
+    "FOREX_BOT_BLAS_THREADS",
+    "FOREX_BOT_OMP_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+if blas_threads is None:
+    blas_threads = 1  # Single-threaded BLAS when using multiprocessing
 
 os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
 os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(cpu_budget))

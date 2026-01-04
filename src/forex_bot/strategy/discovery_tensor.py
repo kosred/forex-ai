@@ -292,6 +292,11 @@ class TensorDiscoveryEngine:
         # 3. Island Evolution Loop
         genome_dim = n_features + tf_count + 2
         pop_size = int(os.environ.get("FOREX_BOT_DISCOVERY_POPULATION", 24000))
+        try:
+            stdev_init = float(os.environ.get("FOREX_BOT_DISCOVERY_STDEV_INIT", "0.5") or 0.5)
+        except Exception:
+            stdev_init = 0.5
+        stdev_init = max(1e-6, stdev_init)
 
         shm_data_name = self.shm_data.name
         shm_ohlc_name = self.shm_ohlc.name
@@ -329,13 +334,15 @@ class TensorDiscoveryEngine:
         for idx in range(island_count):
             theme = self.themes[idx % len(self.themes)]
             eval_fn = _make_eval(idx, theme)
+            device = torch.device(self.gpu_list[idx]) if self.gpu_list else torch.device("cpu")
             problem = Problem(
                 "max",
                 eval_fn,
                 solution_length=genome_dim,
                 initial_bounds=(-1.0, 1.0),
+                device=device,
             )
-            islands.append(CMAES(problem, popsize=per_island_pop))
+            islands.append(CMAES(problem, popsize=per_island_pop, stdev_init=stdev_init))
         
         logger.info(f"[TELEMETRY] Discovery: {len(islands)} islands active. Subspace drift enabled.")
 

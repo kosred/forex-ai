@@ -503,12 +503,27 @@ class AutoTuner:
         os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
         os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(cpu_budget))
 
+        # Respect explicit BLAS thread overrides if present.
+        explicit = (
+            os.environ.get("FOREX_BOT_BLAS_THREADS")
+            or os.environ.get("FOREX_BOT_OMP_THREADS")
+            or os.environ.get("OMP_NUM_THREADS")
+            or os.environ.get("MKL_NUM_THREADS")
+            or os.environ.get("OPENBLAS_NUM_THREADS")
+            or os.environ.get("NUMEXPR_NUM_THREADS")
+        )
+
         # Prefer explicit per-rank budgets (e.g., 20 cores per GPU under DDP).
         local_rank = os.environ.get("LOCAL_RANK")
         per_gpu = os.environ.get("FOREX_BOT_CPU_THREADS_PER_GPU")
         budget = os.environ.get("FOREX_BOT_CPU_BUDGET") or os.environ.get("FOREX_BOT_CPU_THREADS")
         blas_threads = None
-        if local_rank is not None:
+        if explicit:
+            try:
+                blas_threads = max(1, int(explicit))
+            except Exception:
+                blas_threads = None
+        if blas_threads is None and local_rank is not None:
             if per_gpu:
                 try:
                     blas_threads = max(1, int(per_gpu))
@@ -521,16 +536,26 @@ class AutoTuner:
                     blas_threads = None
             if blas_threads is None:
                 blas_threads = 20
-        else:
+        elif blas_threads is None:
             if budget:
                 try:
                     blas_threads = max(1, int(budget))
                 except Exception:
                     blas_threads = None
+
         # Fallbacks if no explicit override was set.
         if blas_threads is None:
-            # Default to using the full CPU budget unless user overrides.
-            blas_threads = max(1, cpu_budget)
+            multiproc_hint = (
+                hints.is_hpc
+                or hints.feature_workers > 1
+                or hints.n_jobs > 1
+                or int(os.environ.get("FOREX_BOT_FEATURE_WORKERS", "0") or 0) > 1
+                or int(os.environ.get("FOREX_BOT_PROP_SEARCH_WORKERS", "0") or 0) > 1
+                or int(os.environ.get("FOREX_BOT_CPU_WORKERS", "0") or 0) > 1
+                or int(os.environ.get("FOREX_BOT_GPU_WORKERS", "0") or 0) > 1
+            )
+            # Default to 1 thread per process when multiprocessing is expected.
+            blas_threads = 1 if multiproc_hint else max(1, cpu_budget)
 
         # HPC FIX: Strategic Thread Saturation
         # Ensure NumPy/SciPy/PyTorch can actually use the 252 cores
