@@ -1,0 +1,16 @@
+[package]
+name = "forex_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "forex_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+rayon = "1.10"
+ndarray = { version = "0.15", features = ["rayon"] }
+polars = { version = "0.47.1", features = ["lazy", "dtype-full"] }
+ta-lib-in-rust = "1.0.8"

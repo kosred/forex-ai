@@ -50,7 +50,6 @@ from ..models.transformers import TransformerExpertTorch
 from ..models.trees import (
     CatBoostAltExpert,
     LightGBMExpert,
-    RandomForestExpert,
     XGBoostDARTExpert,
     XGBoostRFExpert,
 )
@@ -144,8 +143,6 @@ class HyperparameterOptimizer:
             "xgboostrf": "xgboost_rf",
             "xgboostdart": "xgboost_dart",
             "catboostalt": "catboost_alt",
-            "randomforest": "random_forest",
-            "extratrees": "extra_trees",
             "n_beats": "nbeats",
         }
         return aliases.get(key, key)
@@ -194,15 +191,6 @@ class HyperparameterOptimizer:
                 {"name": "feature_fraction", "type": "range", "bounds": [0.5, 1.0]},
                 {"name": "bagging_fraction", "type": "range", "bounds": [0.5, 1.0]},
                 {"name": "min_child_samples", "type": "range", "bounds": [10, 100], "value_type": "int"},
-            ]
-        if name == "RandomForest":
-            return [
-                {"name": "n_estimators", "type": "range", "bounds": [100, 300], "value_type": "int"},
-                {"name": "max_depth", "type": "range", "bounds": [8, 16], "value_type": "int"},
-                {"name": "min_samples_split", "type": "range", "bounds": [2, 10], "value_type": "int"},
-                {"name": "min_samples_leaf", "type": "range", "bounds": [1, 5], "value_type": "int"},
-                {"name": "max_features", "type": "range", "bounds": [0.5, 1.0]},
-                {"name": "bootstrap", "type": "choice", "values": [True, False]},
             ]
         if name == "XGBoostRF":
             return [
@@ -312,14 +300,6 @@ class HyperparameterOptimizer:
                 except Exception:
                     pass
             return LightGBMExpert(params=params)
-        if name == "RandomForest":
-            if isinstance(device, str) and device.startswith("cuda:"):
-                try:
-                    params["gpu_device_id"] = int(device.split(":")[1])
-                except Exception:
-                    pass
-            params.setdefault("random_state", 42)
-            return RandomForestExpert(params=params)
         if name == "XGBoostRF":
             params.setdefault("random_state", 42)
             return XGBoostRFExpert(params=params)
@@ -878,7 +858,7 @@ class HyperparameterOptimizer:
         resources = {"cpu": 1, "gpu": 0}
         if self.device_pool and name in {"TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"}:
             resources["gpu"] = 1
-        if name in {"LightGBM", "RandomForest", "XGBoostRF", "XGBoostDART", "CatBoostAlt"} and self.device_pool:
+        if name in {"LightGBM", "XGBoostRF", "XGBoostDART", "CatBoostAlt"} and self.device_pool:
             resources["gpu"] = 1
 
         try:
@@ -964,7 +944,7 @@ class HyperparameterOptimizer:
         best_params: dict[str, dict[str, Any]] = {}
         
         all_models = [
-            "LightGBM", "RandomForest", "XGBoostRF", "XGBoostDART", "CatBoostAlt", "MLP",
+            "LightGBM", "XGBoostRF", "XGBoostDART", "CatBoostAlt", "MLP",
             "TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"
         ]
 
@@ -1010,7 +990,7 @@ class HyperparameterOptimizer:
         best_params = {}
         models_to_optimize = [
             "LightGBM", "XGBoost", "XGBoostRF", "XGBoostDART",
-            "CatBoost", "CatBoostAlt", "RandomForest", "ExtraTrees",
+            "CatBoost", "CatBoostAlt",
             "TabNet", "N-BEATS", "TiDE", "KAN", "Transformer", "MLP"
         ]
 

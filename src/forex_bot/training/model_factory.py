@@ -34,8 +34,6 @@ class ModelFactory:
             "xgboostrf": "xgboost_rf",
             "xgboostdart": "xgboost_dart",
             "catboostalt": "catboost_alt",
-            "randomforest": "random_forest",
-            "extratrees": "extra_trees",
             "n_beats": "nbeats",
         }
         return aliases.get(key, key)
@@ -74,7 +72,6 @@ class ModelFactory:
             "kan": "KAN",
             "transformer": "Transformer",
             "evolution": "Neuroevolution",
-            "extra_trees": "ExtraTrees",
             "mlp": "MLP",
         }
         opt_key = opt_key_map.get(model_name)
@@ -110,8 +107,6 @@ class ModelFactory:
         # Tree experts expect a single "params" dict in __init__
         if model_name in {
             "lightgbm",
-            "random_forest",
-            "extra_trees",
             "xgboost",
             "xgboost_rf",
             "xgboost_dart",

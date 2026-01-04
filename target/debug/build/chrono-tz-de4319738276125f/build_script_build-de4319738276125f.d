@@ -1,0 +1,5 @@
+C:\Users\konst\development\forex-ai\target\debug\build\chrono-tz-de4319738276125f\build_script_build-de4319738276125f.d: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\chrono-tz-0.10.4\build.rs
+
+C:\Users\konst\development\forex-ai\target\debug\build\chrono-tz-de4319738276125f\build_script_build-de4319738276125f.exe: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\chrono-tz-0.10.4\build.rs
+
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\chrono-tz-0.10.4\build.rs:

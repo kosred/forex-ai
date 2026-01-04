@@ -9,10 +9,9 @@ from ..models.base import validate_time_ordering
 from .evaluation import pad_probs
 
 try:
-    from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+    from sklearn.ensemble import GradientBoostingClassifier
     from sklearn.linear_model import LogisticRegression
 except ImportError:
-    RandomForestClassifier = None
     GradientBoostingClassifier = None
     LogisticRegression = None
 
@@ -37,10 +36,6 @@ class MetaBlender:
             )
         elif GradientBoostingClassifier:
             self.model = GradientBoostingClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42)
-        elif RandomForestClassifier:
-            self.model = RandomForestClassifier(
-                n_estimators=100, max_depth=5, min_samples_leaf=10, n_jobs=-1, random_state=42
-            )
         elif LogisticRegression:
             self.model = LogisticRegression(max_iter=1000, solver="lbfgs", random_state=42)
         else:

@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+  "rust_core",
+  "crates/forex-search",
+  "crates/forex-cli",
+  "crates/forex-data",
+  "crates/forex-models",
+]

@@ -1,0 +1,10 @@
+[package]
+name = "forex-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+forex-data = { path = "../forex-data" }
+forex-models = { path = "../forex-models" }
+forex-search = { path = "../forex-search" }
+anyhow = "1.0"

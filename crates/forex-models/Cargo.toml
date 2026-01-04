@@ -1,0 +1,13 @@
+[package]
+name = "forex-models"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+forex-data = { path = "../forex-data" }
+ndarray = { version = "0.15" }
+tch = { version = "0.15", optional = true }
+
+[features]
+default = []
+tch = ["dep:tch"]

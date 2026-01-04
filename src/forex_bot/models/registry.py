@@ -25,8 +25,6 @@ MODEL_MAPPING = {
     "xgboost_dart": ("trees", "XGBoostDARTExpert"),
     "catboost": ("trees", "CatBoostExpert"),
     "catboost_alt": ("trees", "CatBoostAltExpert"),
-    "random_forest": ("trees", "RandomForestExpert"),
-    "extra_trees": ("trees", "ExtraTreesExpert"),
     "mlp": ("mlp", "MLPExpert"),
     "transformer": ("transformers", "TransformerExpertTorch"),
     "kan": ("kan_gpu", "KANExpert"),

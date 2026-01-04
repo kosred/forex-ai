@@ -47,7 +47,7 @@ class ONNXExporter:
     Exports trained models to ONNX format for ultra-fast inference.
 
     Supports:
-    - Tree models (LightGBM, XGBoost, CatBoost, RandomForest)
+    - Tree models (LightGBM, XGBoost, CatBoost)
     - Logistic Regression
     - Neural networks (PyTorch models)
     - Ensemble meta-blender
@@ -137,7 +137,6 @@ class ONNXExporter:
         model_type = type(base).__name__
 
         if model_type in [
-            "RandomForestClassifier",
             "LogisticRegression",
             "Pipeline",
             "SGDClassifier",

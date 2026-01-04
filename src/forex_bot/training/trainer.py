@@ -370,8 +370,6 @@ class ModelTrainer:
     def _schedule_models(self, models: list[str], workers: int) -> list[list[str]]:
         # Rough weights to reduce wall-time skew (heavy models first).
         base = dict(getattr(self.benchmarker, "COMPLEXITY_MAP", {}) or {})
-        base.setdefault("random_forest", 0.0015)
-        base.setdefault("extra_trees", 0.0012)
         base.setdefault("genetic", 0.002)
         base.setdefault("rllib_ppo", base.get("rl_ppo", 0.005))
         base.setdefault("rllib_sac", base.get("rl_sac", 0.008))
@@ -1625,9 +1623,6 @@ class ModelTrainer:
             registry = set()
 
         for name in ordered:
-            if gpu_only and name in {"extra_trees", "elasticnet"}:
-                skipped.append(name)
-                continue
             if name in {"rllib_ppo", "rllib_sac"} and not bool(RAY_AVAILABLE):
                 skipped.append(name)
                 continue
