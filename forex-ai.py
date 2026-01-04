@@ -90,36 +90,141 @@ def _read_int_env(*keys: str) -> int | None:
                 continue
     return None
 
+auto_mode = str(os.environ.get("FOREX_BOT_AUTO_TUNE", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
+# Auto-split CPU budgets when GPUs are present (training vs discovery/search).
+gpu_count = 0
+try:
+    import torch
+
+    if torch.cuda.is_available():
+        gpu_count = int(torch.cuda.device_count())
+except Exception:
+    gpu_count = 0
+
+if gpu_count > 0:
+    per_gpu = _read_int_env("FOREX_BOT_CPU_THREADS_PER_GPU")
+    if per_gpu is None:
+        # Heuristic: 10 cores/GPU if the machine can afford it, otherwise scale down.
+        per_gpu = min(10, max(4, cpu_budget // max(1, gpu_count * 2)))
+        if cpu_budget // max(1, gpu_count) >= 12:
+            per_gpu = 10
+    training_budget = min(cpu_budget, per_gpu * gpu_count)
+    # Ensure we leave at least 1 core for search/features.
+    if training_budget >= cpu_budget:
+        per_gpu = max(1, (cpu_budget - 1) // max(1, gpu_count))
+        training_budget = max(1, per_gpu * gpu_count)
+    remaining = max(1, cpu_budget - training_budget)
+
+    if auto_mode:
+        os.environ["FOREX_BOT_CPU_THREADS_PER_GPU"] = str(per_gpu)
+        os.environ["FOREX_BOT_CPU_BUDGET"] = str(training_budget)
+        os.environ["FOREX_BOT_CPU_THREADS"] = str(training_budget)
+    else:
+        os.environ.setdefault("FOREX_BOT_CPU_THREADS_PER_GPU", str(per_gpu))
+        os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(training_budget))
+        os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(training_budget))
+
+    # Discovery / feature CPU budgets
+    if auto_mode:
+        os.environ["FOREX_BOT_FEATURE_CPU_BUDGET"] = str(remaining)
+        os.environ["FOREX_BOT_FEATURE_WORKERS"] = str(remaining)
+        os.environ["FOREX_BOT_PROP_SEARCH_WORKERS"] = str(remaining)
+        os.environ["FOREX_BOT_PROP_SEARCH_ASYNC"] = "1"
+        os.environ["FOREX_BOT_PROP_SEARCH_ASYNC_WAIT"] = "0"
+        if platform.system().lower() == "linux":
+            os.environ["FOREX_BOT_PROP_MP_CONTEXT"] = "fork"
+    else:
+        os.environ.setdefault("FOREX_BOT_FEATURE_CPU_BUDGET", str(remaining))
+        os.environ.setdefault("FOREX_BOT_FEATURE_WORKERS", str(remaining))
+        os.environ.setdefault("FOREX_BOT_PROP_SEARCH_WORKERS", str(remaining))
+        os.environ.setdefault("FOREX_BOT_PROP_SEARCH_ASYNC", "1")
+        os.environ.setdefault("FOREX_BOT_PROP_SEARCH_ASYNC_WAIT", "0")
+        if platform.system().lower() == "linux":
+            os.environ.setdefault("FOREX_BOT_PROP_MP_CONTEXT", "fork")
+
+    # Favor GPU model training by default when GPUs are present.
+    if auto_mode:
+        os.environ["FOREX_BOT_PARALLEL_MODELS"] = "gpu"
+        os.environ["FOREX_BOT_GPU_WORKERS"] = str(gpu_count)
+    else:
+        os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", "gpu")
+        os.environ.setdefault("FOREX_BOT_GPU_WORKERS", str(gpu_count))
+
+    # Keep the event loop responsive so prop search can actually run.
+    if auto_mode:
+        os.environ["FOREX_BOT_DISCOVERY_ASYNC"] = "1"
+    else:
+        os.environ.setdefault("FOREX_BOT_DISCOVERY_ASYNC", "1")
+
+    # If we have lots of RAM, allow prop search to stay parallel.
+    try:
+        mem = psutil.virtual_memory()
+        if float(mem.available) / (1024**3) >= 64.0:
+            if auto_mode:
+                os.environ["FOREX_BOT_PROP_PARALLEL_MEM_FRAC"] = "0.90"
+                os.environ["FOREX_BOT_PROP_PARALLEL_OVERHEAD"] = "1.20"
+            else:
+                os.environ.setdefault("FOREX_BOT_PROP_PARALLEL_MEM_FRAC", "0.90")
+                os.environ.setdefault("FOREX_BOT_PROP_PARALLEL_OVERHEAD", "1.20")
+    except Exception:
+        pass
+
 # Respect explicit user overrides for BLAS/OMP threads; default to 1 otherwise.
-blas_threads = _read_int_env(
-    "FOREX_BOT_BLAS_THREADS",
-    "FOREX_BOT_OMP_THREADS",
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-)
-if blas_threads is None:
-    blas_threads = 1  # Single-threaded BLAS when using multiprocessing
+if auto_mode:
+    blas_threads = 1
+else:
+    blas_threads = _read_int_env(
+        "FOREX_BOT_BLAS_THREADS",
+        "FOREX_BOT_OMP_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    )
+    if blas_threads is None:
+        blas_threads = 1  # Single-threaded BLAS when using multiprocessing
 
 os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
 os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(cpu_budget))
 # BLAS libraries: Single-threaded to prevent N_workers × N_threads explosion
-os.environ.setdefault("NUMEXPR_MAX_THREADS", str(blas_threads))
-os.environ.setdefault("OMP_NUM_THREADS", str(blas_threads))
-os.environ.setdefault("MKL_NUM_THREADS", str(blas_threads))
-os.environ.setdefault("OPENBLAS_NUM_THREADS", str(blas_threads))
-os.environ.setdefault("NUMBA_NUM_THREADS", str(blas_threads))
-os.environ.setdefault("NUMBA_DEFAULT_NUM_THREADS", str(blas_threads))
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(blas_threads))
-# Disable dynamic threading for predictable performance
-os.environ.setdefault("OMP_DYNAMIC", "FALSE")
-os.environ.setdefault("MKL_DYNAMIC", "FALSE")
-# PyTorch/TensorFlow thread limits (match BLAS: single-threaded)
-os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(blas_threads))
-os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
-os.environ.setdefault("TORCH_NUM_THREADS", str(blas_threads))
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+if auto_mode:
+    os.environ["NUMEXPR_MAX_THREADS"] = str(blas_threads)
+    os.environ["OMP_NUM_THREADS"] = str(blas_threads)
+    os.environ["MKL_NUM_THREADS"] = str(blas_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
+    os.environ["NUMBA_NUM_THREADS"] = str(blas_threads)
+    os.environ["NUMBA_DEFAULT_NUM_THREADS"] = str(blas_threads)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(blas_threads)
+    # Disable dynamic threading for predictable performance
+    os.environ["OMP_DYNAMIC"] = "FALSE"
+    os.environ["MKL_DYNAMIC"] = "FALSE"
+    # PyTorch/TensorFlow thread limits (match BLAS: single-threaded)
+    os.environ["TF_NUM_INTRAOP_THREADS"] = str(blas_threads)
+    os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+    os.environ["TORCH_NUM_THREADS"] = str(blas_threads)
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+else:
+    os.environ.setdefault("NUMEXPR_MAX_THREADS", str(blas_threads))
+    os.environ.setdefault("OMP_NUM_THREADS", str(blas_threads))
+    os.environ.setdefault("MKL_NUM_THREADS", str(blas_threads))
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(blas_threads))
+    os.environ.setdefault("NUMBA_NUM_THREADS", str(blas_threads))
+    os.environ.setdefault("NUMBA_DEFAULT_NUM_THREADS", str(blas_threads))
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(blas_threads))
+    # Disable dynamic threading for predictable performance
+    os.environ.setdefault("OMP_DYNAMIC", "FALSE")
+    os.environ.setdefault("MKL_DYNAMIC", "FALSE")
+    # PyTorch/TensorFlow thread limits (match BLAS: single-threaded)
+    os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(blas_threads))
+    os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+    os.environ.setdefault("TORCH_NUM_THREADS", str(blas_threads))
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # NCCL optimizations for 8x A6000 P2P topology
 os.environ["NCCL_P2P_LEVEL"] = "5"
 os.environ["NCCL_IB_DISABLE"] = "1"

@@ -591,9 +591,12 @@ class AutoTuner:
         per_worker_gb = self._read_float_env("FOREX_BOT_FEATURE_WORKER_GB", 2.0) or 2.0
         max_ram_workers = int(ram_gb // max(0.5, per_worker_gb))
 
-        # 2. Saturate Cores
+        # 2. Saturate Cores (allow dedicated feature CPU budget override)
         cpu_cores = self.profile.cpu_cores
         cpu_budget = self._resolve_cpu_budget(cpu_cores)
+        feature_budget = self._read_int_env("FOREX_BOT_FEATURE_CPU_BUDGET", None)
+        if feature_budget is not None and feature_budget > 0:
+            cpu_budget = max(1, min(cpu_cores, feature_budget))
 
         requested = self._read_int_env("FOREX_BOT_FEATURE_WORKERS", None)
         if requested is not None and requested > 0:

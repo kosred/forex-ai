@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 import os
 import time
+import threading
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,28 @@ class TrainingService:
         self._ray_started = False
         self._progress_path = self.trainer.models_dir / "global_incremental_progress.json"
         self._prop_search_task: asyncio.Task | None = None
+        self._discovery_task: asyncio.Task | None = None
+        self._prop_search_thread: threading.Thread | None = None
+        self._discovery_thread: threading.Thread | None = None
+
+    def _start_background_thread(self, name: str, target) -> threading.Thread:
+        thread = threading.Thread(target=target, name=name, daemon=True)
+        thread.start()
+        return thread
+
+    def _start_prop_search_thread(self, symbols: list[str]) -> None:
+        if self._prop_search_thread and self._prop_search_thread.is_alive():
+            logger.info("[STRATEGY DISCOVERY] Async discovery already running; skipping new launch.")
+            return
+
+        def _runner() -> None:
+            try:
+                asyncio.run(self._run_prop_search_for_symbols(symbols, stop_event=None))
+            except Exception as exc:
+                logger.warning(f"[STRATEGY DISCOVERY] Background prop search failed: {exc}", exc_info=True)
+
+        logger.info("[STRATEGY DISCOVERY] Running prop search in background thread.")
+        self._prop_search_thread = self._start_background_thread("forex-prop-search", _runner)
 
     def _load_progress(self) -> set[str]:
         """Load completed-symbol list to allow resuming long incremental runs."""
@@ -106,6 +129,13 @@ class TrainingService:
                 return bool(getattr(self.settings.models, "prop_search_async_wait", False))
             except Exception:
                 return False
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _discovery_async_enabled(self) -> bool:
+        raw = os.environ.get("FOREX_BOT_DISCOVERY_ASYNC")
+        if raw is None or str(raw).strip() == "":
+            # Default to async when prop search is async (keeps event loop alive).
+            return self._prop_search_async_enabled()
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
     def _prop_search_workers_override(self) -> int | None:
@@ -1823,35 +1853,46 @@ class TrainingService:
 
         if bool(getattr(self.settings.models, "prop_search_enabled", False)):
             if self._prop_search_async_enabled():
-                if self._prop_search_task and not self._prop_search_task.done():
-                    logger.info("[STRATEGY DISCOVERY] Async discovery already running; skipping new launch.")
-                else:
-                    logger.info(
-                        "[STRATEGY DISCOVERY] Async mode enabled; running prop search in background."
-                    )
-                    self._prop_search_task = asyncio.create_task(
-                        self._run_prop_search_for_symbols(symbols, stop_event=stop_event)
-                    )
+                # Use a background thread so discovery starts even if the event loop is busy.
+                self._start_prop_search_thread(symbols)
             else:
                 await self._run_prop_search_for_symbols(symbols, stop_event=stop_event)
 
-        discovery_tensor = TensorDiscoveryEngine(n_experts=100, timeframes=timeframes)
-        discovery_tensor.run_unsupervised_search(discovery_frames, iterations=1000)
-        discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
+        def _run_discovery() -> None:
+            discovery_tensor = TensorDiscoveryEngine(n_experts=100, timeframes=timeframes)
+            discovery_tensor.run_unsupervised_search(discovery_frames, iterations=1000)
+            discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
+
+        if self._discovery_async_enabled():
+            if self._discovery_thread and self._discovery_thread.is_alive():
+                logger.info("[STRATEGY DISCOVERY] Async tensor discovery already running; skipping new launch.")
+            else:
+                logger.info("[STRATEGY DISCOVERY] Running tensor discovery in background thread.")
+                self._discovery_thread = self._start_background_thread("forex-tensor-discovery", _run_discovery)
+        else:
+            _run_discovery()
 
         # --- Final Global Training ---
         full_ds = await self._train_global_from_datasets(
             datasets, symbols, optimize, stop_event, exclude_models=None
         )
-        # If discovery is async, optionally wait for it after training completes.
-        if self._prop_search_task and not self._prop_search_task.done():
+        # If discovery/prop search is async, optionally wait for it after training completes.
+        if self._prop_search_thread and self._prop_search_thread.is_alive():
             if self._prop_search_async_wait() and not (stop_event and stop_event.is_set()):
                 logger.info(
                     "[STRATEGY DISCOVERY] Waiting for background discovery to finish "
                     "(set FOREX_BOT_PROP_SEARCH_ASYNC_WAIT=0 to skip)."
                 )
                 with contextlib.suppress(Exception):
-                    await self._prop_search_task
+                    await asyncio.to_thread(self._prop_search_thread.join)
+        if self._discovery_thread and self._discovery_thread.is_alive():
+            if self._prop_search_async_wait() and not (stop_event and stop_event.is_set()):
+                logger.info(
+                    "[STRATEGY DISCOVERY] Waiting for background tensor discovery to finish "
+                    "(set FOREX_BOT_DISCOVERY_ASYNC=0 to run inline)."
+                )
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self._discovery_thread.join)
 
     async def _train_global_sequential(
         self, symbols: list[str], optimize: bool, stop_event: asyncio.Event | None
@@ -1903,29 +1944,21 @@ class TrainingService:
         if datasets and bool(getattr(self.settings.models, "prop_search_enabled", False)):
             symbols_to_run = [sym for sym, _ in datasets]
             if self._prop_search_async_enabled():
-                if self._prop_search_task and not self._prop_search_task.done():
-                    logger.info("[STRATEGY DISCOVERY] Async discovery already running; skipping new launch.")
-                else:
-                    logger.info(
-                        "[STRATEGY DISCOVERY] Async mode enabled; running prop search in background."
-                    )
-                    self._prop_search_task = asyncio.create_task(
-                        self._run_prop_search_for_symbols(symbols_to_run, stop_event=stop_event)
-                    )
+                self._start_prop_search_thread(symbols_to_run)
             else:
                 await self._run_prop_search_for_symbols(symbols_to_run, stop_event=stop_event)
 
         await self._train_global_from_datasets(datasets, symbols, optimize, stop_event)
 
         # If discovery is async, optionally wait for it to finish after training.
-        if self._prop_search_task and not self._prop_search_task.done():
+        if self._prop_search_thread and self._prop_search_thread.is_alive():
             if self._prop_search_async_wait() and not (stop_event and stop_event.is_set()):
                 logger.info(
                     "[STRATEGY DISCOVERY] Waiting for background discovery to finish "
                     "(set FOREX_BOT_PROP_SEARCH_ASYNC_WAIT=0 to skip)."
                 )
                 with contextlib.suppress(Exception):
-                    await self._prop_search_task
+                    await asyncio.to_thread(self._prop_search_thread.join)
 
     def _maybe_start_ray(self) -> None:
         from ..models.rllib_agent import RAY_AVAILABLE, _maybe_init_ray
