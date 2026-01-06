@@ -1,0 +1,11 @@
+C:\Users\konst\development\forex-ai\target/bindings_retry_3\debug\deps\foldhash-60ac50613bb51a6b.d: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\lib.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\fast.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\quality.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\seed.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\convenience.rs
+
+C:\Users\konst\development\forex-ai\target/bindings_retry_3\debug\deps\libfoldhash-60ac50613bb51a6b.rlib: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\lib.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\fast.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\quality.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\seed.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\convenience.rs
+
+C:\Users\konst\development\forex-ai\target/bindings_retry_3\debug\deps\libfoldhash-60ac50613bb51a6b.rmeta: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\lib.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\fast.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\quality.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\seed.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\convenience.rs
+
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\lib.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\fast.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\quality.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\seed.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\foldhash-0.1.5\src\convenience.rs:

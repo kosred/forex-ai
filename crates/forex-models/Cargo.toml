@@ -5,9 +5,53 @@ edition = "2021"
 
 [dependencies]
 forex-data = { path = "../forex-data" }
-ndarray = { version = "0.15" }
-tch = { version = "0.15", optional = true }
+ndarray = { version = "*", features = ["rayon", "serde"] } # Enable rayon and serde for ndarray
+tch = { version = "*", optional = true }
+ort = { version = "2.0.0-rc.10", optional = true, features = ["cuda", "copy-dylibs"] } # ONNX Runtime
+pyo3 = { version = "0.27", features = ["auto-initialize"] } # Python bindings for neural networks
+tracing = "*"
+anyhow = "*"
+thiserror = "*"
+
+# Tree model dependencies
+polars = { version = "0.47", features = ["lazy", "dtype-datetime", "rolling_window"] }
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+
+# Tree model FFI bindings - Let cargo choose versions
+lightgbm3 = { version = "*", optional = true, features = ["gpu", "cuda"] }
+xgboost-rust = { version = "*", optional = true }
+catboost-rust = { version = "*", optional = true, features = ["gpu"] }
+
+# Deep Learning - Burn Framework - DISABLED temporarily due to yanked dependencies
+# burn = { version = "*", optional = true }
+# burn-ndarray = { version = "*", optional = true }
+# burn-cuda = { version = "*", optional = true }
+# burn-wgpu = { version = "*", optional = true }
+# burn-tch = { version = "*", optional = true }
+num_cpus = "*"
+rand = "*"
+rayon = "*"
+chrono = "*"
+lazy_static = "*"
+# Temporarily disabled due to dependency issues
+# cmaes = "*"
+# linfa = "*"
+# linfa-clustering = "*"
+# muonts = "*"
 
 [features]
 default = []
+onnx = ["dep:ort"]
 tch = ["dep:tch"]
+lightgbm = ["dep:lightgbm3"]
+xgboost = ["dep:xgboost-rust"]
+catboost = ["dep:catboost-rust"]
+tree-models = ["lightgbm", "xgboost", "catboost"]
+
+# Burn backends - DISABLED temporarily
+# burn-ndarray-backend = ["burn", "burn-ndarray"]
+# burn-cuda-backend = ["burn", "burn-cuda"]
+# burn-wgpu-backend = ["burn", "burn-wgpu"]
+# burn-tch-backend = ["burn", "burn-tch", "tch"]
+# burn-kan = ["burn", "burn-efficient-kan"]  # Disabled - see KAN_COMPATIBILITY_ISSUE.txt

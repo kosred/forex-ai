@@ -1,0 +1,370 @@
+================================================================================
+TREE MODELS RUST IMPLEMENTATION SPECIFICATION
+COMPLETE FEATURE PRESERVATION - NO SIMPLIFICATION
+================================================================================
+
+SOURCE: src/forex_bot/models/trees.py (739 lines)
+TARGET: crates/forex-models/src/tree_models.rs (NEW)
+
+================================================================================
+CRITICAL FEATURES TO PRESERVE (DO NOT SIMPLIFY!)
+================================================================================
+
+1. LABEL REMAPPING SYSTEM (lines 167-182)
+   - HPC FIX: Hardcoded deterministic mapping prevents "Label Drift"
+   - Mapping: -1 -> 0 (Sell), 0 -> 1 (Neutral), 1 -> 2 (Buy)
+   - Fast vectorized mapping using NumPy/ndarray
+   - Must return both remapped array AND mapping dict
+
+2. OUTPUT REORDERING (lines 112-139)
+   - HPC PROTOCOL: Force output to [Neutral, Buy, Sell] order
+   - Handles binary (2-class) and multiclass (3-class) cases
+   - Binary: col 0 -> Neutral, col 1 -> Buy, col 2 -> 0.0 (Sell)
+   - Multiclass: Maps based on classes_ attribute
+   - Fallback if classes not available
+
+3. TIME FEATURE AUGMENTATION (lines 142-164)
+   - Only if 'close' column exists
+   - Features: ret1, ret1_lag1, ret1_lag2, ret1_lag5, ret1_lag8
+   - Features: vol14, vol50 (rolling std)
+   - Features: mom5, mom15 (momentum/diff)
+   - Use pct_change, rolling, shift, fillna(0.0)
+
+4. GPU DISTRIBUTION ACROSS MULTIPLE GPUs (8 GPUs in HPC setup)
+   - Each model instance has idx: int
+   - GPU assignment: (idx - 1) % gpu_count
+   - LightGBM: params["gpu_device_id"] = gpu_id
+   - XGBoost: params["device"] = f"cuda:{gpu_id}"
+   - CatBoost: params["devices"] = str(gpu_id)
+
+5. TIME-SERIES AWARE TRAIN/VAL SPLIT
+   - Uses time_series_train_val_split with embargo_samples
+   - Default val_ratio=0.15, min_train_samples=100
+   - Embargo: max(24, int(len(y) * 0.01))
+   - Prevents look-ahead bias
+   - Falls back gracefully on ValueError
+
+6. CLASS WEIGHTING (different for each library!)
+   - LightGBM: params["class_weight"] = {cls: weight, ...}
+   - XGBoost: sample_weight array (len(y_train) / (len(uniq) * cnt))
+   - CatBoost: params["class_weights"] = [weight1, weight2, weight3]
+
+7. GPU-ONLY MODE
+   - Environment: FOREX_BOT_GPU_ONLY=1|true|yes|on
+   - If enabled and GPU unavailable: SKIP model entirely
+   - Set self._gpu_only_disabled = True
+   - predict_proba raises RuntimeError if disabled
+
+8. DEVICE PREFERENCE
+   - Environment: FOREX_BOT_TREE_DEVICE=auto|gpu|cpu
+   - Parsing logic (lines 49-63): handles 0/1/true/false variants
+   - auto: prefer GPU if available
+   - gpu: use GPU or fallback to CPU (unless GPU-only mode)
+   - cpu: force CPU
+
+9. CPU THREAD PARTITIONING
+   - Environment: FOREX_BOT_CPU_THREADS=N
+   - Prevents oversubscription on large CPUs (250-core HPC)
+   - LightGBM: n_jobs
+   - XGBoost: n_jobs
+   - CatBoost: thread_count
+
+10. EARLY STOPPING
+    - LightGBM: lgb.early_stopping(50, first_metric_only=True, verbose=False)
+    - XGBoost: early_stopping_rounds=50 (in constructor for XGBoost 2.0+)
+    - CatBoost: od_type="Iter", od_wait=50, use_best_model=True
+    - Uses get_early_stop_params(50, 0.0) from base.py
+
+11. INF/NAN HANDLING
+    - Replace [np.inf, -np.inf] with np.nan BEFORE training
+    - All libraries: x = x.replace([np.inf, -np.inf], np.nan)
+
+12. TIME ORDERING ENFORCEMENT
+    - If DatetimeIndex and not monotonic: re-sort
+    - Lines 216-219 (LightGBM), similar in XGBoost/CatBoost
+    - order = np.argsort(x.index.view("int64"))
+    - x = x.iloc[order]; y = y.iloc[order]
+
+13. BINARY VS MULTICLASS DETECTION
+    - Based on unique labels in y_train after remapping
+    - binary = len(uniq) <= 2
+    - LightGBM: switches objective="binary" or "multiclass"
+    - XGBoost: handles automatically with multi:softprob
+    - CatBoost: handles automatically with MultiClass
+
+14. MODEL CLASSES EXTRACTION (lines 79-109)
+    - Best-effort extraction from model.classes_
+    - Handles sklearn pipelines (named_steps, steps)
+    - Returns list[int] or None
+    - Used for output reordering
+
+15. GPU FALLBACK LOGIC
+    - LightGBM (lines 331-353): If GPU training fails:
+      - If GPU-only mode: skip model entirely
+      - Else: fallback to CPU, rebuild model, retry
+    - XGBoost: No explicit fallback (relies on XGBoost's internal handling)
+    - CatBoost: No explicit fallback
+
+================================================================================
+HYPERPARAMETERS (EXACT DEFAULTS)
+================================================================================
+
+LightGBMExpert (lines 190-206):
+    n_estimators: 800
+    num_leaves: 64
+    learning_rate: 0.03
+    objective: "multiclass"
+    num_class: 3
+    random_state: 42
+    n_jobs: -1
+    verbosity: -1
+    min_data_in_leaf: 50
+    feature_fraction: 0.6
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    path_smooth: 10
+    linear_tree: True
+
+XGBoostExpert (lines 390-403):
+    n_estimators: 800
+    max_depth: 8
+    learning_rate: 0.05
+    objective: "multi:softprob"
+    num_class: 3
+    random_state: 42
+    n_jobs: -1
+    verbosity: 0
+    subsample: 0.9
+    colsample_bytree: 0.9
+    eval_metric: "mlogloss"
+    tree_method: "hist" (overridden to gpu_hist if GPU)
+
+CatBoostExpert (lines 535-543):
+    iterations: 800
+    depth: 8
+    learning_rate: 0.05
+    loss_function: "MultiClass"
+    random_seed: 42
+    verbose: False
+    thread_count: -1
+
+GPU-specific params:
+    LightGBM:
+        device_type: "gpu"
+        max_bin: 63 (GPU), 255 (CPU)
+        gpu_use_dp: False
+        gpu_device_id: (idx-1) % gpu_count
+
+    XGBoost:
+        device: f"cuda:{gpu_id}"
+        tree_method: "gpu_hist" (GPU), "hist" (CPU)
+
+    CatBoost:
+        task_type: "GPU"
+        devices: str(gpu_id)
+        border_count: 32 (GPU only)
+
+================================================================================
+VARIANT MODELS (lines 668-738)
+================================================================================
+
+CatBoostAltExpert (inherits CatBoostExpert):
+    iterations: 900 (not 800)
+    depth: 10 (not 8)
+    learning_rate: 0.03 (not 0.05)
+    random_seed: 7 (not 42)
+    l2_leaf_reg: 6.0 (NEW)
+    random_strength: 1.5 (NEW)
+
+XGBoostRFExpert (inherits XGBoostExpert):
+    n_estimators: 400 (not 800)
+    max_depth: 6 (not 8)
+    learning_rate: 0.3 (not 0.05)
+    subsample: 0.8 (not 0.9)
+    colsample_bynode: 0.8 (NEW)
+    colsample_bytree: 0.8 (not 0.9)
+    num_parallel_tree: 8 (NEW - Random Forest mode)
+
+XGBoostDARTExpert (inherits XGBoostExpert):
+    n_estimators: 600 (not 800)
+    booster: "dart" (NEW - not "gbtree")
+    rate_drop: 0.10 (NEW)
+    skip_drop: 0.50 (NEW)
+    sample_type: "uniform" (NEW)
+    normalize_type: "tree" (NEW)
+
+================================================================================
+RUST IMPLEMENTATION STRATEGY
+================================================================================
+
+CRATES TO USE:
+1. xgboost-rust 0.1.0 (FFI bindings)
+2. lightgbm-rust 0.1.1 (FFI bindings)
+3. catboost-rust 0.3.6 (FFI bindings)
+4. polars (for DataFrame operations)
+5. ndarray (for array operations)
+
+ARCHITECTURE:
+1. Create trait TreeModel with methods:
+   - fit(x: &DataFrame, y: &Series) -> Result<()>
+   - predict_proba(x: &DataFrame) -> Result<Array2<f32>>
+   - save(path: &Path) -> Result<()>
+   - load(path: &Path) -> Result<()>
+
+2. Implement for each library:
+   - LightGBMExpert
+   - XGBoostExpert
+   - CatBoostExpert
+   - CatBoostAltExpert
+   - XGBoostRFExpert
+   - XGBoostDARTExpert
+
+3. Helper functions module:
+   - remap_labels_to_contiguous(y: &Series) -> (Array1<i32>, HashMap<i32, i32>)
+   - reorder_to_neutral_buy_sell(probs: Array2<f32>, classes: Option<Vec<i32>>) -> Array2<f32>
+   - augment_time_features(df: &DataFrame) -> DataFrame
+   - get_model_classes(model: &dyn Any) -> Option<Vec<i32>>
+   - cpu_threads_hint() -> usize
+   - tree_device_preference() -> DevicePreference
+   - gpu_only_mode() -> bool
+   - torch_cuda_available() -> bool
+
+4. Configuration struct:
+   struct TreeModelConfig {
+       idx: usize,  // For GPU distribution
+       params: HashMap<String, ParamValue>,
+       device_pref: DevicePreference,
+       gpu_only: bool,
+       cpu_threads: Option<usize>,
+   }
+
+================================================================================
+ENVIRONMENT VARIABLES TO RESPECT
+================================================================================
+
+FOREX_BOT_CPU_THREADS - Number of threads for tree models
+FOREX_BOT_TREE_DEVICE - auto|gpu|cpu (with variations: 0/1/true/false/yes/no/on/off)
+FOREX_BOT_GPU_ONLY - 1|true|yes|on (skip models if GPU unavailable)
+FOREX_BOT_EARLY_STOP_PATIENCE - Early stopping patience (default: 50)
+FOREX_BOT_EARLY_STOP_MIN_DELTA - Early stopping min delta (default: 0.0)
+
+================================================================================
+CRITICAL LOGIC FLOWS
+================================================================================
+
+FIT WORKFLOW:
+1. Check library availability (LGBM_AVAILABLE, XGB_AVAILABLE, CAT_AVAILABLE)
+2. Augment time features if 'close' exists
+3. Validate time ordering (monotonic index)
+4. If not monotonic: re-sort x and y
+5. Replace inf with nan
+6. Copy params
+7. Apply CPU thread hint if set
+8. Determine GPU usage (preference + availability + GPU-only mode)
+9. Configure GPU params if using GPU
+10. Remap labels to contiguous {0,1,2}
+11. Create train/val split (time-series aware with embargo)
+12. Calculate class weights (library-specific format)
+13. Detect binary vs multiclass
+14. Configure objective/loss
+15. Build model with params
+16. Fit with early stopping
+17. If GPU training fails (LightGBM only): fallback to CPU or skip
+
+PREDICT_PROBA WORKFLOW:
+1. Check if model disabled (GPU-only mode)
+2. Check if model loaded
+3. Augment time features if 'close' exists
+4. Call model.predict_proba(x)
+5. Extract model classes
+6. Reorder to [Neutral, Buy, Sell] format
+7. Return Array2<f32>
+
+================================================================================
+EDGE CASES TO HANDLE
+================================================================================
+
+1. Empty/small datasets (< 500 samples): skip train/val split
+2. Binary classification (2 classes): adjust objective/output
+3. Missing 'close' column: skip feature augmentation
+4. Non-DatetimeIndex: skip time ordering check
+5. GPU unavailable + GPU-only mode: skip model entirely
+6. Model load failure: log warning, continue
+7. Classes extraction failure: use fallback mapping
+8. Train/val split failure: fallback to simple positional split
+9. GPU training failure (LightGBM): fallback to CPU (unless GPU-only)
+10. Inf/NaN in features: replace before training
+
+================================================================================
+TESTING REQUIREMENTS
+================================================================================
+
+1. Label remapping correctness: -1->0, 0->1, 1->2
+2. Output reordering correctness: [Neutral, Buy, Sell]
+3. Time feature augmentation: verify lag/vol/mom calculations
+4. GPU distribution: verify different idx values use different GPUs
+5. Class weighting: verify different formats for each library
+6. Binary vs multiclass: verify objective switches correctly
+7. Early stopping: verify training stops after patience epochs
+8. Time ordering: verify re-sorting works correctly
+9. GPU fallback: verify LightGBM falls back to CPU on failure
+10. GPU-only mode: verify models skip when GPU unavailable
+
+================================================================================
+COMPATIBILITY MATRIX
+================================================================================
+
+Library Versions (Python):
+- lightgbm >= 4.6.0
+- xgboost >= 2.1.0
+- catboost >= 1.2.7
+
+Rust Crate Versions:
+- lightgbm-rust = "0.1.1"
+- xgboost-rust = "0.1.0"
+- catboost-rust = "0.3.6"
+
+IMPORTANT: Verify FFI compatibility between Rust bindings and Python library versions!
+
+================================================================================
+IMPLEMENTATION CHECKLIST
+================================================================================
+
+[ ] Create tree_models.rs module
+[ ] Implement helper functions (remap, reorder, augment, etc.)
+[ ] Implement TreeModelConfig struct
+[ ] Implement TreeModel trait
+[ ] Implement LightGBMExpert
+    [ ] fit() with all edge cases
+    [ ] predict_proba() with reordering
+    [ ] save/load
+    [ ] GPU fallback logic
+[ ] Implement XGBoostExpert
+    [ ] fit() with all edge cases
+    [ ] predict_proba() with reordering
+    [ ] save/load
+[ ] Implement CatBoostExpert
+    [ ] fit() with all edge cases
+    [ ] predict_proba() with reordering
+    [ ] save/load
+[ ] Implement variant models (CatBoostAlt, XGBoostRF, XGBoostDART)
+[ ] Write comprehensive tests
+[ ] Benchmark against Python implementation
+[ ] Document environment variables
+[ ] Create examples
+
+================================================================================
+NOTES
+================================================================================
+
+- DO NOT SIMPLIFY! Every edge case exists for a reason (HPC production system)
+- GPU distribution critical for 8-GPU HPC setup
+- Label remapping prevents "Label Drift" bug (columns swap)
+- Time-series split with embargo prevents look-ahead bias
+- Class weighting handles imbalanced data (critical for trading)
+- GPU-only mode allows forcing GPU-only experiments
+- Variant models provide ensemble diversity
+
+================================================================================
+END OF SPECIFICATION
+================================================================================

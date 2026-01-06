@@ -1,0 +1,408 @@
+================================================================================
+PYTHON TO RUST MIGRATION PLAN - FOREX AI TRADING SYSTEM
+GIL-FREE, HIGH-PERFORMANCE ARCHITECTURE
+================================================================================
+
+MIGRATION STATUS: Phase 1 - Planning Complete
+Last Updated: 2026-01-06
+
+================================================================================
+TIER 1: PRODUCTION-READY RUST LIBRARIES (USE IMMEDIATELY)
+================================================================================
+
+TREE MODELS (GRADIENT BOOSTING) - PRIORITY: CRITICAL
+├─ XGBoost       → xgboost-rust 0.1.0      ⭐⭐⭐⭐⭐
+├─ LightGBM      → lightgbm-rust 0.1.1     ⭐⭐⭐⭐⭐
+└─ CatBoost      → catboost-rust 0.3.6     ⭐⭐⭐⭐⭐
+   Status: FFI bindings to C++ libraries (same as Python)
+   Impact: 70% of models GIL-free
+   Timeline: 1 week
+
+DATA PROCESSING - PRIORITY: CRITICAL
+├─ Pandas        → polars 0.52.0           ⭐⭐⭐⭐⭐ (30x faster)
+├─ NumPy         → ndarray 0.17 + rayon    ⭐⭐⭐⭐⭐ (already using)
+└─ scikit-learn  → linfa                   ⭐⭐⭐⭐⭐ (25x faster)
+   Status: Production ready
+   Impact: Foundation for everything
+   Timeline: 2 weeks
+
+SPECIALIZED MODELS - PRIORITY: HIGH
+├─ KAN           → burn-efficient-kan 0.1.2 ⭐⭐⭐⭐⭐ (Pure Rust!)
+├─ CMA-ES        → cmaes 0.2.1              ⭐⭐⭐⭐⭐
+├─ Genetic Algo  → genevo, genetic_algorithm ⭐⭐⭐⭐⭐
+└─ Clustering    → linfa-clustering         ⭐⭐⭐⭐⭐
+   Status: Ready to use
+   Timeline: 2-3 weeks
+
+================================================================================
+TIER 2: BURN FRAMEWORK (IMPLEMENT IN PURE RUST)
+================================================================================
+
+PRIMARY DEEP LEARNING FRAMEWORK: Burn
+- Multi-backend: CUDA, WGPU, NdArray
+- Pure Rust, production-ready
+- GPU acceleration built-in
+
+MODELS TO IMPLEMENT:
+├─ MLP           → burn::nn (built-in)      Difficulty: ⭐ (1 week)
+├─ LSTM/RNN      → burn::nn::lstm           Difficulty: ⭐⭐ (2 weeks)
+├─ CNN/ResNet    → burn::nn::conv           Difficulty: ⭐⭐ (2 weeks)
+├─ VAE           → Tutorial available       Difficulty: ⭐⭐⭐ (3 weeks)
+├─ GAN           → Burn WGAN example        Difficulty: ⭐⭐⭐ (3 weeks)
+├─ NBEATS        → Custom (MLP-based)       Difficulty: ⭐⭐⭐ (3 weeks)
+├─ TiDE          → Custom (encoder-decoder) Difficulty: ⭐⭐⭐ (3 weeks)
+└─ TabNet        → Custom (attention)       Difficulty: ⭐⭐⭐⭐ (4 weeks)
+
+RESOURCES:
+- Burn VAE Tutorial (Dec 2025): https://medium.com/@alfred.weirich/...
+- ClawFoxyVision: LSTM/GRU time series examples
+- Official Burn repo: WGAN MNIST example
+
+================================================================================
+TIER 3: CANDLE FRAMEWORK (FOR TRANSFORMERS)
+================================================================================
+
+USE FOR: Transformer-based models
+- HuggingFace integration
+- FlashAttention v3 support
+- Pre-built architectures
+
+MODELS:
+├─ Transformers  → candle-transformers      ⭐⭐⭐⭐⭐
+├─ Self-Attention→ candle-flash-attn-3      ⭐⭐⭐⭐⭐
+├─ BERT/GPT2     → rust-bert                ⭐⭐⭐⭐⭐
+└─ Tokenizers    → tokenizers (HuggingFace) ⭐⭐⭐⭐⭐
+
+Timeline: 2-3 weeks
+
+================================================================================
+TIER 4: MUONTS - GLUONTS MODELS IN RUST!
+================================================================================
+
+CRITICAL DISCOVERY: MuonTS ports GluonTS models to Rust using Burn
+
+CONFIRMED MODELS:
+└─ TFT (Temporal Fusion Transformer) ✅ IMPLEMENTED
+   Docs: https://docs.rs/muonts/latest/muonts/models/tft/tfe/
+
+LIKELY MODELS (needs verification):
+├─ DeepAR        ⚠️ (GluonTS model, likely in MuonTS)
+└─ Other GluonTS models
+
+ACTION: Investigate MuonTS immediately - could replace NBEATS, TiDE!
+Timeline: 1 week investigation
+
+================================================================================
+TIER 5: STRATEGIC ALTERNATIVES (ONNX EXPORT)
+================================================================================
+
+REINFORCEMENT LEARNING
+├─ Python: stable-baselines3, tianshou
+├─ Rust: border (DQN, SAC, IQN) - immature
+└─ STRATEGY: Train in Python → Export to ONNX → Inference in Rust (ort)
+   Impact: No runtime GIL, policies run in Rust
+
+NORMALIZING FLOWS
+├─ Python: normflows, etc.
+├─ Rust: None found
+└─ STRATEGY: Implement in Burn OR train in Python → ONNX export
+   Priority: Low (unless critical)
+
+METATRADER 5 INTEGRATION - CRITICAL
+├─ Option A: Rust FFI bindings (rust-bindgen)  ⭐⭐⭐⭐ Very Hard
+├─ Option B: REST API (mt5-rest)               ⭐⭐ Medium
+└─ Option C: Python subprocess                 ⭐ Easy
+   RECOMMENDATION: Start with C, migrate to B, then A if needed
+   Impact: Critical for trading execution
+
+================================================================================
+IMPLEMENTATION PHASES
+================================================================================
+
+PHASE 1: QUICK WINS (2-3 weeks) - START HERE
+┌──────────────────────────────────────────────────┐
+│ 1. Tree Models (xgboost-rust, lightgbm-rust)    │
+│    - Add to forex-models Cargo.toml             │
+│    - Create wrapper API                          │
+│    - Test with existing data                     │
+│    Timeline: 1 week                              │
+│                                                  │
+│ 2. Data Processing (polars, ndarray)            │
+│    - Port data loading to polars                 │
+│    - Replace pandas operations                   │
+│    Timeline: 1 week                              │
+│                                                  │
+│ 3. Feature Engineering (linfa)                   │
+│    - Port sklearn preprocessing                  │
+│    Timeline: 1 week                              │
+│                                                  │
+│ RESULT: 70-80% of models GIL-free, 10-30x speed │
+└──────────────────────────────────────────────────┘
+
+PHASE 2: DEEP LEARNING FOUNDATION (3-4 weeks)
+┌──────────────────────────────────────────────────┐
+│ 1. Set up Burn framework                        │
+│    - Add burn dependencies                       │
+│    - Configure CUDA backend                      │
+│    Timeline: 3 days                              │
+│                                                  │
+│ 2. MLP + KAN                                     │
+│    - Implement MLP using burn::nn                │
+│    - Integrate burn-efficient-kan                │
+│    Timeline: 1 week                              │
+│                                                  │
+│ 3. LSTM/RNN                                      │
+│    - Use burn::nn::lstm                          │
+│    - Port existing LSTM models                   │
+│    Timeline: 2 weeks                             │
+│                                                  │
+│ 4. Investigate MuonTS                            │
+│    - Test TFT model                              │
+│    - Check for DeepAR, other models              │
+│    Timeline: 1 week                              │
+│                                                  │
+│ RESULT: Core DL ready, GPU acceleration enabled │
+└──────────────────────────────────────────────────┘
+
+PHASE 3: SPECIALIZED MODELS (4-6 weeks)
+┌──────────────────────────────────────────────────┐
+│ 1. Transformers (candle-transformers, rust-bert)│
+│    Timeline: 2 weeks                             │
+│                                                  │
+│ 2. NBEATS (Burn OR MuonTS)                       │
+│    Timeline: 3 weeks                             │
+│                                                  │
+│ 3. TiDE (Burn OR MuonTS)                         │
+│    Timeline: 3 weeks                             │
+│                                                  │
+│ 4. TabNet (Burn implementation OR ONNX)          │
+│    Timeline: 4 weeks                             │
+│                                                  │
+│ 5. VAE/GAN (Burn examples)                       │
+│    Timeline: 3 weeks                             │
+│                                                  │
+│ RESULT: All models except RL in pure Rust       │
+└──────────────────────────────────────────────────┘
+
+PHASE 4: PRODUCTION DEPLOYMENT (2-3 weeks)
+┌──────────────────────────────────────────────────┐
+│ 1. MT5 Integration                               │
+│    - Start: Python subprocess                    │
+│    - Later: REST API (mt5-rest)                  │
+│    Timeline: 2 weeks                             │
+│                                                  │
+│ 2. RL Policies                                   │
+│    - Train in Python                             │
+│    - Export to ONNX                              │
+│    - Load in Rust via ort                        │
+│    Timeline: 1 week                              │
+│                                                  │
+│ 3. Normalizing Flows (optional)                  │
+│    - ONNX export or skip                         │
+│                                                  │
+│ RESULT: 95%+ GIL-free, production-ready          │
+└──────────────────────────────────────────────────┘
+
+================================================================================
+FINAL ARCHITECTURE (100% GIL-FREE)
+================================================================================
+
+┌─────────────────────────────────────────────────┐
+│  RUST MAIN RUNTIME (forex-cli binary)          │
+│  ✅ No GIL, full multi-core parallelism         │
+│  ✅ GPU acceleration (CUDA)                     │
+└─────────────────────────────────────────────────┘
+            │
+    ┌───────┼───────┐
+    │       │       │
+Data Layer  ML      Training
+    │       │       │
+polars  Tree Models  Burn
+ndarray ONNX (ort)   Rayon
+linfa   Burn models  CUDA
+        Candle
+        MuonTS
+            │
+    ┌───────┴───────┐
+    │               │
+MT5 (Process)   RL (Offline)
+    │               │
+REST API    Python→ONNX
+Subprocess  Load in Rust
+No GIL      No runtime GIL
+
+================================================================================
+DEPENDENCY ADDITIONS
+================================================================================
+
+[forex-models/Cargo.toml]
+xgboost-rust = "0.1.0"
+lightgbm-rust = "0.1.1"
+catboost-rust = "0.3.6"
+burn = "0.19.0"
+burn-cuda = "0.19.0"
+burn-efficient-kan = "0.1.2"
+ort = "2.0.0-rc.10"  # ONNX runtime
+muonts = "*"  # Check latest version
+
+[forex-data/Cargo.toml]
+polars = "0.52.0"
+linfa = "*"
+linfa-clustering = "*"
+
+[forex-bindings/Cargo.toml]
+# Already has pyo3, numpy
+
+[NEW: forex-transformers/Cargo.toml]
+candle-core = "*"
+candle-transformers = "*"
+candle-flash-attn-3 = "*"
+rust-bert = "*"
+tokenizers = "*"
+
+================================================================================
+CRATE STRUCTURE
+================================================================================
+
+forex-ai/
+├─ crates/
+│  ├─ forex-core/         ✅ Done (config, logging, storage, system)
+│  ├─ forex-data/         🔄 In Progress (add polars, linfa)
+│  ├─ forex-models/       🔄 Expand (add tree models, burn, ort)
+│  ├─ forex-search/       ✅ Done (genetic algorithms)
+│  ├─ forex-bindings/     🔄 Expand (expose more to Python)
+│  ├─ forex-cli/          🔄 Update (main Rust runtime)
+│  └─ forex-transformers/ ❌ NEW (candle, rust-bert)
+└─ src/forex_bot/         🔄 Keep for training, export ONNX
+
+================================================================================
+KEY RESOURCES
+================================================================================
+
+CRATES:
+- burn-efficient-kan: https://crates.io/crates/burn-efficient-kan
+- MuonTS: https://lib.rs/crates/muonts
+- MuonTS TFT docs: https://docs.rs/muonts/latest/muonts/models/tft/
+- Candle: https://github.com/huggingface/candle
+- rust-bert: https://github.com/guillaume-be/rust-bert
+- linfa: https://github.com/rust-ml/linfa
+- polars: https://github.com/pola-rs/polars
+
+TUTORIALS:
+- Burn VAE: https://medium.com/@alfred.weirich/rust-burn-building-a-variational-autoencoder-for-mnist-part-4-b9c345b96421
+- ClawFoxyVision: https://github.com/rustic-ml/ClawFoxyVision
+- Candle tutorial: https://github.com/ToluClassics/candle-tutorial
+
+BENCHMARKS:
+- Linfa 25x faster: https://lpalmieri.com/posts/2019-12-01-taking-ml-to-production-with-rust-a-25x-speedup/
+- Polars 30x faster: https://towardsdatascience.com/rust-polars-unlocking-high-performance-data-analysis-part-1-ce42af370ece/
+
+================================================================================
+IMMEDIATE NEXT STEPS
+================================================================================
+
+RECOMMENDED START: Option 1 - Port Tree Models
+
+[ ] 1. Add tree model dependencies to forex-models/Cargo.toml
+[ ] 2. Create tree_models.rs module
+[ ] 3. Implement wrappers for XGBoost, LightGBM, CatBoost
+[ ] 4. Write tests with existing data
+[ ] 5. Update forex-bindings to expose tree models to Python
+[ ] 6. Benchmark vs Python implementations
+
+ALTERNATIVE: Option 2 - Investigate MuonTS + Burn
+
+[ ] 1. Add muonts and burn to Cargo.toml
+[ ] 2. Test MuonTS TFT model
+[ ] 3. Implement simple MLP in Burn
+[ ] 4. Test GPU acceleration
+[ ] 5. Document findings
+
+ALTERNATIVE: Option 3 - Data Pipeline
+
+[ ] 1. Add polars to forex-data/Cargo.toml
+[ ] 2. Port data loading from pandas to polars
+[ ] 3. Add linfa for feature engineering
+[ ] 4. Create Rust data pipeline
+[ ] 5. Benchmark performance
+
+================================================================================
+SUCCESS METRICS
+================================================================================
+
+Phase 1 Complete:
+✅ Tree models running in Rust
+✅ 10-30x speedup vs Python
+✅ 70% of models GIL-free
+✅ Data pipeline in polars
+
+Phase 2 Complete:
+✅ Burn framework integrated
+✅ MLP, LSTM, KAN working
+✅ GPU acceleration enabled
+✅ MuonTS evaluated
+
+Phase 3 Complete:
+✅ Transformers via Candle
+✅ NBEATS, TiDE implemented
+✅ 95% of models in Rust
+
+Phase 4 Complete:
+✅ MT5 integration working
+✅ RL policies via ONNX
+✅ 100% production deployment
+✅ Full GIL-free runtime
+
+================================================================================
+RISK MITIGATION
+================================================================================
+
+Risk: Complex models hard to implement in Rust
+Mitigation: Use ONNX export for edge cases, prioritize high-impact models
+
+Risk: MT5 integration breaks
+Mitigation: Start with Python subprocess, gradual migration to REST/FFI
+
+Risk: Performance not as expected
+Mitigation: Benchmark each phase, compare with Python baseline
+
+Risk: GPU compatibility issues
+Mitigation: Test on target hardware early, Burn supports multiple backends
+
+Risk: Team learning curve
+Mitigation: Start with simple models, extensive documentation, gradual rollout
+
+================================================================================
+TIMELINE SUMMARY
+================================================================================
+
+Total Estimated Time: 11-17 weeks (3-4 months)
+
+Week 1-3:   Phase 1 (Quick Wins)
+Week 4-7:   Phase 2 (Deep Learning Foundation)
+Week 8-13:  Phase 3 (Specialized Models)
+Week 14-17: Phase 4 (Production Deployment)
+
+CRITICAL PATH:
+1. Tree models (Week 1)
+2. Data pipeline (Week 2-3)
+3. Burn setup (Week 4)
+4. MuonTS investigation (Week 5)
+5. Core models (Week 6-10)
+6. MT5 integration (Week 14-15)
+
+================================================================================
+NOTES
+================================================================================
+
+- Python bindings ONLY for training complex models, NOT runtime inference
+- All inference must be GIL-free (Rust or ONNX)
+- GPU acceleration critical for deep learning models
+- MuonTS could significantly reduce implementation time
+- Prioritize high-impact, low-risk migrations first
+- Keep Python codebase for model development/experimentation
+- Export to ONNX for production deployment
+
+================================================================================
+END OF MIGRATION PLAN
+================================================================================

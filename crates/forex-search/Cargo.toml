@@ -12,4 +12,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 statrs = "0.16"
 forex-data = { path = "../forex-data" }
-forex_core = { path = "../../rust_core" }
+forex-core = { path = "../forex-core" }

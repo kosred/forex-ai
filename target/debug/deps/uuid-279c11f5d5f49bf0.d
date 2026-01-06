@@ -1,0 +1,13 @@
+C:\Users\konst\development\forex-ai\target\debug\deps\uuid-279c11f5d5f49bf0.d: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\lib.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\macros.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\builder.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\error.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\non_nil.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\parser.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\fmt.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\timestamp.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\external.rs
+
+C:\Users\konst\development\forex-ai\target\debug\deps\libuuid-279c11f5d5f49bf0.rmeta: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\lib.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\macros.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\builder.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\error.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\non_nil.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\parser.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\fmt.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\timestamp.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\external.rs
+
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\lib.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\macros.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\builder.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\error.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\non_nil.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\parser.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\fmt.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\timestamp.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\uuid-1.19.0\src\external.rs:

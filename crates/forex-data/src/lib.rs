@@ -104,9 +104,9 @@ impl FeatureCache {
         std::fs::create_dir_all(&self.dir)?;
         let mut path = self.dir.clone();
         path.push(format!("{key}.parquet"));
-        let df = feature_frame_to_df(frame)?;
+        let mut df = feature_frame_to_df(frame)?;
         let file = std::fs::File::create(&path)?;
-        ParquetWriter::new(file).finish(&df)?;
+        ParquetWriter::new(file).finish(&mut df)?;
         Ok(())
     }
 }
@@ -135,7 +135,9 @@ fn series_to_f64(series: &Series) -> Result<Vec<f64>> {
 
 fn series_to_f32(series: &Series, n_rows: usize) -> Vec<f32> {
     let mut out = vec![0.0_f32; n_rows];
-    let casted = series.cast(&DataType::Float64).unwrap_or_else(|_| series.clone());
+    let casted = series
+        .cast(&DataType::Float64)
+        .unwrap_or_else(|_| series.clone());
     if let Ok(chunked) = casted.f64() {
         for (i, v) in chunked.into_iter().enumerate().take(n_rows) {
             out[i] = v.unwrap_or(0.0) as f32;
@@ -144,11 +146,12 @@ fn series_to_f32(series: &Series, n_rows: usize) -> Vec<f32> {
     out
 }
 
-fn find_series<'a>(df: &'a DataFrame, candidates: &[&str]) -> Option<&'a Series> {
+fn find_series(df: &DataFrame, candidates: &[&str]) -> Option<Series> {
     for name in df.get_column_names() {
         let lower = name.to_ascii_lowercase();
         if candidates.iter().any(|c| lower == *c) {
-            return df.column(name).ok();
+            // In polars 0.47, column() returns &Column, convert to Series
+            return df.column(name).ok().map(|col| col.as_materialized_series().clone());
         }
     }
     None
@@ -165,24 +168,24 @@ fn extract_timestamps(df: &DataFrame) -> Result<Option<Vec<i64>>> {
 }
 
 fn feature_frame_to_df(frame: &FeatureFrame) -> Result<DataFrame> {
-    let mut cols: Vec<Series> = Vec::with_capacity(frame.names.len() + 1);
-    cols.push(Series::new("timestamp", frame.timestamps.clone()));
+    let mut cols: Vec<Column> = Vec::with_capacity(frame.names.len() + 1);
+    cols.push(Series::new("timestamp".into(), frame.timestamps.clone()).into());
     for (idx, name) in frame.names.iter().enumerate() {
         let mut col = Vec::with_capacity(frame.data.nrows());
         for row in 0..frame.data.nrows() {
             col.push(frame.data[(row, idx)]);
         }
-        cols.push(Series::new(name.as_str(), col));
+        cols.push(Series::new(name.as_str().into(), col).into());
     }
     Ok(DataFrame::new(cols)?)
 }
 
 fn df_to_feature_frame(df: &DataFrame) -> Result<FeatureFrame> {
-    let timestamps = extract_timestamps(df)?
-        .context("cached features missing timestamp column")?;
+    let timestamps = extract_timestamps(df)?.context("cached features missing timestamp column")?;
     let mut names = Vec::new();
     let mut columns: Vec<Vec<f32>> = Vec::new();
-    for series in df.get_columns() {
+    for col in df.get_columns() {
+        let series = col.as_materialized_series();
         if series.name().eq_ignore_ascii_case("timestamp") {
             continue;
         }
@@ -212,22 +215,18 @@ pub fn load_parquet(path: impl AsRef<Path>) -> Result<Ohlcv> {
     let df = ParquetReader::new(file).finish()?;
 
     let timestamp = extract_timestamps(&df)?;
-    let open = find_series(&df, &["open", "o"])
-        .context("missing open column")?;
-    let high = find_series(&df, &["high", "h"])
-        .context("missing high column")?;
-    let low = find_series(&df, &["low", "l"])
-        .context("missing low column")?;
-    let close = find_series(&df, &["close", "c"])
-        .context("missing close column")?;
+    let open = find_series(&df, &["open", "o"]).context("missing open column")?;
+    let high = find_series(&df, &["high", "h"]).context("missing high column")?;
+    let low = find_series(&df, &["low", "l"]).context("missing low column")?;
+    let close = find_series(&df, &["close", "c"]).context("missing close column")?;
     let volume = find_series(&df, &["volume", "vol", "v"]);
 
-    let open = series_to_f64(open)?;
-    let high = series_to_f64(high)?;
-    let low = series_to_f64(low)?;
-    let close = series_to_f64(close)?;
+    let open = series_to_f64(&open)?;
+    let high = series_to_f64(&high)?;
+    let low = series_to_f64(&low)?;
+    let close = series_to_f64(&close)?;
     let volume = match volume {
-        Some(series) => Some(series_to_f64(series)?),
+        Some(ref series) => Some(series_to_f64(series)?),
         None => None,
     };
 
@@ -256,10 +255,7 @@ pub fn load_parquet(path: impl AsRef<Path>) -> Result<Ohlcv> {
     })
 }
 
-pub fn load_symbol_dataset(
-    root: impl AsRef<Path>,
-    symbol: &str,
-) -> Result<SymbolDataset> {
+pub fn load_symbol_dataset(root: impl AsRef<Path>, symbol: &str) -> Result<SymbolDataset> {
     let tfs = discover_timeframes(&root, symbol)?;
     if tfs.is_empty() {
         bail!("no timeframes discovered for symbol={}", symbol);
@@ -303,11 +299,11 @@ pub fn compute_talib_features(ohlcv: &Ohlcv) -> Result<FeatureMatrix> {
         .unwrap_or_else(|| vec![0.0_f64; n_rows]);
 
     let mut df = DataFrame::new(vec![
-        Series::new("open", ohlcv.open.clone()),
-        Series::new("high", ohlcv.high.clone()),
-        Series::new("low", ohlcv.low.clone()),
-        Series::new("close", ohlcv.close.clone()),
-        Series::new("volume", volume),
+        Series::new("open".into(), ohlcv.open.clone()).into(),
+        Series::new("high".into(), ohlcv.high.clone()).into(),
+        Series::new("low".into(), ohlcv.low.clone()).into(),
+        Series::new("close".into(), ohlcv.close.clone()).into(),
+        Series::new("volume".into(), volume).into(),
     ])?;
 
     let original_cols: HashSet<String> = df
@@ -321,9 +317,10 @@ pub fn compute_talib_features(ohlcv: &Ohlcv) -> Result<FeatureMatrix> {
 
     let mut names = Vec::new();
     let mut columns = Vec::new();
-    for series in df.get_columns() {
+    for col in df.get_columns() {
+        let series = col.as_materialized_series();
         let name = series.name();
-        if original_cols.contains(name) {
+        if original_cols.contains(name.as_str()) {
             continue;
         }
         let mut col_name = String::from("ta_");
@@ -360,12 +357,12 @@ pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<F
         .unwrap_or_else(|| vec![0.0_f64; n_rows]);
 
     let mut df = DataFrame::new(vec![
-        Series::new("timestamp", timestamps),
-        Series::new("open", ohlcv.open.clone()),
-        Series::new("high", ohlcv.high.clone()),
-        Series::new("low", ohlcv.low.clone()),
-        Series::new("close", ohlcv.close.clone()),
-        Series::new("volume", volume),
+        Series::new("timestamp".into(), timestamps).into(),
+        Series::new("open".into(), ohlcv.open.clone()).into(),
+        Series::new("high".into(), ohlcv.high.clone()).into(),
+        Series::new("low".into(), ohlcv.low.clone()).into(),
+        Series::new("close".into(), ohlcv.close.clone()).into(),
+        Series::new("volume".into(), volume).into(),
     ])?;
 
     df = df.sort(["timestamp"], SortMultipleOptions::default())?;
@@ -379,27 +376,28 @@ pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<F
     let df = add_technical_indicators(&mut df)
         .map_err(|e| anyhow::anyhow!("ta-lib-in-rust failed: {e}"))?;
 
-    let timestamps = extract_timestamps(&df)?
-        .context("feature frame missing timestamp column")?;
+    let timestamps = extract_timestamps(&df)?.context("feature frame missing timestamp column")?;
 
     let mut names = Vec::new();
     let mut columns = Vec::new();
 
     if include_raw {
         for raw in ["open", "high", "low", "close", "volume"] {
-            if let Ok(series) = df.column(raw) {
+            if let Ok(col) = df.column(raw) {
+                let series = col.as_materialized_series();
                 names.push(raw.to_string());
                 columns.push(series_to_f32(series, n_rows));
             }
         }
     }
 
-    for series in df.get_columns() {
+    for col in df.get_columns() {
+        let series = col.as_materialized_series();
         let name = series.name();
         if name.eq_ignore_ascii_case("timestamp") {
             continue;
         }
-        if original_cols.contains(name) {
+        if original_cols.contains(name.as_str()) {
             continue;
         }
         let mut col_name = String::from("ta_");

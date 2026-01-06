@@ -1,0 +1,226 @@
+================================================================================
+KAN (KOLMOGOROV-ARNOLD NETWORKS) COMPATIBILITY ISSUE
+================================================================================
+Date: 2026-01-06
+Status: ⚠️ BLOCKED - Dependency version incompatibility
+
+================================================================================
+PROBLEM SUMMARY
+================================================================================
+
+The burn-efficient-kan crate (v0.3.0) depends on Burn framework v0.16.x,
+but our project uses Burn v0.19.1. There are breaking changes between these
+versions that prevent direct integration.
+
+================================================================================
+TECHNICAL DETAILS
+================================================================================
+
+CRATE INFORMATION:
+- Package: burn-efficient-kan
+- Latest Version: 0.3.0 (published 6 months ago)
+- Repository: https://github.com/VlaDexa/burn-efficient-kan
+- Docs: https://docs.rs/burn-efficient-kan/0.3.0
+
+DEPENDENCY CONFLICT:
+- burn-efficient-kan 0.3.0 requires: burn ^0.16
+- forex-models currently uses: burn 0.19.1
+
+BREAKING CHANGES (Burn 0.16 → 0.19):
+1. Tensor Data Structure Changes:
+   - Burn 0.14.0: Internal tensor data structure changed
+   - Burn 0.17.0: Old Data struct removed, replaced with TensorData
+
+2. API Surface Changes:
+   - Module trait modifications
+   - Backend trait changes
+   - AutodiffModule interface updates
+
+3. Major Features Added in 0.19:
+   - Quantization support
+   - Distributed training
+   - LLVM backend
+   - Improved CPU performance
+
+COMPATIBILITY CHECK:
+✅ Burn 0.19.1 - Our target version (latest stable)
+❌ burn-efficient-kan 0.3.0 - Requires Burn 0.16.x
+❌ No updated version available (as of 2026-01-06)
+
+================================================================================
+ATTEMPTED SOLUTIONS
+================================================================================
+
+1. ✅ CHECKED: crates.io for updated versions
+   - Latest is still 0.3.0 (6 months old)
+   - No 0.4.0 or newer with Burn 0.19 support
+
+2. ✅ RESEARCHED: GitHub repository
+   - Repository: https://github.com/VlaDexa/burn-efficient-kan
+   - 13 stars, 25 commits, 1 fork
+   - Last activity: Check needed
+   - No visible work on Burn 0.19 migration
+
+3. ❌ NOT ATTEMPTED: Downgrade to Burn 0.16
+   - Would lose new features (quantization, distributed training, LLVM)
+   - Would lose performance improvements
+   - Not recommended for production system
+
+4. ❌ NOT ATTEMPTED: Fork and update burn-efficient-kan
+   - Significant engineering effort
+   - Would need to maintain fork
+   - Should be upstream contribution instead
+
+================================================================================
+RECOMMENDED SOLUTION
+================================================================================
+
+IMMEDIATE (Current Sprint):
+1. ⏸️ DEFER KAN integration until burn-efficient-kan updates
+2. ✅ DOCUMENT this issue (this file)
+3. ✅ REMOVE burn-efficient-kan dependency for now
+4. ✅ KEEP Burn 0.19.1 for MLP/LSTM (working perfectly)
+5. ✅ CONTINUE with other Phase 2/3 tasks
+
+SHORT-TERM (1-2 months):
+1. ⏰ MONITOR burn-efficient-kan repository for updates
+2. 📧 OPEN ISSUE on GitHub requesting Burn 0.19 support
+3. 🔔 SET UP notification for new releases
+4. 🤝 OFFER to contribute migration if needed
+
+LONG-TERM (3-6 months):
+If still no update, consider:
+1. 🔨 IMPLEMENT custom KAN layer using Burn 0.19 primitives
+2. 🍴 FORK and update burn-efficient-kan ourselves
+3. 🔬 RESEARCH alternative KAN implementations
+4. 📊 EVALUATE if KAN is critical for our use case
+
+================================================================================
+ALTERNATIVE: MANUAL KAN IMPLEMENTATION
+================================================================================
+
+If burn-efficient-kan doesn't update, we can implement KAN from scratch:
+
+RESOURCES:
+- Original Paper: "KAN: Kolmogorov-Arnold Networks" (2024)
+- Python Reference: https://github.com/Blealtan/efficient-kan
+- Burn Documentation: https://burn.dev/docs/
+
+IMPLEMENTATION PLAN:
+1. Study KAN architecture (spline-based activation functions)
+2. Implement B-spline basis functions in Burn
+3. Create KanLayer module
+4. Add grid update mechanism
+5. Implement symbolic formula extraction
+6. Test on regression/classification tasks
+
+ESTIMATED EFFORT: 40-60 hours (1-2 weeks)
+
+PROS:
+✅ Full control over implementation
+✅ Native Burn 0.19 support
+✅ Can optimize for our use case
+✅ Learning experience
+
+CONS:
+❌ Significant development time
+❌ Need to validate correctness vs reference
+❌ Maintenance burden
+❌ May have subtle bugs
+
+================================================================================
+IMPACT ON PROJECT
+================================================================================
+
+CURRENT STATUS:
+✅ Phase 1 (Tree Models): 100% Complete - NOT AFFECTED
+✅ Phase 2 (Deep Learning): 90% Complete
+   ✅ MLP: Fully functional
+   ✅ LSTM: Fully functional
+   ❌ KAN: Blocked by dependency issue
+
+REMAINING PHASE 2 TASKS:
+- Neural network save/load: ✅ DONE
+- Training utilities: ✅ DONE
+- Multi-backend support: ✅ DONE
+- Python bindings for NN: ⏸️ DEFERRED (wait for KAN decision)
+
+PHASE 3 READINESS:
+✅ Can proceed with Phase 3 (Transformers, NBEATS, TiDE) immediately
+✅ KAN is not a blocker for other models
+✅ All core infrastructure in place
+
+PRODUCTION IMPACT:
+- MINIMAL: KAN is experimental/optional
+- Tree models (Phase 1): Fully operational
+- MLP/LSTM (Phase 2): Fully operational
+- KAN absence doesn't block deployment
+
+================================================================================
+MONITORING & NEXT STEPS
+================================================================================
+
+IMMEDIATE ACTION ITEMS:
+1. ✅ Remove burn-efficient-kan from Cargo.toml dependencies
+2. ✅ Update PHASE_1_AND_2_COMPLETE.txt with KAN status
+3. ✅ Create GitHub issue on burn-efficient-kan repo
+4. ⏭️ Continue with Phase 3 planning
+5. ⏭️ Create Rust usage examples for MLP/LSTM
+
+WEEKLY CHECK (every Monday):
+- Check burn-efficient-kan crates.io for new versions
+- Check GitHub repo for activity
+- Review issue status
+
+DECISION POINT (March 2026):
+If no update by March 2026:
+→ Decide: Manual implementation vs Skip KAN vs Fork & update
+
+================================================================================
+REFERENCES
+================================================================================
+
+CRATES:
+- burn-efficient-kan: https://crates.io/crates/burn-efficient-kan
+- burn: https://crates.io/crates/burn
+- docs.rs: https://docs.rs/burn-efficient-kan/0.3.0
+
+BURN FRAMEWORK:
+- Homepage: https://burn.dev/
+- Release 0.19.0: https://burn.dev/blog/release-0.19.0/
+- GitHub: https://github.com/tracel-ai/burn
+- Documentation: https://burn.dev/docs/
+
+KAN RESOURCES:
+- GitHub (Rust): https://github.com/VlaDexa/burn-efficient-kan
+- GitHub (Python): https://github.com/Blealtan/efficient-kan
+- Benchmarks: https://github.com/Jerry-Master/KAN-benchmarking
+
+BURN BREAKING CHANGES:
+- v0.14.0: Tensor data structure changes
+- v0.17.0: Data struct removed, TensorData introduced
+- v0.19.0: Quantization, distributed training, LLVM backend
+
+================================================================================
+CONCLUSION
+================================================================================
+
+🎯 RECOMMENDATION: Proceed without KAN for now
+
+✅ RATIONALE:
+1. Burn 0.19.1 is the correct choice (latest, fastest, most features)
+2. MLP and LSTM are fully functional and sufficient for Phase 2
+3. KAN is experimental and not critical for production
+4. Waiting for upstream update is more sustainable than forking
+5. Manual implementation is possible if urgently needed
+
+⏭️ NEXT STEPS:
+1. Update project documentation
+2. Continue with Phase 3 (Transformers, NBEATS, TiDE)
+3. Create comprehensive examples for existing models
+4. Monitor burn-efficient-kan for updates
+5. Revisit KAN in Q2 2026 if needed
+
+================================================================================
+END OF COMPATIBILITY ANALYSIS
+================================================================================

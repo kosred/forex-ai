@@ -6,5 +6,5 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 polars = { version = "0.47.1", features = ["lazy", "parquet", "dtype-full", "temporal"] }
-ndarray = { version = "0.15", features = ["rayon"] }
+ndarray = { version = "0.17", features = ["rayon"] }
 ta-lib-in-rust = "1.0.8"

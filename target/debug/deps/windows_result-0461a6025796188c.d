@@ -1,0 +1,11 @@
+C:\Users\konst\development\forex-ai\target\debug\deps\windows_result-0461a6025796188c.d: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\lib.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\bindings.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\com.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\strings.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\bstr.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\error.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\hresult.rs
+
+C:\Users\konst\development\forex-ai\target\debug\deps\libwindows_result-0461a6025796188c.rmeta: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\lib.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\bindings.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\com.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\strings.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\bstr.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\error.rs C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\hresult.rs
+
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\lib.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\bindings.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\com.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\strings.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\bstr.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\error.rs:
+C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-result-0.2.0\src\hresult.rs:
