@@ -4,6 +4,7 @@ Thread-safe implementation for HPC environments.
 """
 
 import logging
+import os
 import threading
 import importlib
 from typing import TYPE_CHECKING, Any, Dict, Type
@@ -40,6 +41,29 @@ MODEL_MAPPING = {
     "unsupervised": ("unsupervised", "ClusterExpert"),
 }
 
+_RUST_TREE_MAPPING = {
+    "lightgbm": "RustLightGBMExpert",
+    "xgboost": "RustXGBoostExpert",
+    "xgboost_rf": "RustXGBoostRFExpert",
+    "xgboost_dart": "RustXGBoostDARTExpert",
+}
+
+
+def _use_rust_tree_models() -> bool:
+    """Return True if Rust tree bindings should be preferred."""
+    raw = os.environ.get("FOREX_BOT_TREE_BACKEND", "auto").strip().lower()
+    if raw in {"rust", "1", "true", "yes", "on"}:
+        return True
+    if raw in {"python", "py", "0", "false", "no", "off"}:
+        return False
+    # auto: try to detect bindings
+    try:
+        import forex_bindings  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
 def register_model(name: str, module_path: str, class_name: str) -> None:
     """Dynamically registers a new model type."""
     with _REGISTRY_LOCK:
@@ -59,6 +83,12 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
             raise ValueError(f"Model '{name}' not found in registry.")
         
         module_name, class_name = MODEL_MAPPING[name]
+        rust_requested = False
+
+        if name in _RUST_TREE_MAPPING and _use_rust_tree_models():
+            module_name = "trees_rust"
+            class_name = _RUST_TREE_MAPPING[name]
+            rust_requested = True
 
         # Handle CPU fallback for GPU models if needed
         if not prefer_gpu and name in {"kan", "nbeats", "tabnet", "tide"}:
@@ -68,9 +98,32 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
             # Import with package context
             module = importlib.import_module(f".{module_name}", package="forex_bot.models")
             cls = getattr(module, class_name)
+            if rust_requested and getattr(cls, "_model_cls", None) is None:
+                raise ImportError(f"Rust bindings missing class for {name}")
             _CLASS_CACHE[name] = cls
             return cls
         except Exception as e:
+            if rust_requested:
+                # Rust bindings failed; fall back to Python implementation.
+                base_module, base_class = MODEL_MAPPING[name]
+                try:
+                    module = importlib.import_module(f".{base_module}", package="forex_bot.models")
+                    cls = getattr(module, base_class)
+                    _CLASS_CACHE[name] = cls
+                    logger.warning(
+                        "Rust bindings unavailable for '%s' (error: %s); using Python model.",
+                        name,
+                        e,
+                    )
+                    return cls
+                except Exception as py_exc:
+                    logger.error(
+                        "Python fallback import failed for '%s' after Rust error: %s",
+                        name,
+                        py_exc,
+                    )
+                    raise ImportError(f"Could not load model {name}") from py_exc
+
             # If GPU module import fails, try CPU implementation as fallback.
             if name in {"kan", "nbeats", "tabnet", "tide"} and module_name.endswith("_gpu"):
                 try:

@@ -175,10 +175,11 @@ if gpu_count > 0:
     except Exception:
         pass
 
-# Rust acceleration (CPU-heavy paths) - safe no-op if module is not built.
+# Rust acceleration (CPU-heavy paths) - safe no-op if module is not built.      
 rust_threads = remaining if gpu_count > 0 else cpu_budget
 if auto_mode:
     os.environ["FOREX_BOT_RUST_ACCEL"] = "1"
+    os.environ.setdefault("FOREX_BOT_TREE_BACKEND", "rust")
     os.environ["FOREX_BOT_RUST_THREADS"] = str(rust_threads)
     os.environ["RAYON_NUM_THREADS"] = str(rust_threads)
     os.environ["FOREX_BOT_RUST_EVO"] = "1"
@@ -186,6 +187,7 @@ if auto_mode:
     os.environ["FOREX_BOT_RUST_FEATURES_ONLY"] = "1"
 else:
     os.environ.setdefault("FOREX_BOT_RUST_ACCEL", "1")
+    os.environ.setdefault("FOREX_BOT_TREE_BACKEND", "rust")
     os.environ.setdefault("FOREX_BOT_RUST_THREADS", str(rust_threads))
     os.environ.setdefault("RAYON_NUM_THREADS", str(rust_threads))
     os.environ.setdefault("FOREX_BOT_RUST_EVO", "1")

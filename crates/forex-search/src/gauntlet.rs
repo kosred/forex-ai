@@ -61,7 +61,7 @@ impl StrategyGauntlet {
         let signals = signals_for_gene(features, gene);
         let (months, days) = month_day_indices(&features.timestamps);
 
-        let metrics = forex_core::fast_evaluate_strategy_core(
+        let metrics = crate::eval::fast_evaluate_strategy_core(
             &ohlcv.close,
             &ohlcv.high,
             &ohlcv.low,

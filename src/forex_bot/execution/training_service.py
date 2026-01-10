@@ -793,6 +793,7 @@ class TrainingService:
             max_rows=int(getattr(self.settings.system, "discovery_max_rows", 0) or 0),
             stream_mode=bool(getattr(self.settings.system, "discovery_stream", False)),
             auto_cap=bool(getattr(self.settings.system, "discovery_auto_cap", True)),
+            settings=self.settings,
         )
         
         # We need to pass the enriched multi-timeframe frames to the engine
@@ -1859,7 +1860,11 @@ class TrainingService:
                 await self._run_prop_search_for_symbols(symbols, stop_event=stop_event)
 
         def _run_discovery() -> None:
-            discovery_tensor = TensorDiscoveryEngine(n_experts=100, timeframes=timeframes)
+            discovery_tensor = TensorDiscoveryEngine(
+                n_experts=100,
+                timeframes=timeframes,
+                settings=self.settings,
+            )
             discovery_tensor.run_unsupervised_search(discovery_frames, iterations=1000)
             discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 

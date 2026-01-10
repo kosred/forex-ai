@@ -251,7 +251,7 @@ pub fn evaluate_genes(
     let use_premium: Vec<i8> = genes.iter().map(|g| if g.use_premium_discount { 1 } else { 0 }).collect();
     let use_inducement: Vec<i8> = genes.iter().map(|g| if g.use_inducement { 1 } else { 0 }).collect();
 
-    let metrics = forex_core::evaluate_population_core(
+    let metrics = crate::eval::evaluate_population_core(
         &ohlcv.close,
         &ohlcv.high,
         &ohlcv.low,

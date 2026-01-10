@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2};
 use polars::prelude::*;
 use std::collections::HashMap;
 

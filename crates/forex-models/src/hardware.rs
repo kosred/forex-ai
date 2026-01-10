@@ -3,9 +3,7 @@
 // NO SIMPLIFICATION - Preserves all hardware profiling logic
 // REMOVES: Python multiprocessing, GIL-related threading workarounds
 
-use anyhow::{Context, Result};
 use std::env;
-use std::time::Instant;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "tch")]
@@ -31,7 +29,7 @@ impl HardwareInfo {
     /// This is what Python needed multiprocessing to emulate
     pub fn detect() -> Self {
         let cpu_cores = num_cpus::get();
-        let cpu_cores_usable = cpu_cores.saturating_sub(1); // Reserve 1 for OS
+        let cpu_cores_usable = cpu_cores.saturating_sub(1).max(1); // Reserve 1 for OS 
 
         let (gpu_count, gpu_names, gpu_memory_gb, compute_capabilities) = Self::detect_gpus();
 
@@ -308,7 +306,7 @@ pub fn enable_flash_attention() {
 /// Configure rayon thread pool to use all cores minus 1
 /// REPLACES Python's multiprocessing.cpu_count() - no GIL issues!
 pub fn configure_rayon_threads(hardware: &HardwareInfo) {
-    let threads = hardware.cpu_cores_usable;
+    let threads = hardware.cpu_cores_usable.max(1);
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
@@ -324,7 +322,7 @@ pub fn configure_rayon_threads(hardware: &HardwareInfo) {
 /// REPLACES Python's prefer_gpu_env_jobs (lines 197-204)
 /// NO multiprocessing import needed - Rust has no GIL!
 pub fn get_parallel_jobs(hardware: &HardwareInfo, requested: Option<usize>) -> usize {
-    let max_jobs = hardware.cpu_cores_usable;
+    let max_jobs = hardware.cpu_cores_usable.max(1);
 
     match requested {
         Some(n) => n.min(max_jobs).max(1),
@@ -342,7 +340,7 @@ pub fn distribute_gpu_assignment(model_idx: usize, hardware: &HardwareInfo) -> u
     if hardware.gpu_count == 0 {
         0
     } else {
-        (model_idx - 1) % hardware.gpu_count
+        model_idx % hardware.gpu_count
     }
 }
 

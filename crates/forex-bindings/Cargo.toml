@@ -8,15 +8,17 @@ name = "forex_bindings"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27", features = ["extension-module"] }
-numpy = "0.27"
-pythonize = "0.27"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-ndarray = "0.15"
+pyo3 = { version = "0.27.2", features = ["extension-module"] }
+numpy = "0.27.1"
+pythonize = "0.27.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.148"
+ndarray = "0.16.1"
 forex-core = { path = "../forex-core" }
+forex-data = { path = "../forex-data" }
 forex-models = { path = "../forex-models" }
-polars = { version = "0.52.0", features = ["lazy", "dtype-datetime"] }
+forex-search = { path = "../forex-search" }
+polars = { version = "0.52.0", features = ["lazy", "dtype-datetime", "timezones"] }
 
 [features]
 default = []

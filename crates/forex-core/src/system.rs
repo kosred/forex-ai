@@ -31,7 +31,7 @@ impl HardwareProbe {
     pub fn detect(&mut self) -> HardwareProfile {
         self.sys.refresh_all();
 
-        let cpu_cores = self.sys.physical_core_count().unwrap_or(1);
+        let cpu_cores = self.sys.cpus().len().max(1);
         let total_ram_gb = self.sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         let available_ram_gb = self.sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
 

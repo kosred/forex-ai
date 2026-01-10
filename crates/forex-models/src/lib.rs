@@ -1,12 +1,3 @@
-use anyhow::{Context, Result};
-use ndarray::{Array2, Axis};
-#[cfg(feature = "onnx")]
-use ort::{inputs, Session, Value}; // inputs! macro might be available or we use vec
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
-use tracing::{error, info, warn};
-
 // Base classes and utilities (ported from models/base.py)
 pub mod base;
 
@@ -16,16 +7,43 @@ pub mod tree_models;
 // Hardware detection (ported from models/device.py)
 pub mod hardware;
 
-// Neural networks (ported from models/mlp.py + models/deep.py using tch-rs)
+// Neural networks (ported from models/mlp.py + models/deep.py using PyO3)
 pub mod neural_networks;
 
+// ONNX export for ultra-fast inference
+pub mod onnx_exporter;
+
+// Evaluation helpers (simple backtest, signal conversion)
+pub mod evaluation_helpers;
+
+// Model registry (model discovery and validation)
+pub mod registry;
+
+// Genetic strategy expert (evolutionary algorithms for TA-Lib)
+pub mod genetic;
+
+// Exit agent (RL-based trade exit decisions)
+pub mod exit_agent;
+
+// Parallel trainer - TRUE multi-core training (each thread gets independent GIL)
+pub mod parallel_trainer;
+
 // Temporarily disabled modules (dependency issues - will re-enable after porting core files)
-// pub mod evaluation_helpers;
-// pub mod registry;
 // pub mod evolution;
 // pub mod unsupervised;
 // pub mod rl;
 // pub mod transformers;
+
+#[cfg(feature = "onnx")]
+use ort::{inputs, Session, Value};
+#[cfg(feature = "onnx")]
+use std::collections::HashMap;
+#[cfg(feature = "onnx")]
+use anyhow::{Context, Result};
+#[cfg(feature = "onnx")]
+use ndarray::Array2;
+#[cfg(feature = "onnx")]
+use tracing::{info, warn};
 
 #[cfg(feature = "onnx")]
 pub struct ONNXInferenceEngine {

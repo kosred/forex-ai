@@ -1,4 +1,0 @@
-cargo::rustc-check-cfg=cfg(cuda_12050)
-cargo::rustc-check-cfg=cfg(cuda_12080)
-cargo:rustc-cfg=cuda_12050
-cargo:rustc-cfg=cuda_12080

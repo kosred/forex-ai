@@ -5,23 +5,23 @@ edition = "2021"
 
 [dependencies]
 forex-data = { path = "../forex-data" }
-ndarray = { version = "*", features = ["rayon", "serde"] } # Enable rayon and serde for ndarray
-tch = { version = "*", optional = true }
+ndarray = { version = "0.16.1", features = ["rayon", "serde"] } # Enable rayon and serde for ndarray
+tch = { version = "0.22.0", optional = true }
 ort = { version = "2.0.0-rc.10", optional = true, features = ["cuda", "copy-dylibs"] } # ONNX Runtime
-pyo3 = { version = "0.27", features = ["auto-initialize"] } # Python bindings for neural networks
-tracing = "*"
-anyhow = "*"
-thiserror = "*"
+pyo3 = { version = "0.27.2", features = ["auto-initialize"] } # Python bindings for neural networks
+tracing = "0.1.41"
+anyhow = "1.0.99"
+thiserror = "2.0.14"
 
 # Tree model dependencies
-polars = { version = "0.47", features = ["lazy", "dtype-datetime", "rolling_window"] }
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
+polars = { version = "0.52.0", features = ["lazy", "dtype-datetime", "rolling_window", "timezones"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.148"
 
 # Tree model FFI bindings - Let cargo choose versions
-lightgbm3 = { version = "*", optional = true, features = ["gpu", "cuda"] }
-xgboost-rust = { version = "*", optional = true }
-catboost-rust = { version = "*", optional = true, features = ["gpu"] }
+lightgbm3 = { version = "1.0.8", optional = true, features = ["gpu", "cuda"] }
+xgboost-rust = { version = "0.1.0", optional = true }
+catboost-rust = { version = "0.3.4", optional = true, features = ["gpu"] }
 
 # Deep Learning - Burn Framework - DISABLED temporarily due to yanked dependencies
 # burn = { version = "*", optional = true }
@@ -29,11 +29,11 @@ catboost-rust = { version = "*", optional = true, features = ["gpu"] }
 # burn-cuda = { version = "*", optional = true }
 # burn-wgpu = { version = "*", optional = true }
 # burn-tch = { version = "*", optional = true }
-num_cpus = "*"
-rand = "*"
-rayon = "*"
-chrono = "*"
-lazy_static = "*"
+num_cpus = "1.17.0"
+rand = "0.8.5"
+rayon = "1.11.0"
+chrono = "0.4.40"
+lazy_static = "1.5.0"
 # Temporarily disabled due to dependency issues
 # cmaes = "*"
 # linfa = "*"

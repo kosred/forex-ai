@@ -16,7 +16,10 @@ use ndarray::Array2;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use std::path::Path;
-use tracing::{debug, info, warn};
+use tracing::info;
+
+// Re-export for ONNX export functionality
+pub use crate::onnx_exporter::ONNXExportable;
 
 // ============================================================================
 // PYTHON MODEL WRAPPERS - PyO3 Bindings
@@ -155,6 +158,61 @@ impl MLPExpert {
             Ok(())
         })
     }
+
+    /// Export model to ONNX format for ultra-fast inference
+    /// Uses torch.onnx.export via PyO3
+    pub fn export_to_onnx(&self, output_path: &Path, sample_input: &Array2<f32>) -> Result<()> {
+        Python::with_gil(|py| {
+            let torch = PyModule::import(py, "torch")?;
+            let numpy = PyModule::import(py, "numpy")?;
+
+            let expert = self.py_expert.as_ref()
+                .context("MLP expert not initialized")?
+                .bind(py);
+
+            // Get underlying PyTorch model
+            let pytorch_model = expert.getattr("model")?;
+
+            // Set to eval mode
+            pytorch_model.call_method0("eval")?;
+
+            // Convert sample_input to torch tensor
+            let shape = (sample_input.nrows(), sample_input.ncols());
+            let flat: Vec<f32> = sample_input.iter().copied().collect();
+            let np_array = numpy.call_method1("array", (flat,))?
+                .call_method1("reshape", (shape,))?;
+
+            let tensor = torch.call_method1("from_numpy", (np_array,))?
+                .call_method0("float")?;
+
+            // Export to ONNX
+            let export_params = PyDict::new(py);
+            export_params.set_item("export_params", true)?;
+            export_params.set_item("opset_version", 17)?;
+            export_params.set_item("do_constant_folding", true)?;
+            export_params.set_item("input_names", vec!["input"])?;
+            export_params.set_item("output_names", vec!["output"])?;
+
+            let dynamic_axes = PyDict::new(py);
+            let input_axes = PyDict::new(py);
+            input_axes.set_item(0, "batch_size")?;
+            let output_axes = PyDict::new(py);
+            output_axes.set_item(0, "batch_size")?;
+            dynamic_axes.set_item("input", input_axes)?;
+            dynamic_axes.set_item("output", output_axes)?;
+            export_params.set_item("dynamic_axes", dynamic_axes)?;
+
+            torch.getattr("onnx")?
+                .call_method(
+                    "export",
+                    (pytorch_model, tensor, output_path.to_string_lossy().as_ref()),
+                    Some(&export_params),
+                )?;
+
+            info!("Exported MLP model to ONNX: {:?}", output_path);
+            Ok(())
+        })
+    }
 }
 
 // ============================================================================
@@ -270,6 +328,70 @@ impl NBeatsExpert {
         let flat_probs: Vec<f32> = probs_list.into_iter().flatten().collect();
         Array2::from_shape_vec((n_rows, n_cols), flat_probs).context("Failed to reshape")
     }
+
+    /// Shared ONNX export method for all deep learning models
+    fn export_pytorch_to_onnx(
+        py_expert: &Option<Py<PyAny>>,
+        output_path: &Path,
+        sample_input: &Array2<f32>,
+        model_name: &str,
+    ) -> Result<()> {
+        Python::with_gil(|py| {
+            let torch = PyModule::import(py, "torch")?;
+            let numpy = PyModule::import(py, "numpy")?;
+
+            let expert = py_expert.as_ref()
+                .context("Expert not initialized")?
+                .bind(py);
+
+            // Get underlying PyTorch model
+            let pytorch_model = expert.getattr("model")?;
+
+            // Set to eval mode
+            pytorch_model.call_method0("eval")?;
+
+            // Convert sample_input to torch tensor
+            let shape = (sample_input.nrows(), sample_input.ncols());
+            let flat: Vec<f32> = sample_input.iter().copied().collect();
+            let np_array = numpy.call_method1("array", (flat,))?
+                .call_method1("reshape", (shape,))?;
+
+            let tensor = torch.call_method1("from_numpy", (np_array,))?
+                .call_method0("float")?;
+
+            // Export to ONNX
+            let export_params = PyDict::new(py);
+            export_params.set_item("export_params", true)?;
+            export_params.set_item("opset_version", 17)?;
+            export_params.set_item("do_constant_folding", true)?;
+            export_params.set_item("input_names", vec!["input"])?;
+            export_params.set_item("output_names", vec!["output"])?;
+
+            let dynamic_axes = PyDict::new(py);
+            let input_axes = PyDict::new(py);
+            input_axes.set_item(0, "batch_size")?;
+            let output_axes = PyDict::new(py);
+            output_axes.set_item(0, "batch_size")?;
+            dynamic_axes.set_item("input", input_axes)?;
+            dynamic_axes.set_item("output", output_axes)?;
+            export_params.set_item("dynamic_axes", dynamic_axes)?;
+
+            torch.getattr("onnx")?
+                .call_method(
+                    "export",
+                    (pytorch_model, tensor, output_path.to_string_lossy().as_ref()),
+                    Some(&export_params),
+                )?;
+
+            info!("Exported {} model to ONNX: {:?}", model_name, output_path);
+            Ok(())
+        })
+    }
+
+    /// Export NBeats model to ONNX
+    pub fn export_to_onnx(&self, output_path: &Path, sample_input: &Array2<f32>) -> Result<()> {
+        Self::export_pytorch_to_onnx(&self.py_expert, output_path, sample_input, "NBeats")
+    }
 }
 
 /// TiDE Expert - PyO3 wrapper
@@ -310,6 +432,11 @@ impl TiDEExpert {
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
         NBeatsExpert::call_python_load(&self.py_expert, path)
+    }
+
+    /// Export TiDE model to ONNX
+    pub fn export_to_onnx(&self, output_path: &Path, sample_input: &Array2<f32>) -> Result<()> {
+        NBeatsExpert::export_pytorch_to_onnx(&self.py_expert, output_path, sample_input, "TiDE")
     }
 }
 
@@ -353,6 +480,11 @@ impl TabNetExpert {
     pub fn load(&mut self, path: &Path) -> Result<()> {
         NBeatsExpert::call_python_load(&self.py_expert, path)
     }
+
+    /// Export TabNet model to ONNX
+    pub fn export_to_onnx(&self, output_path: &Path, sample_input: &Array2<f32>) -> Result<()> {
+        NBeatsExpert::export_pytorch_to_onnx(&self.py_expert, output_path, sample_input, "TabNet")
+    }
 }
 
 /// KAN Expert - PyO3 wrapper
@@ -393,6 +525,11 @@ impl KANExpert {
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
         NBeatsExpert::call_python_load(&self.py_expert, path)
+    }
+
+    /// Export KAN model to ONNX
+    pub fn export_to_onnx(&self, output_path: &Path, sample_input: &Array2<f32>) -> Result<()> {
+        NBeatsExpert::export_pytorch_to_onnx(&self.py_expert, output_path, sample_input, "KAN")
     }
 }
 

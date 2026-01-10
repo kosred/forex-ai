@@ -7,6 +7,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+import multiprocessing
 
 import numpy as np
 import pandas as pd
@@ -70,6 +71,56 @@ def _pad_probs(p: Any) -> np.ndarray:
         out[:, 1] = arr[:, 1]
         return out
     return arr[:, :3].astype(np.float32, copy=False)
+
+
+def _train_single_model_process(args: tuple[str, str, str, int, int, int, str | None]) -> tuple[str, float, bool]:
+    """Train a single model in a separate process to avoid GIL contention."""
+    dataset_dir, model_name, out_dir, idx, threads_per_model, cpu_threads, metadata_path = args
+    t0 = time.perf_counter()
+    try:
+        settings = Settings()
+        try:
+            profile = HardwareProbe().detect()
+            AutoTuner(settings, profile).apply()
+        except Exception:
+            pass
+
+        X, y = _load_memmap_dataset(Path(dataset_dir))
+        metadata = None
+        if metadata_path:
+            try:
+                meta_path = Path(metadata_path)
+                if meta_path.exists():
+                    metadata = pd.read_pickle(meta_path)
+            except Exception:
+                metadata = None
+
+        optimizer = HyperparameterOptimizer(settings)
+        best_params = optimizer.load_params()
+        factory = ModelFactory(settings, Path(out_dir))
+
+        model = factory.create_model(model_name, best_params, idx)
+        with thread_limits(blas_threads=threads_per_model):
+            fit_kwargs = {}
+            if metadata is not None:
+                try:
+                    import inspect
+
+                    sig = inspect.signature(model.fit)
+                    has_kwargs = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                    )
+                    if "metadata" in sig.parameters or has_kwargs:
+                        fit_kwargs["metadata"] = metadata
+                except Exception:
+                    pass
+            model.fit(X, y, **fit_kwargs)
+        model.save(str(out_dir))
+        duration = time.perf_counter() - t0
+        return (model_name, duration, True)
+    except Exception:
+        duration = time.perf_counter() - t0
+        return (model_name, duration, False)
 
 
 def run_worker(argv: list[str] | None = None) -> int:
@@ -170,18 +221,55 @@ def run_worker(argv: list[str] | None = None) -> int:
             logger.error(f"[WORKER] Failed {name}: {e}", exc_info=True)
             return (name, 0.0, False)
 
-    # Use ThreadPoolExecutor for reliable cross-platform parallel training
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    worker_mode_raw = os.environ.get("FOREX_BOT_PARALLEL_WORKER_MODE")
+    if worker_mode_raw is None:
+        backend = str(os.environ.get("FOREX_BOT_TREE_BACKEND", "auto")).strip().lower()
+        use_process_pool = backend in {"python", "py", "0", "false", "no", "off"}
+    else:
+        worker_mode = str(worker_mode_raw).strip().lower()
+        use_process_pool = worker_mode in {"process", "mp", "multiprocess"}
+
+    if use_process_pool:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
     results: list[tuple[str, float, bool]] = []
 
     if max_concurrent_models > 1:
         # Parallel training
-        with ThreadPoolExecutor(max_workers=max_concurrent_models) as executor:
-            future_to_model = {
-                executor.submit(train_single_model, idx, name): name
-                for idx, name in enumerate(models, start=1)
-            }
+        if use_process_pool:
+            spawn_ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=max_concurrent_models, mp_context=spawn_ctx) as executor:
+                future_to_model = {
+                    executor.submit(
+                        _train_single_model_process,
+                        (
+                            str(args.dataset_dir),
+                            name,
+                            str(out_dir),
+                            idx,
+                            threads_per_model,
+                            cpu_threads,
+                            str(args.metadata_path) if args.metadata_path else "",
+                        ),
+                    ): name
+                    for idx, name in enumerate(models, start=1)
+                }
+                for future in as_completed(future_to_model):
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        model_name = future_to_model[future]
+                        logger.error(f"[WORKER] Exception training {model_name}: {e}")
+                        results.append((model_name, 0.0, False))
+        else:
+            with ThreadPoolExecutor(max_workers=max_concurrent_models) as executor:
+                future_to_model = {
+                    executor.submit(train_single_model, idx, name): name
+                    for idx, name in enumerate(models, start=1)
+                }
             for future in as_completed(future_to_model):
                 try:
                     result = future.result()

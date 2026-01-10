@@ -1,3 +1,0 @@
-linfa::DatasetBase<ndarray::ArrayBase<D, I>, ndarray::ArrayBase<ndarray::data_repr::OwnedRepr<()>, ndarray::dimension::dim::Dim<[usize; 1]>>>
-linfa::DatasetBase<ndarray::ArrayBase<D, ndarray::dimension::dim::Dim<[usize; 2]>>, ndarray::ArrayBase<S, I>>
-From<(ndarray::ArrayBase<D, ndarray::dimension::dim::Dim<[usize; 2]>>, ndarray::ArrayBase<S, I>)>

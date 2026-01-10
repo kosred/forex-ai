@@ -3,15 +3,13 @@
 // NO SIMPLIFICATION - Preserves all HPC production logic
 
 use anyhow::{Context, Result};
-use ndarray::{Array1, Array2, Axis};
+use ndarray::{Array1, Array2};
 use polars::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
-use tracing::{debug, info, warn};
 
 use crate::base::ExpertModel;
-use crate::base::time_series_train_val_split as base_split;
 
 #[cfg(feature = "lightgbm")]
 use lightgbm3::{Booster as LGBMBooster, Dataset as LGBMDataset};
@@ -97,29 +95,45 @@ pub fn torch_cuda_available() -> bool {
     {
         tch::Cuda::is_available() && tch::Cuda::device_count() > 0
     }
-    #[cfg(not(feature = "tch"))]
+#[cfg(not(feature = "tch"))]
     {
-        // Fallback: check CUDA_VISIBLE_DEVICES or assume available
-        env::var("CUDA_VISIBLE_DEVICES").is_ok()
+        // Fallback: check CUDA_VISIBLE_DEVICES for a non-empty device list
+        match env::var("CUDA_VISIBLE_DEVICES") {
+            Ok(devices) => {
+                let trimmed = devices.trim();
+                !(trimmed.is_empty() || trimmed == "-1")
+            }
+            Err(_) => false,
+        }
     }
 }
 
 /// Get GPU count for distribution
 pub fn gpu_count() -> usize {
-    #[cfg(feature = "tch")]
+#[cfg(feature = "tch")]
     {
         if tch::Cuda::is_available() {
             tch::Cuda::device_count() as usize
         } else {
-            1
+            0
         }
     }
     #[cfg(not(feature = "tch"))]
     {
         // Fallback: parse from env or default to 1
         match env::var("CUDA_VISIBLE_DEVICES") {
-            Ok(devices) => devices.split(',').count().max(1),
-            Err(_) => 1,
+            Ok(devices) => {
+                let trimmed = devices.trim();
+                if trimmed.is_empty() || trimmed == "-1" {
+                    0
+                } else {
+                    trimmed
+                        .split(',')
+                        .filter(|v| !v.trim().is_empty())
+                        .count()
+                }
+            }
+            Err(_) => 0,
         }
     }
 }
@@ -450,7 +464,7 @@ impl LightGBMExpert {
 // ============================================================================ 
 
 impl ExpertModel for LightGBMExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
         #[cfg(feature = "lightgbm")]
         {
             use serde_json::json;
@@ -611,7 +625,7 @@ impl ExpertModel for LightGBMExpert {
         }
     }
 
-    fn save(&self, path: &Path) -> Result<()> {
+    fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "lightgbm")]
         {
             if let Some(model) = &self.model {
@@ -625,7 +639,7 @@ impl ExpertModel for LightGBMExpert {
         }
     }
 
-    fn load(&mut self, path: &Path) -> Result<()> {
+    fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "lightgbm")]
         {
             let booster = LGBMBooster::from_file(path.to_str().context("Invalid path")?)?;
@@ -723,7 +737,7 @@ impl XGBoostExpert {
 }
 
 impl ExpertModel for XGBoostExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             // HPC CHECK: If GPU-only mode and no GPU, skip training
@@ -863,7 +877,7 @@ impl ExpertModel for XGBoostExpert {
         }
     }
 
-    fn save(&self, path: &Path) -> Result<()> {
+    fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             if let Some(model) = &self.model {
@@ -877,7 +891,7 @@ impl ExpertModel for XGBoostExpert {
         }
     }
 
-    fn load(&mut self, path: &Path) -> Result<()> {
+    fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             let booster = xgb::Booster::load(path.to_str().context("Invalid path")?)?;
@@ -1009,7 +1023,7 @@ impl XGBoostDARTExpert {
 // ============================================================================ 
 
 impl ExpertModel for XGBoostRFExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             let mut base = XGBoostExpert {
@@ -1029,7 +1043,7 @@ impl ExpertModel for XGBoostRFExpert {
         }
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+    fn predict_proba(&self, _x: &DataFrame) -> Result<Array2<f32>> {
         #[cfg(feature = "xgboost")]
         {
             let base = XGBoostExpert {
@@ -1046,7 +1060,7 @@ impl ExpertModel for XGBoostRFExpert {
         }
     }
 
-    fn save(&self, path: &Path) -> Result<()> {
+    fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             if let Some(model) = &self.model {
@@ -1060,7 +1074,7 @@ impl ExpertModel for XGBoostRFExpert {
         }
     }
 
-    fn load(&mut self, path: &Path) -> Result<()> {
+    fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             let booster = xgb::Booster::load(path.to_str().context("Invalid path")?)?;
@@ -1075,7 +1089,7 @@ impl ExpertModel for XGBoostRFExpert {
 }
 
 impl ExpertModel for XGBoostDARTExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             let mut base = XGBoostExpert {
@@ -1095,7 +1109,7 @@ impl ExpertModel for XGBoostDARTExpert {
         }
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+    fn predict_proba(&self, _x: &DataFrame) -> Result<Array2<f32>> {
         #[cfg(feature = "xgboost")]
         {
             let base = XGBoostExpert {
@@ -1112,7 +1126,7 @@ impl ExpertModel for XGBoostDARTExpert {
         }
     }
 
-    fn save(&self, path: &Path) -> Result<()> {
+    fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             if let Some(model) = &self.model {
@@ -1126,7 +1140,7 @@ impl ExpertModel for XGBoostDARTExpert {
         }
     }
 
-    fn load(&mut self, path: &Path) -> Result<()> {
+    fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             let booster = xgb::Booster::load(path.to_str().context("Invalid path")?)?;
@@ -1254,7 +1268,7 @@ impl ExpertModel for CatBoostExpert {
             let probs = Array2::from_shape_vec((n_samples, 3), predictions)?;
 
             // Reorder output
-            Ok(reorder_to_neutral_buy_sell(probs, None))
+            Ok(reorder_to_neutral_buy_sell(probs, Some(vec![0, 1, 2])))
         }
         #[cfg(not(feature = "catboost"))]
         {
@@ -1273,7 +1287,7 @@ impl ExpertModel for CatBoostExpert {
         }
     }
 
-    fn load(&mut self, path: &Path) -> Result<()> {
+    fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "catboost")]
         {
             let model = catboost::Model::load(path.to_str().unwrap())?;
@@ -1424,7 +1438,7 @@ mod tests {
     #[test]
     fn test_reorder_binary() {
         let probs = Array2::from_shape_vec((3, 2), vec![0.7, 0.3, 0.6, 0.4, 0.8, 0.2]).unwrap();
-        let reordered = reorder_to_neutral_buy_sell(probs, None);
+        let reordered = reorder_to_neutral_buy_sell(probs, Some(vec![0, 1, 2]));
 
         assert_eq!(reordered.shape(), &[3, 3]);
         // Binary: col 0->Neutral, col 1->Buy, col 2->0.0 (Sell)
@@ -1455,7 +1469,7 @@ mod tests {
 }
 
 impl ExpertModel for CatBoostAltExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
         #[cfg(feature = "catboost")]
         {
             let mut base = CatBoostExpert {
@@ -1475,7 +1489,7 @@ impl ExpertModel for CatBoostAltExpert {
         }
     }
 
-    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+    fn predict_proba(&self, _x: &DataFrame) -> Result<Array2<f32>> {
         #[cfg(feature = "catboost")]
         {
             let base = CatBoostExpert {
@@ -1492,7 +1506,7 @@ impl ExpertModel for CatBoostAltExpert {
         }
     }
 
-    fn save(&self, path: &Path) -> Result<()> {
+    fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "catboost")]
         {
             let base = CatBoostExpert {
@@ -1509,7 +1523,7 @@ impl ExpertModel for CatBoostAltExpert {
         }
     }
 
-    fn load(&mut self, path: &Path) -> Result<()> {
+    fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "catboost")]
         {
             let model = catboost::Model::load(path.to_str().context("Invalid path")?)?;

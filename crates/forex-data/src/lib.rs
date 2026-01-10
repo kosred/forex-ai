@@ -1,10 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::*;
-use ta_lib_in_rust::indicators::add_technical_indicators;
+use talib::common::{ta_initialize, TimePeriodKwargs};
+use talib::momentum::{ta_adx, ta_cci, ta_macd, ta_rsi, MacdKwargs};
+use talib::overlap::{ta_bbands, ta_ema, ta_sma, BBANDSKwargs};
+use talib::volatility::{ta_atr, ta_natr, ATRKwargs, NATRKwargs};
+use talib_sys::{TA_MAType, TA_MAType_TA_MAType_SMA};
 
 #[derive(Debug, Clone)]
 pub struct Ohlcv {
@@ -24,6 +29,144 @@ impl Ohlcv {
     pub fn is_empty(&self) -> bool {
         self.close.is_empty()
     }
+}
+
+fn is_sorted_timestamps(ts: &[i64]) -> bool {
+    ts.windows(2).all(|w| w[0] <= w[1])
+}
+
+fn sort_ohlcv_by_timestamp(ohlcv: &Ohlcv) -> Ohlcv {
+    let Some(ts) = &ohlcv.timestamp else {
+        return ohlcv.clone();
+    };
+    if ts.len() != ohlcv.len() || is_sorted_timestamps(ts) {
+        return ohlcv.clone();
+    }
+    let mut idx: Vec<usize> = (0..ts.len()).collect();
+    idx.sort_by_key(|&i| ts[i]);
+
+    let reorder = |src: &Vec<f64>| idx.iter().map(|&i| src[i]).collect::<Vec<f64>>();
+    let sorted_ts = idx.iter().map(|&i| ts[i]).collect::<Vec<i64>>();
+    let volume = ohlcv
+        .volume
+        .as_ref()
+        .map(|v| idx.iter().map(|&i| v[i]).collect::<Vec<f64>>());
+
+    Ohlcv {
+        timestamp: Some(sorted_ts),
+        open: reorder(&ohlcv.open),
+        high: reorder(&ohlcv.high),
+        low: reorder(&ohlcv.low),
+        close: reorder(&ohlcv.close),
+        volume,
+    }
+}
+
+fn pad_vec(mut values: Vec<f64>, len: usize) -> Vec<f64> {
+    if values.len() < len {
+        values.resize(len, f64::NAN);
+    } else if values.len() > len {
+        values.truncate(len);
+    }
+    values
+}
+
+static TALIB_INIT: OnceLock<Result<(), anyhow::Error>> = OnceLock::new();
+
+fn ensure_talib_init() -> Result<()> {
+    let init = TALIB_INIT.get_or_init(|| {
+        ta_initialize().map_err(|e| anyhow::anyhow!("TA-Lib init failed: {:?}", e))
+    });
+    match init {
+        Ok(_) => Ok(()),
+        Err(err) => Err(anyhow::anyhow!(err.to_string())),
+    }
+}
+
+fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
+    if ohlcv.is_empty() {
+        bail!("empty OHLCV data");
+    }
+    ensure_talib_init()?;
+
+    let len = ohlcv.len();
+    let close_ptr = ohlcv.close.as_ptr();
+    let high_ptr = ohlcv.high.as_ptr();
+    let low_ptr = ohlcv.low.as_ptr();
+
+    let mut out: Vec<(String, Vec<f64>)> = Vec::new();
+
+    let period14 = TimePeriodKwargs { timeperiod: 14 };
+    let period20 = TimePeriodKwargs { timeperiod: 20 };
+
+    if let Ok(values) = ta_rsi(close_ptr, len, &period14) {
+        out.push(("rsi_14".to_string(), pad_vec(values, len)));
+    }
+    if let Ok(values) = ta_adx(high_ptr, low_ptr, close_ptr, len, &period14) {
+        out.push(("adx_14".to_string(), pad_vec(values, len)));
+    }
+    if let Ok(values) = ta_cci(high_ptr, low_ptr, close_ptr, len, &period20) {
+        out.push(("cci_20".to_string(), pad_vec(values, len)));
+    }
+
+    let macd_kwargs = MacdKwargs {
+        fastperiod: 12,
+        slowperiod: 26,
+        signalperiod: 9,
+    };
+    if let Ok((macd, signal, hist)) = ta_macd(close_ptr, len, &macd_kwargs) {
+        out.push(("macd".to_string(), pad_vec(macd, len)));
+        out.push(("macd_signal".to_string(), pad_vec(signal, len)));
+        out.push(("macd_hist".to_string(), pad_vec(hist, len)));
+    }
+
+    let atr_kwargs = ATRKwargs { timeperiod: 14 };
+    if let Ok(values) = ta_atr(high_ptr, low_ptr, close_ptr, len, &atr_kwargs) {
+        out.push(("atr_14".to_string(), pad_vec(values, len)));
+    }
+    let natr_kwargs = NATRKwargs { timeperiod: 14 };
+    if let Ok(values) = ta_natr(high_ptr, low_ptr, close_ptr, len, &natr_kwargs) {
+        out.push(("natr_14".to_string(), pad_vec(values, len)));
+    }
+
+    if let Ok(values) = ta_sma(close_ptr, len, &period20) {
+        out.push(("sma_20".to_string(), pad_vec(values, len)));
+    }
+    if let Ok(values) = ta_ema(close_ptr, len, &period20) {
+        out.push(("ema_20".to_string(), pad_vec(values, len)));
+    }
+
+    let bb_kwargs = BBANDSKwargs {
+        timeperiod: 20,
+        nbdevup: 2.0,
+        nbdevdn: 2.0,
+        matype: TA_MAType_TA_MAType_SMA as TA_MAType,
+    };
+    if let Ok((upper, middle, lower)) = ta_bbands(close_ptr, len, &bb_kwargs) {
+        let upper = pad_vec(upper, len);
+        let middle = pad_vec(middle, len);
+        let lower = pad_vec(lower, len);
+        out.push(("bb_upper".to_string(), upper.clone()));
+        out.push(("bb_middle".to_string(), middle.clone()));
+        out.push(("bb_lower".to_string(), lower.clone()));
+        let mut width = Vec::with_capacity(len);
+        for i in 0..len {
+            let mid = middle.get(i).copied().unwrap_or(f64::NAN);
+            let up = upper.get(i).copied().unwrap_or(f64::NAN);
+            let lo = lower.get(i).copied().unwrap_or(f64::NAN);
+            if !mid.is_finite() || mid.abs() <= f64::EPSILON {
+                width.push(f64::NAN);
+            } else {
+                width.push((up - lo) / mid.abs());
+            }
+        }
+        out.push(("bb_width".to_string(), width));
+    }
+
+    if out.is_empty() {
+        bail!("TA-Lib produced no indicators");
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone)]
@@ -288,45 +431,20 @@ pub fn load_symbol_dataset_with_timeframes(
 }
 
 pub fn compute_talib_features(ohlcv: &Ohlcv) -> Result<FeatureMatrix> {
-    let n_rows = ohlcv.len();
+    let sorted = sort_ohlcv_by_timestamp(ohlcv);
+    let n_rows = sorted.len();
     if n_rows == 0 {
         bail!("empty OHLCV data");
     }
 
-    let volume = ohlcv
-        .volume
-        .clone()
-        .unwrap_or_else(|| vec![0.0_f64; n_rows]);
+    let indicators = compute_talib_indicators(&sorted)?;
+    let mut names = Vec::with_capacity(indicators.len());
+    let mut columns: Vec<Vec<f32>> = Vec::with_capacity(indicators.len());
 
-    let mut df = DataFrame::new(vec![
-        Series::new("open".into(), ohlcv.open.clone()).into(),
-        Series::new("high".into(), ohlcv.high.clone()).into(),
-        Series::new("low".into(), ohlcv.low.clone()).into(),
-        Series::new("close".into(), ohlcv.close.clone()).into(),
-        Series::new("volume".into(), volume).into(),
-    ])?;
-
-    let original_cols: HashSet<String> = df
-        .get_column_names()
-        .iter()
-        .map(|name| name.to_string())
-        .collect();
-
-    let df = add_technical_indicators(&mut df)
-        .map_err(|e| anyhow::anyhow!("ta-lib-in-rust failed: {e}"))?;
-
-    let mut names = Vec::new();
-    let mut columns = Vec::new();
-    for col in df.get_columns() {
-        let series = col.as_materialized_series();
-        let name = series.name();
-        if original_cols.contains(name.as_str()) {
-            continue;
-        }
-        let mut col_name = String::from("ta_");
-        col_name.push_str(name);
-        names.push(col_name);
-        columns.push(series_to_f32(series, n_rows));
+    for (name, values) in indicators {
+        names.push(format!("ta_{name}"));
+        let vals = pad_vec(values, n_rows);
+        columns.push(vals.iter().map(|v| *v as f32).collect());
     }
 
     let n_cols = columns.len();
@@ -342,68 +460,40 @@ pub fn compute_talib_features(ohlcv: &Ohlcv) -> Result<FeatureMatrix> {
 }
 
 pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<FeatureFrame> {
-    let n_rows = ohlcv.len();
+    let sorted = sort_ohlcv_by_timestamp(ohlcv);
+    let n_rows = sorted.len();
     if n_rows == 0 {
         bail!("empty OHLCV data");
     }
 
-    let timestamps = ohlcv
+    let timestamps = sorted
         .timestamp
         .clone()
         .unwrap_or_else(|| (0..n_rows as i64).collect());
-    let volume = ohlcv
-        .volume
-        .clone()
-        .unwrap_or_else(|| vec![0.0_f64; n_rows]);
 
-    let mut df = DataFrame::new(vec![
-        Series::new("timestamp".into(), timestamps).into(),
-        Series::new("open".into(), ohlcv.open.clone()).into(),
-        Series::new("high".into(), ohlcv.high.clone()).into(),
-        Series::new("low".into(), ohlcv.low.clone()).into(),
-        Series::new("close".into(), ohlcv.close.clone()).into(),
-        Series::new("volume".into(), volume).into(),
-    ])?;
-
-    df = df.sort(["timestamp"], SortMultipleOptions::default())?;
-
-    let original_cols: HashSet<String> = df
-        .get_column_names()
-        .iter()
-        .map(|name| name.to_string())
-        .collect();
-
-    let df = add_technical_indicators(&mut df)
-        .map_err(|e| anyhow::anyhow!("ta-lib-in-rust failed: {e}"))?;
-
-    let timestamps = extract_timestamps(&df)?.context("feature frame missing timestamp column")?;
-
+    let indicators = compute_talib_indicators(&sorted)?;
     let mut names = Vec::new();
-    let mut columns = Vec::new();
+    let mut columns: Vec<Vec<f32>> = Vec::new();
 
     if include_raw {
-        for raw in ["open", "high", "low", "close", "volume"] {
-            if let Ok(col) = df.column(raw) {
-                let series = col.as_materialized_series();
-                names.push(raw.to_string());
-                columns.push(series_to_f32(series, n_rows));
-            }
+        names.push("open".to_string());
+        columns.push(sorted.open.iter().map(|v| *v as f32).collect());
+        names.push("high".to_string());
+        columns.push(sorted.high.iter().map(|v| *v as f32).collect());
+        names.push("low".to_string());
+        columns.push(sorted.low.iter().map(|v| *v as f32).collect());
+        names.push("close".to_string());
+        columns.push(sorted.close.iter().map(|v| *v as f32).collect());
+        if let Some(volume) = &sorted.volume {
+            names.push("volume".to_string());
+            columns.push(volume.iter().map(|v| *v as f32).collect());
         }
     }
 
-    for col in df.get_columns() {
-        let series = col.as_materialized_series();
-        let name = series.name();
-        if name.eq_ignore_ascii_case("timestamp") {
-            continue;
-        }
-        if original_cols.contains(name.as_str()) {
-            continue;
-        }
-        let mut col_name = String::from("ta_");
-        col_name.push_str(name);
-        names.push(col_name);
-        columns.push(series_to_f32(series, n_rows));
+    for (name, values) in indicators {
+        names.push(format!("ta_{name}"));
+        let vals = pad_vec(values, n_rows);
+        columns.push(vals.iter().map(|v| *v as f32).collect());
     }
 
     let n_cols = columns.len();

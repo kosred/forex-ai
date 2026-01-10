@@ -113,10 +113,13 @@ class ModelFactory:
             "catboost",
             "catboost_alt",
         }:
-            # Tree-based models don't support batch_size - filter it out
+            # Tree-based models don't support batch_size - filter it out        
             tree_params = params.copy()
             tree_params.pop("batch_size", None)
             init_kwargs = {"params": tree_params}
+
+        # Pass model index when supported (Rust bindings use this for GPU round-robin).
+        init_kwargs.setdefault("idx", idx)
 
         # Inject Device if supported
         if prefer_gpu and self.available_gpus:

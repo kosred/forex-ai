@@ -8,3 +8,6 @@ members = [
   "crates/forex-core",
   "crates/forex-bindings",
 ]
+
+[patch.crates-io]
+talib-sys = { path = "vendor/talib-sys" }
